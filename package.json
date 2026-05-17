@@ -1,0 +1,41 @@
+{
+  "name": "code-graph",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n vite,server -c blue,green \"npm:dev:client\" \"npm:dev:server\"",
+    "dev:client": "vite",
+    "dev:server": "tsx watch server/index.ts",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "chokidar": "^5.0.0",
+    "d3-force": "^3.0.0",
+    "monaco-editor": "^0.55.1",
+    "pixi.js": "^8.18.1",
+    "rbush": "^4.0.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-resizable-panels": "^4.10.0",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@types/d3-force": "^3.0.10",
+    "@types/node": "^22.10.0",
+    "@types/rbush": "^4.0.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "fastify": "^5.2.0",
+    "playwright": "^1.59.1",
+    "ts-morph": "^25.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  }
+}

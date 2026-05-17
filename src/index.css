@@ -1,0 +1,59 @@
+:root {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    sans-serif;
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.9);
+  background-color: #1a1a1a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  width: 100%;
+}
+
+button {
+  font: inherit;
+  padding: 0.4em 0.9em;
+  border: 1px solid #555;
+  background: #2a2a2a;
+  color: inherit;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #383838;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+input[type='text'],
+input:not([type]) {
+  font: inherit;
+  padding: 0.4em 0.6em;
+  border: 1px solid #444;
+  background: #111;
+  color: inherit;
+  border-radius: 4px;
+}
+
+/* Monaco decoration applied to the AST node range that matches the current
+   graph selection. Combined background + inline class for a soft highlight
+   that's still legible under the syntax theme. */
+.codegraph-ast-highlight {
+  background: rgba(58, 111, 176, 0.18);
+  border-left: 2px solid rgba(109, 177, 255, 0.85);
+}
+.codegraph-ast-highlight-inline {
+  background: rgba(58, 111, 176, 0.12);
+}

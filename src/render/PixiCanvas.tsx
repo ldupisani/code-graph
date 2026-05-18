@@ -45,6 +45,7 @@ const COLORS = {
   // text label, so they're identifiable without crowding the layout.
   astOutlineBlock: 0xe06cff, // magenta — Block
   astOutlineObject: 0xe8c84a, // yellow — ObjectLiteralExpression
+  astOutlineParam: 0x6cb6ff, // light blue — Parameter
   text: 0xeeeeee,
   textDim: 0xb0b0b8,
   edge: 0x565a63, // import links: subdued but always visible
@@ -61,14 +62,18 @@ const SEMANTIC_EDGE_STYLE: Record<
 
 // LOD: rects whose smaller side is below this many screen pixels are not drawn.
 const CULL_PX = 4;
-// Below this camera zoom the view "simplifies": call links, operator glyphs
-// and generic kind labels (type/if/arrow fn…) drop out, leaving only real
-// names. Zoom in past it for full detail.
+// Below this camera zoom the view "simplifies": operator glyphs and generic
+// kind labels (type/if/arrow fn…) drop out, leaving only real names. Zoom in
+// past it for full detail.
 const SIMPLIFY_BELOW = 1.5;
 // Block/object kind outlines are cheap structural cues (just a colored
 // border, no text), so they come back much earlier when zooming in than the
 // rest of the detail — at this lower zoom threshold.
 const OUTLINE_BELOW = 0.5;
+// Call links only render when their caller node is on screen anyway (its
+// file must be expanded), so they can come back early too — otherwise
+// they're invisible until an expanded node fills the whole viewport.
+const CALLS_BELOW = 0.5;
 // Labels appear only while their container is at least the label's own box
 // (text + insets) on screen — see labelScreenBox / the gate in drawAstNode.
 
@@ -137,6 +142,7 @@ function labelFor(node: { name: string | null; syntaxKind: string }): string | n
 const KIND_OUTLINE: Record<string, number> = {
   Block: COLORS.astOutlineBlock,
   ObjectLiteralExpression: COLORS.astOutlineObject,
+  Parameter: COLORS.astOutlineParam,
 };
 
 // A node is "significant" — worth its own box, never collapsed as a
@@ -345,6 +351,13 @@ export function PixiCanvas({ project }: CanvasProps) {
       // the user takes manual camera control. null = not following.
       let followId: string | null = null;
 
+      // Directional `${fromFileId} ${toFileId}` keys for semantic edges
+      // (calls/extends/implements) actually drawn this frame. drawSemanticEdges
+      // rebuilds it; drawEdges (which runs earlier in the frame) reads the
+      // previous frame's set to suppress now-redundant import lines — a
+      // 1-frame lag that's imperceptible at 60fps.
+      const visibleSemanticPairs = new Set<string>();
+
       // Pool of Pixi Text objects re-used across frames. `visible` is toggled
       // for unused entries, avoiding GC churn.
       const labelPool = new LabelPool(labelLayer);
@@ -371,6 +384,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         const interior = fitInterior(ast, {
           labelOf: labelFor,
           significant: isSignificant,
+          pruneEmpty: (n) => n.syntaxKind === 'Block', // drop empty `{}`
           // Exactly the box the renderer's LOD gate checks below, so a cell
           // sized here shows its label at 1:1 and nothing larger.
           measure: labelScreenBox,
@@ -408,6 +422,7 @@ export function PixiCanvas({ project }: CanvasProps) {
             originY: TITLE_STRIP,
             labelOf: labelFor,
             significant: isSignificant,
+            pruneEmpty: (n) => n.syntaxKind === 'Block', // drop empty `{}`
             measure: labelScreenBox,
           }),
         );
@@ -431,7 +446,7 @@ export function PixiCanvas({ project }: CanvasProps) {
 
         // 1. Import edges (under rects — they connect file centers and look
         //    cleanest terminating at the rect borders).
-        drawEdges(layout, worldGfx, cameraScale);
+        drawEdges(layout, worldGfx, cameraScale, visibleSemanticPairs);
 
         // 2. Files + AST subtrees on `worldGfx`. pushRect keeps visibleById
         //    in sync so the edge pass below can find precise anchors.
@@ -452,6 +467,7 @@ export function PixiCanvas({ project }: CanvasProps) {
           cameraScale,
           selection,
           state.expandedFiles,
+          visibleSemanticPairs,
         );
       }
 
@@ -510,15 +526,18 @@ export function PixiCanvas({ project }: CanvasProps) {
               ix + iw - fold, iy + fold,
             ])
             .fill({ color: line, alpha: 0.6 });
+          // Anchor to the ICON's bounds, not the (invisible) sim footprint —
+          // otherwise connectors terminate in empty space far from the icon,
+          // and the click target wouldn't match what's drawn.
           pushRect({
             id: sim.id,
             fileId: sim.id,
             kind: 'file',
-            x,
-            y,
-            w: sim.width,
-            h: sim.height,
-            area: sim.width * sim.height,
+            x: ix,
+            y: iy,
+            w: iw,
+            h: ih,
+            area: iw * ih,
           });
           putName(iy);
           return;
@@ -612,10 +631,24 @@ export function PixiCanvas({ project }: CanvasProps) {
           borderWidth = 1 / cameraScale;
           borderAlpha = 1;
         }
-        worldGfx
-          .rect(x, y, node.rect.w, node.rect.h)
-          .fill({ color: fillColor, alpha: isSelected ? 1 : 0.92 })
-          .stroke({ color: borderColor, width: borderWidth, alpha: borderAlpha });
+        // Parameters get just-slightly-rounded corners as a subtle nod to
+        // the round brackets a parameter list lives in — small enough that
+        // the label stays well inside the border.
+        if (node.syntaxKind === 'Parameter') {
+          const radius = Math.min(
+            4 / cameraScale, // ~4px on screen — a gentle curve, not a pill
+            Math.min(node.rect.w, node.rect.h) / 2,
+          );
+          worldGfx
+            .roundRect(x, y, node.rect.w, node.rect.h, radius)
+            .fill({ color: fillColor, alpha: isSelected ? 1 : 0.92 })
+            .stroke({ color: borderColor, width: borderWidth, alpha: borderAlpha });
+        } else {
+          worldGfx
+            .rect(x, y, node.rect.w, node.rect.h)
+            .fill({ color: fillColor, alpha: isSelected ? 1 : 0.92 })
+            .stroke({ color: borderColor, width: borderWidth, alpha: borderAlpha });
+        }
 
         pushRect({
           id: node.id,
@@ -627,6 +660,35 @@ export function PixiCanvas({ project }: CanvasProps) {
           h: node.rect.h,
           area: node.rect.w * node.rect.h,
         });
+
+        // Constructor badge: a small outlined wrench in the top-right corner
+        // so a constructor is recognizable even though it has no name label.
+        // Same cheap-structural-cue zoom gate as the kind outlines.
+        if (node.syntaxKind === 'Constructor' && cameraScale >= OUTLINE_BELOW) {
+          const s = 11 / cameraScale; // glyph footprint, screen-constant
+          const gap = 4 / cameraScale; // clearance between badge and box
+          // Float it just ABOVE the box's top-left, outside the interior,
+          // so it never overlaps the constructor's child nodes.
+          const gx = x; // left-aligned to the box edge
+          const gy = y - gap - s; // entirely above the box top
+          const lw = 1.2 / cameraScale; // outline stroke, ~constant on screen
+          const col = SYNTAX.func; // ties to "this is a (constructor) function"
+          // Handle: lower-left → up toward the head.
+          worldGfx
+            .moveTo(gx + s * 0.12, gy + s * 0.9)
+            .lineTo(gx + s * 0.58, gy + s * 0.44)
+            .stroke({ color: col, width: lw, alpha: 1 });
+          // Open-ring head (a spanner jaw): ~300° arc with a gap.
+          const hcx = gx + s * 0.68;
+          const hcy = gy + s * 0.32;
+          const hr = s * 0.26;
+          const a0 = -0.15 * Math.PI;
+          const a1 = 1.55 * Math.PI;
+          worldGfx
+            .moveTo(hcx + hr * Math.cos(a0), hcy + hr * Math.sin(a0))
+            .arc(hcx, hcy, hr, a0, a1)
+            .stroke({ color: col, width: lw, alpha: 1 });
+        }
 
         // Label every node that has room for one. Use the resolved name when
         // present (declarations, literals, import specifiers); otherwise fall
@@ -974,14 +1036,16 @@ function drawEdges(
   layout: FileLayoutResult,
   gfx: Graphics,
   cameraScale: number,
+  visibleSemanticPairs: ReadonlySet<string>,
 ): void {
-  // Import links: always shown, one consistent subdued style at every zoom.
-  // Screen-constant thin width so they never vanish when zoomed out but stay
-  // a quiet background layer beneath the bright semantic edges.
+  // Import links: a quiet subdued background layer. Suppressed when a
+  // calls/extends/implements link is already visible between the same two
+  // files — that semantic relationship makes the import implicit.
   for (const link of layout.links) {
     const s = typeof link.source === 'string' ? layout.byId.get(link.source) : link.source;
     const t = typeof link.target === 'string' ? layout.byId.get(link.target) : link.target;
     if (!s || !t) continue;
+    if (visibleSemanticPairs.has(`${s.id} ${t.id}`)) continue;
     gfx
       .moveTo(s.x, s.y)
       .lineTo(t.x, t.y)
@@ -1061,7 +1125,15 @@ function drawSemanticEdges(
   cameraScale: number,
   selection: string | null,
   expandedFiles: ReadonlySet<string>,
+  // Rebuilt here each frame: directional `${fromFile} ${toFile}` keys for
+  // every edge actually drawn, so drawEdges can suppress redundant imports.
+  visibleSemanticPairs: Set<string>,
 ): void {
+  visibleSemanticPairs.clear();
+  const fileOf = (id: string): string => {
+    const i = id.lastIndexOf('#');
+    return i > 0 ? id.slice(0, i) : id;
+  };
   // Connector geometry (curve path, port/outline positions) stays in world
   // space so it tracks the nodes, but every *size* — line width, outline
   // width, port radius, arrowhead — is multiplied by 1/cameraScale so it
@@ -1080,15 +1152,16 @@ function drawSemanticEdges(
   // (kind, rect) so overlapping calls don't stack the stroke into a blob.
   const drawnOutlines = new Set<string>();
   for (const edge of edges) {
-    // Call links drop out entirely in the simplified (zoomed-out) tier.
-    // Otherwise a call link is only meaningful when you can see who's
-    // calling: if the caller's own node isn't on screen (its file is
-    // collapsed, or it was LOD-culled) the edge would just dangle from a
-    // lifted ancestor, so require the calling node itself to be directly
-    // visible. (`extends`/`implements` still lift to a visible ancestor.)
+    // Call links come back early (CALLS_BELOW), well before full detail —
+    // otherwise they'd be invisible until an expanded node fills the screen.
+    // They're still only meaningful when you can see who's calling: if the
+    // caller's own node isn't on screen (its file is collapsed, or it was
+    // LOD-culled) the edge would just dangle from a lifted ancestor, so
+    // require the calling node itself to be directly visible.
+    // (`extends`/`implements` still lift to a visible ancestor.)
     if (
       edge.kind === 'calls' &&
-      (cameraScale < SIMPLIFY_BELOW || !visibleById.has(edge.fromId))
+      (cameraScale < CALLS_BELOW || !visibleById.has(edge.fromId))
     ) {
       continue;
     }
@@ -1111,6 +1184,14 @@ function drawSemanticEdges(
     const key = `${edge.kind}|${from.id}|${to.id}`;
     if (seen.has(key)) continue;
     seen.add(key);
+
+    // This edge is committed to being drawn — record its file pair so the
+    // (now-implicit) import line between these two files is suppressed.
+    const fromFile = fileOf(edge.fromId);
+    const toFile = fileOf(edge.toId);
+    if (fromFile !== toFile) {
+      visibleSemanticPairs.add(`${fromFile} ${toFile}`);
+    }
 
     // Each kind has its own port geometry. `calls`/`implements` read as
     // dataflow: out of the caller's bottom-right, into the callee's top-left

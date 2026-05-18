@@ -62,6 +62,10 @@ export interface AstLayoutOpts {
   // single-child pass-through — true if it has a label OR a kind outline.
   // (Defaults to "has a label" when omitted.)
   significant?: (n: { name: string | null; syntaxKind: string }) => boolean;
+  // Kinds that are noise when they have no children (e.g. an empty `{}`
+  // Block). Such nodes are dropped from the layout entirely so they don't
+  // reserve a tiny empty box.
+  pruneEmpty?: (n: { name: string | null; syntaxKind: string }) => boolean;
   // Box (w,h) a label needs in its cell — the SAME function the renderer's
   // LOD gate checks, so a node is exactly big enough for its own label.
   measure: (text: string) => { w: number; h: number };
@@ -115,6 +119,9 @@ export function layoutAst(
   // semantic-edge anchoring already lifts to the nearest visible ancestor.
   const significant =
     opts.significant ?? ((n) => opts.labelOf(n) !== null);
+  const pruneEmpty = opts.pruneEmpty ?? (() => false);
+  const isPrunedEmpty = (n: AstNode): boolean =>
+    pruneEmpty(n) && (kidsOf.get(n.id)?.length ?? 0) === 0;
   const collapse = (n: AstNode): AstNode => {
     let cur = n;
     for (;;) {
@@ -160,7 +167,9 @@ export function layoutAst(
   const size = (node: AstNode): Sized => {
     const label = opts.labelOf(node);
     const lb = label ? opts.measure(label) : { w: 0, h: 0 };
-    const kids = (kidsOf.get(node.id) ?? []).map(collapse);
+    const kids = (kidsOf.get(node.id) ?? [])
+      .map(collapse)
+      .filter((k) => !isPrunedEmpty(k));
 
     if (node.op) {
       // BinaryExpression: unlabeled, exactly two operands → [l] op [r].
@@ -268,6 +277,7 @@ export function layoutAst(
 export interface FitInteriorOpts {
   labelOf: (n: { name: string | null; syntaxKind: string }) => string | null;
   significant?: (n: { name: string | null; syntaxKind: string }) => boolean;
+  pruneEmpty?: (n: { name: string | null; syntaxKind: string }) => boolean;
   measure: (text: string) => { w: number; h: number };
   min: { w: number; h: number };
   max: { w: number; h: number };
@@ -283,6 +293,7 @@ export function fitInterior(
     originY: 0,
     labelOf: opts.labelOf,
     significant: opts.significant,
+    pruneEmpty: opts.pruneEmpty,
     measure: opts.measure,
     wrapWidth: opts.wrapWidth,
   });

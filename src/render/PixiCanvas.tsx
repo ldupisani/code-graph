@@ -419,12 +419,12 @@ export function PixiCanvas({ project }: CanvasProps) {
           min: EXPANDED_MIN,
           max: EXPANDED_MAX,
         });
-        // Widen if needed so the file's own basename strip still fits, and
-        // add the title strip the AST is laid out beneath.
-        const sim = layout.byId.get(fileId);
+        // Symmetric padding (= TITLE_STRIP) on all four sides around the AST
+        // content. The filename floats above the box, so the box no longer
+        // needs to be widened to fit it.
         const size = {
-          w: Math.max(interior.w, sim?.collapsedW ?? 0),
-          h: interior.h + TITLE_STRIP,
+          w: interior.w + TITLE_STRIP * 2,
+          h: interior.h + TITLE_STRIP * 2,
         };
         expandedSizeCache.set(fileId, { ast, size });
         return size;
@@ -441,12 +441,13 @@ export function PixiCanvas({ project }: CanvasProps) {
       function buildSubtreeLayout(fileId: string): void {
         const ast = useGraphStore.getState().asts.get(fileId);
         if (!ast) return;
-        // Content-sized: the layout sizes itself to its text, so we only pass
-        // the origin (below the title strip, so the AST clears the filename).
+        // Content-sized: the layout sizes itself to its text. Inset by
+        // TITLE_STRIP on all sides so the padding is symmetric (matches the
+        // box sizing in expandedSizeFor).
         subtreeByFileId.set(
           fileId,
           layoutAst(ast, {
-            originX: 0,
+            originX: TITLE_STRIP,
             originY: TITLE_STRIP,
             labelOf: labelFor,
             significant: isSignificant,
@@ -575,12 +576,17 @@ export function PixiCanvas({ project }: CanvasProps) {
           return;
         }
 
-        const fill = isSelected ? COLORS.fileSelected : COLORS.fileExpanded;
-        const stroke = isSelected ? COLORS.fileBorderSelected : COLORS.fileBorder;
+        // Expanded files: translucent background, no outline — except when
+        // selected, where the selection blue is a thick outline (half the
+        // title-strip width) instead of recoloring the background.
         worldGfx
           .roundRect(x, y, sim.width, sim.height, 6)
-          .fill({ color: fill })
-          .stroke({ color: stroke, width: isSelected ? 2 : 1 });
+          .fill({ color: COLORS.fileExpanded, alpha: 0.7 });
+        if (isSelected) {
+          worldGfx
+            .roundRect(x, y, sim.width, sim.height, 6)
+            .stroke({ color: COLORS.fileSelected, width: TITLE_STRIP / 2 });
+        }
 
         pushRect({
           id: sim.id,
@@ -640,7 +646,7 @@ export function PixiCanvas({ project }: CanvasProps) {
 
         const isSelected = selection === node.id;
         const tint = depthTint(node.depth);
-        const fillColor = isSelected ? COLORS.astSelected : tint;
+        const fillColor = tint; // selection is shown via the outline, not fill
         // A call/new argument is a "parameter block for a call" — style it
         // like a function `Parameter` (light-blue outline + rounded).
         const argParent = node.parentId
@@ -695,8 +701,10 @@ export function PixiCanvas({ project }: CanvasProps) {
         let borderWidth = 0.5;
         let borderAlpha = 0.9;
         if (isSelected) {
-          borderColor = COLORS.astSelectedBorder;
-          borderWidth = 1.5;
+          // Selection blue as a thick outline (half the title-strip width),
+          // not a background recolor.
+          borderColor = COLORS.astSelected;
+          borderWidth = TITLE_STRIP / 2;
           borderAlpha = 1;
         } else if (kindOutline !== undefined) {
           // Selection still overrides the kind color so the active node
@@ -740,7 +748,7 @@ export function PixiCanvas({ project }: CanvasProps) {
           );
           worldGfx
             .roundRect(x, y, node.rect.w, node.rect.h, radius)
-            .fill({ color: fillColor, alpha: isSelected ? 1 : 0.92 })
+            .fill({ color: fillColor, alpha: 0.92 })
             .stroke({ color: borderColor, width: borderWidth, alpha: borderAlpha });
         } else if (abstractOutline) {
           // Abstract definition: dashed/dotted box outline. Abstract
@@ -750,7 +758,7 @@ export function PixiCanvas({ project }: CanvasProps) {
           const h = node.rect.h;
           worldGfx
             .rect(x, y, w, h)
-            .fill({ color: fillColor, alpha: isSelected ? 1 : 0.92 });
+            .fill({ color: fillColor, alpha: 0.92 });
           const dash = (abstractFn ? 1.2 : 3.5) / cameraScale;
           const dgap = (abstractFn ? 2.4 : 2.5) / cameraScale;
           emitDashed(
@@ -773,7 +781,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         } else {
           worldGfx
             .rect(x, y, node.rect.w, node.rect.h)
-            .fill({ color: fillColor, alpha: isSelected ? 1 : 0.92 })
+            .fill({ color: fillColor, alpha: 0.92 })
             .stroke({ color: borderColor, width: borderWidth, alpha: borderAlpha });
         }
 

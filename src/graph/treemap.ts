@@ -20,6 +20,8 @@ export interface TreemapNode {
   rect: Rect;
   depth: number;
   exported?: boolean;
+  abstract?: boolean;
+  extendsName?: string;
   // Relational rendering: when set, the renderer draws `op` centered at
   // `opAnchor` between this node's two operand boxes. For the `let i = j`
   // case the left operand is the node's own name, drawn in `labelChip`
@@ -66,6 +68,17 @@ export interface AstLayoutOpts {
   // Block). Such nodes are dropped from the layout entirely so they don't
   // reserve a tiny empty box.
   pruneEmpty?: (n: { name: string | null; syntaxKind: string }) => boolean;
+  // Nodes dropped from the layout entirely (with their subtree) — e.g. an
+  // `extends` clause now rendered inline on the class header.
+  prune?: (n: { name: string | null; syntaxKind: string }) => boolean;
+  // Unlabeled nodes that should still reserve a top label-height band, so a
+  // badge (e.g. the constructor wrench) can sit there without overlapping
+  // children — same vertical space a named class header takes.
+  reserveBand?: (n: { name: string | null; syntaxKind: string }) => boolean;
+  // Row-grouping key. Consecutive siblings in different groups never share a
+  // wrapped row (e.g. `extends` clauses get their own row, though multiple
+  // extends can share one). Defaults to a single group (no effect).
+  rowGroup?: (n: { name: string | null; syntaxKind: string }) => string;
   // Box (w,h) a label needs in its cell — the SAME function the renderer's
   // LOD gate checks, so a node is exactly big enough for its own label.
   measure: (text: string) => { w: number; h: number };
@@ -119,9 +132,12 @@ export function layoutAst(
   // semantic-edge anchoring already lifts to the nearest visible ancestor.
   const significant =
     opts.significant ?? ((n) => opts.labelOf(n) !== null);
+  const rowGroup = opts.rowGroup ?? (() => 'n');
   const pruneEmpty = opts.pruneEmpty ?? (() => false);
-  const isPrunedEmpty = (n: AstNode): boolean =>
-    pruneEmpty(n) && (kidsOf.get(n.id)?.length ?? 0) === 0;
+  const prune = opts.prune ?? (() => false);
+  const reserveBand = opts.reserveBand ?? (() => false);
+  const isPruned = (n: AstNode): boolean =>
+    prune(n) || (pruneEmpty(n) && (kidsOf.get(n.id)?.length ?? 0) === 0);
   const collapse = (n: AstNode): AstNode => {
     let cur = n;
     for (;;) {
@@ -166,10 +182,16 @@ export function layoutAst(
   // ---- Phase 1: bottom-up intrinsic sizing ------------------------------
   const size = (node: AstNode): Sized => {
     const label = opts.labelOf(node);
-    const lb = label ? opts.measure(label) : { w: 0, h: 0 };
+    const lb = label
+      ? opts.measure(label)
+      : reserveBand(node)
+        ? // No text, but reserve a label-height band (square, so a childless
+          // node is still big enough for the badge that lives in it).
+          { w: opts.measure('').h, h: opts.measure('').h }
+        : { w: 0, h: 0 };
     const kids = (kidsOf.get(node.id) ?? [])
       .map(collapse)
-      .filter((k) => !isPrunedEmpty(k));
+      .filter((k) => !isPruned(k));
 
     if (node.op) {
       // BinaryExpression: unlabeled, exactly two operands → [l] op [r].
@@ -200,13 +222,18 @@ export function layoutAst(
     let rowY = 0;
     let rowH = 0;
     let blockW = 0;
+    let rowGroupId: string | null = null; // group of the current row's items
     for (const k of sizedKids) {
-      if (rowX > 0 && rowX + k.w > wrapWidth) {
+      const g = rowGroup(k.node);
+      // Wrap when the row is full OR the group changes — so e.g. `extends`
+      // clauses never share a row with ordinary members.
+      if (rowX > 0 && (g !== rowGroupId || rowX + k.w > wrapWidth)) {
         blockW = Math.max(blockW, rowX - GAP); // drop trailing gap
         rowY += rowH + GAP;
         rowX = 0;
         rowH = 0;
       }
+      if (rowX === 0) rowGroupId = g; // first item fixes the row's group
       placed.push({ sized: k, x: rowX, y: rowY });
       rowX += k.w + GAP;
       rowH = Math.max(rowH, k.h);
@@ -241,6 +268,8 @@ export function layoutAst(
       start: s.node.start,
       end: s.node.end,
       exported: s.node.exported,
+      abstract: s.node.abstract,
+      extendsName: s.node.extendsName,
       rect: { x, y, w: s.w, h: s.h },
       depth,
     };
@@ -278,6 +307,9 @@ export interface FitInteriorOpts {
   labelOf: (n: { name: string | null; syntaxKind: string }) => string | null;
   significant?: (n: { name: string | null; syntaxKind: string }) => boolean;
   pruneEmpty?: (n: { name: string | null; syntaxKind: string }) => boolean;
+  prune?: (n: { name: string | null; syntaxKind: string }) => boolean;
+  reserveBand?: (n: { name: string | null; syntaxKind: string }) => boolean;
+  rowGroup?: (n: { name: string | null; syntaxKind: string }) => string;
   measure: (text: string) => { w: number; h: number };
   min: { w: number; h: number };
   max: { w: number; h: number };
@@ -294,6 +326,9 @@ export function fitInterior(
     labelOf: opts.labelOf,
     significant: opts.significant,
     pruneEmpty: opts.pruneEmpty,
+    prune: opts.prune,
+    reserveBand: opts.reserveBand,
+    rowGroup: opts.rowGroup,
     measure: opts.measure,
     wrapWidth: opts.wrapWidth,
   });

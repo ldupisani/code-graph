@@ -70,6 +70,8 @@ export function extractAst(
       name: friendlyName(node, inlined),
       op: operatorOf(node),
       exported: exportedOf(node),
+      abstract: abstractOf(node),
+      extendsName: extendsNameOf(node),
       start: node.getStart(),
       end: node.getEnd(),
     });
@@ -379,6 +381,25 @@ function exportedOf(node: Node): true | undefined {
   return undefined;
 }
 
+// `abstract` class / method / property / accessor. Undefined (omitted from
+// the wire) otherwise, to keep payloads lean.
+function abstractOf(node: Node): true | undefined {
+  return Node.isAbstractable(node) && node.isAbstract() ? true : undefined;
+}
+
+// Base type text of a class/interface `extends` clause, rendered inline on
+// the header. A class has at most one; an interface may extend several.
+function extendsNameOf(node: Node): string | undefined {
+  if (Node.isClassDeclaration(node)) {
+    return node.getExtends()?.getText() || undefined;
+  }
+  if (Node.isInterfaceDeclaration(node)) {
+    const exts = node.getExtends();
+    return exts.length ? exts.map((e) => e.getText()).join(', ') : undefined;
+  }
+  return undefined;
+}
+
 function isTrivialToken(kind: ts.SyntaxKind): boolean {
   // SyntaxKind enum is laid out so punctuation and keyword tokens occupy
   // contiguous ranges (FirstPunctuation..LastPunctuation, FirstKeyword..LastKeyword).
@@ -464,6 +485,21 @@ function friendlyName(node: Node, inlined: Set<Node>): string | null {
   ) {
     const text = node.getText();
     return text.length > 60 ? text.slice(0, 57) + '…' : text;
+  }
+
+  // The static text chunks of a substitution template (`...${x}...`): show
+  // their cooked content (the `${...}` expressions are separate child nodes).
+  // Backtick-quoted so leading/trailing spaces are visible; empty chunks
+  // (e.g. the head of `${x}...`) get no label.
+  if (
+    kind === ts.SyntaxKind.TemplateHead ||
+    kind === ts.SyntaxKind.TemplateMiddle ||
+    kind === ts.SyntaxKind.TemplateTail
+  ) {
+    const text = (node.compilerNode as ts.LiteralLikeNode).text;
+    if (!text) return null;
+    const body = text.length > 58 ? text.slice(0, 55) + '…' : text;
+    return '`' + body + '`';
   }
   return null;
 }

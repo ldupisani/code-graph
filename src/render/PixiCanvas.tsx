@@ -14,7 +14,7 @@ import {
   EXPANDED_MIN,
   type FileLayoutResult,
 } from '../graph/layout';
-import { fileLabel, labelScreenBox } from '../graph/labels';
+import { fileLabel, labelScreenBox, measureMono } from '../graph/labels';
 import { useGraphStore } from '../graph/store';
 import {
   fitInterior,
@@ -46,6 +46,8 @@ const COLORS = {
   astOutlineBlock: 0xe06cff, // magenta — Block
   astOutlineObject: 0xe8c84a, // yellow — ObjectLiteralExpression
   astOutlineParam: 0x6cb6ff, // light blue — Parameter
+  astOutlineAbstract: 0x4ec9b0, // dashed — abstract/interface (editor type color)
+  astOutlineAbstractFn: 0x808080, // dotted — abstract function (≈50% white)
   text: 0xeeeeee,
   textDim: 0xb0b0b8,
   edge: 0x565a63, // import links: subdued but always visible
@@ -55,7 +57,8 @@ const SEMANTIC_EDGE_STYLE: Record<
   SemanticEdgeKind,
   { color: number; width: number; alpha: number; arrowSize: number }
 > = {
-  calls: { color: 0xff8b3d, width: 1.2, alpha: 0.85, arrowSize: 7 },
+  // 0xdcdcaa == SYNTAX.func — same yellow as the call labels/triangle.
+  calls: { color: 0xdcdcaa, width: 1.2, alpha: 0.85, arrowSize: 7 },
   extends: { color: 0x9aa3ff, width: 1.8, alpha: 0.9, arrowSize: 9 },
   implements: { color: 0x60d0c0, width: 1.4, alpha: 0.85, arrowSize: 8 },
 };
@@ -117,7 +120,6 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
   NonNullExpression: 'non-null',
   // Other
   HeritageClause: 'extends',
-  ExpressionWithTypeArguments: 'type ref',
   TypeReference: 'type',
   ImportDeclaration: 'import',
   ExportDeclaration: 'export',
@@ -132,8 +134,19 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
 // anything not curated) returns null, so it neither competes with a real
 // name nor reserves a label band. Such single-child wrappers are then
 // flattened away entirely by the layout (see layoutAst).
-function labelFor(node: { name: string | null; syntaxKind: string }): string | null {
-  if (node.name) return node.name;
+function labelFor(node: {
+  name: string | null;
+  syntaxKind: string;
+  extendsName?: string;
+}): string | null {
+  if (node.name) {
+    // Inline the extends clause on the header: "Dog extends Animal". The
+    // sizer measures this composite (single source of truth), the renderer
+    // draws it as colored segments.
+    return node.extendsName
+      ? `${node.name} extends ${node.extendsName}`
+      : node.name;
+  }
   return SYNTAX_KIND_LABELS[node.syntaxKind] ?? null;
 }
 
@@ -150,7 +163,13 @@ const KIND_OUTLINE: Record<string, number> = {
 // `block` or yellow `object` must survive even as a single-child wrapper,
 // otherwise its outline would never be drawn.)
 function isSignificant(node: { name: string | null; syntaxKind: string }): boolean {
-  return labelFor(node) !== null || KIND_OUTLINE[node.syntaxKind] !== undefined;
+  return (
+    labelFor(node) !== null ||
+    KIND_OUTLINE[node.syntaxKind] !== undefined ||
+    // Constructor has no label but its own box (white outline + wrench
+    // badge), so it must never collapse as a single-child pass-through.
+    node.syntaxKind === 'Constructor'
+  );
 }
 
 // Label text colored like the code editor (Monaco `vs-dark` / Dark+ family,
@@ -231,6 +250,9 @@ const SYNTAX_CATEGORY: Record<string, keyof typeof SYNTAX> = {
   StringLiteral: 'string',
   NoSubstitutionTemplateLiteral: 'string',
   TemplateExpression: 'string',
+  TemplateHead: 'string',
+  TemplateMiddle: 'string',
+  TemplateTail: 'string',
   NumericLiteral: 'number',
   BigIntLiteral: 'number',
 };
@@ -351,7 +373,7 @@ export function PixiCanvas({ project }: CanvasProps) {
       // the user takes manual camera control. null = not following.
       let followId: string | null = null;
 
-      // Directional `${fromFileId} ${toFileId}` keys for semantic edges
+      // Directional `${fromFileId} ${toFileId}` keys for semantic edges
       // (calls/extends/implements) actually drawn this frame. drawSemanticEdges
       // rebuilds it; drawEdges (which runs earlier in the frame) reads the
       // previous frame's set to suppress now-redundant import lines — a
@@ -385,6 +407,12 @@ export function PixiCanvas({ project }: CanvasProps) {
           labelOf: labelFor,
           significant: isSignificant,
           pruneEmpty: (n) => n.syntaxKind === 'Block', // drop empty `{}`
+          // extends/implements clauses are inlined on the class header.
+          prune: (n) => n.syntaxKind === 'HeritageClause',
+          // Constructor reserves a label-height band for its wrench badge.
+          reserveBand: (n) => n.syntaxKind === 'Constructor',
+          rowGroup: (n) =>
+            n.syntaxKind === 'HeritageClause' ? 'extends' : 'n',
           // Exactly the box the renderer's LOD gate checks below, so a cell
           // sized here shows its label at 1:1 and nothing larger.
           measure: labelScreenBox,
@@ -423,6 +451,10 @@ export function PixiCanvas({ project }: CanvasProps) {
             labelOf: labelFor,
             significant: isSignificant,
             pruneEmpty: (n) => n.syntaxKind === 'Block', // drop empty `{}`
+            prune: (n) => n.syntaxKind === 'HeritageClause',
+            reserveBand: (n) => n.syntaxKind === 'Constructor',
+            rowGroup: (n) =>
+              n.syntaxKind === 'HeritageClause' ? 'extends' : 'n',
             measure: labelScreenBox,
           }),
         );
@@ -609,12 +641,56 @@ export function PixiCanvas({ project }: CanvasProps) {
         const isSelected = selection === node.id;
         const tint = depthTint(node.depth);
         const fillColor = isSelected ? COLORS.astSelected : tint;
+        // A call/new argument is a "parameter block for a call" — style it
+        // like a function `Parameter` (light-blue outline + rounded).
+        const argParent = node.parentId
+          ? tree.byId.get(node.parentId)
+          : undefined;
+        const isCallArg =
+          argParent?.syntaxKind === 'CallExpression' ||
+          argParent?.syntaxKind === 'NewExpression';
+        const paramLike = node.syntaxKind === 'Parameter' || isCallArg;
         // Kind outlines have their own (much lower) zoom threshold so they
-        // reappear well before the rest of the detail does.
+        // reappear well before the rest of the detail does. A call argument
+        // with no outline of its own gets the parameter light-blue.
         const kindOutline =
           cameraScale < OUTLINE_BELOW
             ? undefined
-            : KIND_OUTLINE[node.syntaxKind];
+            : (KIND_OUTLINE[node.syntaxKind] ??
+              (isCallArg ? COLORS.astOutlineParam : undefined));
+        // Abstract definitions AND interfaces get a green dashed outline
+        // (TS interfaces aren't flagged `abstract` but are abstract by
+        // nature). Same zoom gate as the kind outlines.
+        const abstractOutline =
+          (!!node.abstract || node.syntaxKind === 'InterfaceDeclaration') &&
+          cameraScale >= OUTLINE_BELOW;
+        // An abstract *function* (method/accessor) reads differently from an
+        // abstract class/interface: grey + dotted instead of green + dashed.
+        const abstractFn =
+          !!node.abstract &&
+          (node.syntaxKind === 'MethodDeclaration' ||
+            node.syntaxKind === 'GetAccessor' ||
+            node.syntaxKind === 'SetAccessor');
+        // A concrete class gets the same green, but SOLID (abstract classes
+        // hit the dashed branch above first, so this is non-abstract only).
+        const classOutline =
+          (node.syntaxKind === 'ClassDeclaration' ||
+            node.syntaxKind === 'ClassExpression') &&
+          cameraScale >= OUTLINE_BELOW;
+        // A concrete function definition gets the same grey, but SOLID
+        // (abstract functions hit the dotted branch above first).
+        const fnOutline =
+          (node.syntaxKind === 'FunctionDeclaration' ||
+            node.syntaxKind === 'FunctionExpression' ||
+            node.syntaxKind === 'ArrowFunction' ||
+            node.syntaxKind === 'MethodDeclaration' ||
+            node.syntaxKind === 'GetAccessor' ||
+            node.syntaxKind === 'SetAccessor') &&
+          cameraScale >= OUTLINE_BELOW;
+        // Constructor: white box outline + a white wrench badge inside, on
+        // the same cheap-cue zoom gate as the kind outlines.
+        const isCtor =
+          node.syntaxKind === 'Constructor' && cameraScale >= OUTLINE_BELOW;
         let borderColor: number = COLORS.astBorder;
         let borderWidth = 0.5;
         let borderAlpha = 0.9;
@@ -630,11 +706,34 @@ export function PixiCanvas({ project }: CanvasProps) {
           borderColor = kindOutline;
           borderWidth = 1 / cameraScale;
           borderAlpha = 1;
+        } else if (abstractOutline) {
+          // Visible even when unselected — its own color/width, not the
+          // faint default border (the dashing is applied below). Abstract
+          // functions are grey; abstract classes/interfaces are green.
+          borderColor = abstractFn
+            ? COLORS.astOutlineAbstractFn
+            : COLORS.astOutlineAbstract;
+          borderWidth = 1 / cameraScale;
+          borderAlpha = 1;
+        } else if (classOutline) {
+          // Solid green — same color as the class name, not dashed.
+          borderColor = SYNTAX.type;
+          borderWidth = 1 / cameraScale;
+          borderAlpha = 1;
+        } else if (isCtor) {
+          borderColor = COLORS.astSelectedBorder; // white
+          borderWidth = 1 / cameraScale;
+          borderAlpha = 1;
+        } else if (fnOutline) {
+          // Solid grey — same color as an abstract function, but not dotted.
+          borderColor = COLORS.astOutlineAbstractFn;
+          borderWidth = 1 / cameraScale;
+          borderAlpha = 1;
         }
-        // Parameters get just-slightly-rounded corners as a subtle nod to
-        // the round brackets a parameter list lives in — small enough that
-        // the label stays well inside the border.
-        if (node.syntaxKind === 'Parameter') {
+        // Parameters (and call arguments — parameter blocks for a call) get
+        // just-slightly-rounded corners, a subtle nod to the round brackets
+        // a parameter list lives in — small enough the label stays inside.
+        if (paramLike) {
           const radius = Math.min(
             4 / cameraScale, // ~4px on screen — a gentle curve, not a pill
             Math.min(node.rect.w, node.rect.h) / 2,
@@ -643,6 +742,34 @@ export function PixiCanvas({ project }: CanvasProps) {
             .roundRect(x, y, node.rect.w, node.rect.h, radius)
             .fill({ color: fillColor, alpha: isSelected ? 1 : 0.92 })
             .stroke({ color: borderColor, width: borderWidth, alpha: borderAlpha });
+        } else if (abstractOutline) {
+          // Abstract definition: dashed/dotted box outline. Abstract
+          // functions get a fine dotted pattern; abstract classes/interfaces
+          // the extends-style dash. Fill first, then stroke the perimeter.
+          const w = node.rect.w;
+          const h = node.rect.h;
+          worldGfx
+            .rect(x, y, w, h)
+            .fill({ color: fillColor, alpha: isSelected ? 1 : 0.92 });
+          const dash = (abstractFn ? 1.2 : 3.5) / cameraScale;
+          const dgap = (abstractFn ? 2.4 : 2.5) / cameraScale;
+          emitDashed(
+            worldGfx,
+            [
+              { x, y },
+              { x: x + w, y },
+              { x: x + w, y: y + h },
+              { x, y: y + h },
+              { x, y },
+            ],
+            dash,
+            dgap,
+          );
+          worldGfx.stroke({
+            color: borderColor,
+            width: borderWidth,
+            alpha: borderAlpha,
+          });
         } else {
           worldGfx
             .rect(x, y, node.rect.w, node.rect.h)
@@ -661,18 +788,18 @@ export function PixiCanvas({ project }: CanvasProps) {
           area: node.rect.w * node.rect.h,
         });
 
-        // Constructor badge: a small outlined wrench in the top-right corner
-        // so a constructor is recognizable even though it has no name label.
-        // Same cheap-structural-cue zoom gate as the kind outlines.
-        if (node.syntaxKind === 'Constructor' && cameraScale >= OUTLINE_BELOW) {
+        // Constructor badge: a small white outlined wrench centered at the
+        // top of the box (in the reserved label band), so a constructor is
+        // recognizable even though it has no name label.
+        if (isCtor) {
           const s = 11 / cameraScale; // glyph footprint, screen-constant
-          const gap = 4 / cameraScale; // clearance between badge and box
-          // Float it just ABOVE the box's top-left, outside the interior,
-          // so it never overlaps the constructor's child nodes.
-          const gx = x; // left-aligned to the box edge
-          const gy = y - gap - s; // entirely above the box top
+          // Centered horizontally; vertically centered in the reserved top
+          // band (same height the treemap reserved for it).
+          const bandH = labelScreenBox('').h;
+          const gx = x + node.rect.w / 2 - s / 2;
+          const gy = y + bandH / 2 - s / 2;
           const lw = 1.2 / cameraScale; // outline stroke, ~constant on screen
-          const col = SYNTAX.func; // ties to "this is a (constructor) function"
+          const col = COLORS.astSelectedBorder; // white
           // Handle: lower-left → up toward the head.
           worldGfx
             .moveTo(gx + s * 0.12, gy + s * 0.9)
@@ -701,8 +828,85 @@ export function PixiCanvas({ project }: CanvasProps) {
         // out the container shrinks under it — gate on the same box the sizer
         // used so the label is hidden the moment it would spill out, instead
         // of overflowing.
+        // Draw the header as colored segments: name (type) + " extends "
+        // (keyword) + base (type), preserving syntax highlighting. Used in
+        // place of the single-color put when the node has an extends clause.
+        const segScale = 1 / cameraScale;
+        const drawHeaderSegments = (
+          startX: number,
+          midY: number,
+          centered: boolean,
+        ): void => {
+          const segs = [
+            { t: node.name ?? '', c: syntaxColor(node) },
+            { t: ' extends ', c: SYNTAX.keyword },
+            { t: node.extendsName ?? '', c: SYNTAX.type },
+          ];
+          let total = 0;
+          for (const s of segs) total += measureMono(s.t, 11).w;
+          let cx = centered ? startX - (total * segScale) / 2 : startX;
+          for (const s of segs) {
+            if (!s.t) continue;
+            labelPool.put({
+              text: s.t,
+              worldX: cx,
+              worldY: midY,
+              color: s.c,
+              size: 11,
+              anchorX: 0,
+              anchorY: centered ? 0.5 : 0,
+              scale: segScale,
+            });
+            cx += measureMono(s.t, 11).w * segScale;
+          }
+        };
+        const composite = node.extendsName != null && node.name != null;
+        // The " extends Base" suffix is a non-name detail, so it drops in the
+        // simplified tier along with operators/kind labels — just the name.
+        const showExtends = composite && !simplified;
         const labelText = labelFor(node);
         const labelBox = labelText ? labelScreenBox(labelText) : null;
+        // A call site: the "call" word becomes a right-pointing triangle
+        // outline; the callee text (if any) follows in the node's color.
+        const isCall = node.syntaxKind === 'CallExpression';
+        const callee =
+          isCall && labelText && labelText.startsWith('call ')
+            ? labelText.slice(5)
+            : '';
+        const drawCallGlyph = (
+          startX: number,
+          refY: number,
+          centered: boolean,
+        ): void => {
+          const gs = 1 / cameraScale;
+          // One line-box tall; triangle and text are both anchored on its
+          // vertical center so they always read as centered with each other.
+          const lineH = measureMono('x', 11).h * gs; // line-box, for centering
+          const triH = 11 * gs; // same height as the label font
+          const triW = triH * 0.85;
+          const gap = 7 * gs; // breathing room between the glyph and the text
+          const calleeW = callee ? measureMono(callee, 11).w * gs : 0;
+          const totalW = triW + (callee ? gap + calleeW : 0);
+          const sx = centered ? startX - totalW / 2 : startX;
+          // `refY` is the line top for container labels, the line center for
+          // centered (leaf) labels — normalize to a center either way.
+          const cy = centered ? refY : refY + lineH / 2;
+          worldGfx
+            .poly([sx, cy - triH / 2, sx, cy + triH / 2, sx + triW, cy])
+            .stroke({ color: syntaxColor(node), width: gs, alpha: 1 });
+          if (callee) {
+            labelPool.put({
+              text: callee,
+              worldX: sx + triW + gap,
+              worldY: cy,
+              color: syntaxColor(node),
+              size: 11,
+              anchorX: 0,
+              anchorY: 0.5,
+              scale: gs,
+            });
+          }
+        };
         // In the simplified tier only real names survive — generic kind
         // labels (type / if / arrow fn / call / access …) drop out.
         const nameOk = !simplified || node.name != null;
@@ -739,25 +943,55 @@ export function PixiCanvas({ project }: CanvasProps) {
           const parent = node.parentId ? tree.byId.get(node.parentId) : null;
           const parentLabel = parent ? labelFor(parent) : null;
           if (parentLabel !== labelText) {
+            // In the simplified tier a composite header collapses to just
+            // the name (labelText is a narrowed string in this block).
+            const headerText =
+              composite && simplified && node.name ? node.name : labelText;
             const hasKids = !!tree.childrenByParent.get(node.id)?.length;
             if (hasKids) {
-              // Container: the label titles the children, so it sits at the
-              // top-left. Margins are screen px → /cameraScale to world.
-              labelPool.put({
-                text: labelText,
-                worldX: x + 4 / cameraScale,
-                worldY: y + 3 / cameraScale,
-                color: syntaxColor(node),
-                size: 11,
-                anchorX: 0,
-                anchorY: 0,
-                scale: 1 / cameraScale,
-              });
+              // Container: the label titles the children, top-left.
+              if (showExtends) {
+                drawHeaderSegments(
+                  x + 4 / cameraScale,
+                  y + 3 / cameraScale,
+                  false,
+                );
+              } else if (isCall) {
+                drawCallGlyph(
+                  x + 4 / cameraScale,
+                  y + 3 / cameraScale,
+                  false,
+                );
+              } else {
+                labelPool.put({
+                  text: headerText,
+                  worldX: x + 4 / cameraScale,
+                  worldY: y + 3 / cameraScale,
+                  color: syntaxColor(node),
+                  size: 11,
+                  anchorX: 0,
+                  anchorY: 0,
+                  scale: 1 / cameraScale,
+                });
+              }
+            } else if (showExtends) {
+              // Leaf class (empty body): centered composite header.
+              drawHeaderSegments(
+                x + node.rect.w / 2,
+                y + node.rect.h / 2,
+                true,
+              );
+            } else if (isCall) {
+              drawCallGlyph(
+                x + node.rect.w / 2,
+                y + node.rect.h / 2,
+                true,
+              );
             } else {
               // Leaf / value (an operand like `20`, `i`, `j`): center it in
               // its box, symmetric with the left chip and the operator glyph.
               labelPool.put({
-                text: labelText,
+                text: headerText,
                 worldX: x + node.rect.w / 2,
                 worldY: y + node.rect.h / 2,
                 color: syntaxColor(node),
@@ -1057,41 +1291,53 @@ function drawEdges(
   }
 }
 
-// Control points for the connector curve drawn between the caller's
-// bottom-right OUTPUT port and the callee's left-edge INPUT port:
-//  (a) bow into open space — don't slice through either rect body;
-//  (b) arrive at the callee port HORIZONTALLY so the arrowhead reads as
-//      entering the left edge — `cp2.y === callee.y` is the invariant the
-//      downstream tangent math depends on;
-//  (c) stay sane across the ~38px (collapsed file) .. ~380px (expanded)
-//      rect-size range and any relative placement of the two ports.
-function semanticBezierControls(
-  caller: { x: number; y: number },
-  callee: { x: number; y: number },
-): { cp1: { x: number; y: number }; cp2: { x: number; y: number } } {
-  const clamp = (v: number, lo: number, hi: number) =>
-    Math.min(Math.max(v, lo), hi);
-  const dx = callee.x - caller.x;
-  const dy = callee.y - caller.y;
-  // How far the callee sits *behind* the caller (to its left). The curve has
-  // to double back here, which is exactly when it cusps — feed that back-
-  // travel into the handle length so the loop rounds out instead of kinking.
-  const back = Math.max(0, -dx);
-  // Horizontal reach: proportional to span + back-travel, with a generous
-  // floor (short edges still bow smoothly) and a high cap.
-  const h = clamp(0.5 * Math.abs(dx) + 0.7 * back + 40, 64, 320);
-  // Vertical bias: walk the curve down out of the bottom-right corner first
-  // so it clears the source rect's body before arcing toward the callee.
-  const v = clamp(0.35 * Math.abs(dy) + 20, 28, 150);
+// Call/implements connector. Picks the closest pair of edge-midpoint ports
+// (top/bottom/left/right center) on the caller and callee rects so the two
+// nodes connect over the shortest span, and bows the curve out perpendicular
+// to each chosen face (handle length scales with the gap, clamped).
+function callConnector(
+  from: { x: number; y: number; w: number; h: number },
+  to: { x: number; y: number; w: number; h: number },
+): {
+  startPort: { x: number; y: number };
+  endPort: { x: number; y: number };
+  cp1: { x: number; y: number };
+  cp2: { x: number; y: number };
+} {
+  const ports = (r: { x: number; y: number; w: number; h: number }) => {
+    const cx = r.x + r.w / 2;
+    const cy = r.y + r.h / 2;
+    return [
+      { x: cx, y: r.y, nx: 0, ny: -1 }, // top
+      { x: cx, y: r.y + r.h, nx: 0, ny: 1 }, // bottom
+      { x: r.x, y: cy, nx: -1, ny: 0 }, // left
+      { x: r.x + r.w, y: cy, nx: 1, ny: 0 }, // right
+    ];
+  };
+  const fps = ports(from);
+  const tps = ports(to);
+  let best = { d: Infinity, a: fps[0], b: tps[0] };
+  for (const a of fps) {
+    for (const b of tps) {
+      const d = Math.hypot(b.x - a.x, b.y - a.y);
+      if (d < best.d) best = { d, a, b };
+    }
+  }
+  const { a, b, d } = best;
+  // Handle out of each face so the curve enters/exits perpendicular; scales
+  // with the span, with a floor (short hops still bow) and a cap.
+  const h = Math.min(Math.max(d * 0.5, 36), 260);
   return {
-    cp1: { x: caller.x + h, y: caller.y + v },
-    cp2: { x: callee.x - h, y: callee.y },
+    startPort: { x: a.x, y: a.y },
+    endPort: { x: b.x, y: b.y },
+    cp1: { x: a.x + a.nx * h, y: a.y + a.ny * h },
+    cp2: { x: b.x + b.nx * h, y: b.y + b.ny * h },
   };
 }
 
 // Control points for the inheritance connector: BOTTOM of the superclass
 // (`start`, the thing being extended) → TOP of the subclass (`end`, the thing
-// that extends it). The axis-swapped mirror of semanticBezierControls:
+// that extends it). Fixed vertical class-hierarchy geometry:
 //  (a) leave the bottom port going DOWN so it clears the superclass body;
 //  (b) arrive at the top port VERTICALLY so the arrowhead reads as entering
 //      the top edge — `cp2.x === end.x` is the invariant the tangent math
@@ -1228,9 +1474,8 @@ function drawSemanticEdges(
       endPort = { x: from.x + from.w / 2, y: from.y };    // top of subclass
       ({ cp1, cp2 } = inheritanceBezierControls(startPort, endPort));
     } else {
-      startPort = { x: from.x + from.w, y: from.y + from.h }; // bottom-right of caller
-      endPort = { x: to.x, y: to.y };                         // top-left of callee
-      ({ cp1, cp2 } = semanticBezierControls(startPort, endPort));
+      // Closest top/bottom/left/right edge-center ports on both rects.
+      ({ startPort, endPort, cp1, cp2 } = callConnector(from, to));
     }
 
     if (dashed) {

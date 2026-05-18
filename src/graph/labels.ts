@@ -28,7 +28,11 @@ export const AST_LABEL_FONT = 11;
 // Generous inset so the names we keep get breathing room and adjacent
 // labels don't visually collide.
 export const LABEL_INSET_X = 9;
-export const LABEL_INSET_Y = 7;
+// Container labels are pinned to the top of their box, so this inset is
+// almost entirely the empty band *under* the label before the inner tree
+// items. Kept small (≈⅓ less than the prior value) so children sit close
+// beneath the title rather than after a tall gap.
+export const LABEL_INSET_Y = 4;
 
 // The box (screen px) a node's cell must have for its label to fit: the text
 // plus the inset on both sides. THE single source of truth — used identically

@@ -85,6 +85,13 @@ export interface AstNode {
   // declaration, `export`/`export default`). Used for zoomed-out LOD: only
   // high-level constructs keep their label when text no longer fits.
   exported?: boolean;
+  // True for an `abstract` declaration (class/method/property/accessor).
+  // The renderer gives it a dashed box outline.
+  abstract?: boolean;
+  // For a class/interface, the base type text from its `extends` clause
+  // (e.g. "Animal", or "A, B" for an interface). Rendered inline on the
+  // header ("Dog extends Animal") instead of as a separate block.
+  extendsName?: string;
   start: number;          // char offset in source, inclusive
   end: number;            // char offset, exclusive
 }

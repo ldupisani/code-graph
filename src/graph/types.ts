@@ -21,6 +21,9 @@ export interface SimFileNode {
   // so collapsing restores the content size rather than a global constant.
   collapsedW: number;
   collapsedH: number;
+  // True while this file is open (drawn as a big box) — used by the
+  // link-clearance force to treat it as an obstacle.
+  expanded?: boolean;
   relativePath: string;
 }
 

@@ -19,6 +19,14 @@ export interface TreemapNode {
   end: number;
   rect: Rect;
   depth: number;
+  exported?: boolean;
+  // Relational rendering: when set, the renderer draws `op` centered at
+  // `opAnchor` between this node's two operand boxes. For the `let i = j`
+  // case the left operand is the node's own name, drawn in `labelChip`
+  // instead of as the usual top-of-box label.
+  op?: string;
+  opAnchor?: { x: number; y: number };
+  labelChip?: Rect;
 }
 
 export interface TreemapLayout {
@@ -27,209 +35,265 @@ export interface TreemapLayout {
   rootId: string;
 }
 
-// Side / bottom padding around children — cosmetic gap so adjacent siblings
-// don't share borders.
-const PADDING = 4;
-// Top padding reserves a label band so the parent's name/kind label doesn't
-// overlap the children laid out inside. Sized for the 11pt monospace label
-// plus a couple of pixels.
-const TOP_LABEL_PADDING = 16;
-// Smallest inner padding when a rect gets too tight for the regular padding to
-// be sensible. Keeps tiny leaves visually distinct without overflowing.
-const MIN_PADDING = 0.5;
+// --- Content-sized nested layout -----------------------------------------
+// The old squarified treemap sized cells by source character span, which
+// produced giant boxes holding a single short label. Instead every node is
+// sized BOTTOM-UP to exactly its own label plus its children, packed into
+// wrapped rows — so a box is never bigger than the text it contains.
 
-export function layoutAst(ast: FileAstResponse, outerRect: Rect): TreemapLayout {
-  const childrenByParent = new Map<string | null, AstNode[]>();
+// Inner padding on every side of a node. Kept small: the label box already
+// carries its own text inset (see labelScreenBox), this is just breathing
+// room so nested borders don't touch.
+const PAD = 4;
+// Gap between the label band and the children block, and between siblings.
+const GAP = 4;
+// Children flow left→right and wrap to a new row once the row would exceed
+// this content width. A single child wider than this still gets its own row
+// (a node is never split). Tune for wider/narrower expanded files.
+const DEFAULT_WRAP_WIDTH = 480;
+
+export interface AstLayoutOpts {
+  originX: number;
+  originY: number;
+  // Mirrors the renderer's label resolution so a node is sized to exactly
+  // the text it will show (and unlabeled nodes stay tiny).
+  labelOf: (n: { name: string | null; syntaxKind: string }) => string | null;
+  // Whether a node is worth its own box and must NOT be collapsed as a
+  // single-child pass-through — true if it has a label OR a kind outline.
+  // (Defaults to "has a label" when omitted.)
+  significant?: (n: { name: string | null; syntaxKind: string }) => boolean;
+  // Box (w,h) a label needs in its cell — the SAME function the renderer's
+  // LOD gate checks, so a node is exactly big enough for its own label.
+  measure: (text: string) => { w: number; h: number };
+  wrapWidth?: number;
+}
+
+interface Sized {
+  node: AstNode;
+  labelH: number;
+  w: number;
+  h: number;
+  // Child placements relative to this node's children-block origin.
+  kids: { sized: Sized; x: number; y: number }[];
+  // Relational layout (op between operands), all relative to the
+  // children-block origin. `labelChip` present only for the `let i = j`
+  // shape where the left operand is this node's own name.
+  op?: string;
+  opRel?: { x: number; y: number };
+  labelChip?: Rect;
+}
+
+// Lay every AstNode out as a nested box sized bottom-up to its own label and
+// its children packed into wrapped rows. No area heuristic, no fixed outer
+// box: each node is exactly large enough for its content plus padding, so
+// there is never a giant box with a lone label at the top.
+export function layoutAst(
+  ast: FileAstResponse,
+  opts: AstLayoutOpts,
+): TreemapLayout {
+  const wrapWidth = opts.wrapWidth ?? DEFAULT_WRAP_WIDTH;
+
+  const kidsOf = new Map<string | null, AstNode[]>();
   for (const n of ast.nodes) {
-    const arr = childrenByParent.get(n.parentId) ?? [];
+    const arr = kidsOf.get(n.parentId) ?? [];
     arr.push(n);
-    childrenByParent.set(n.parentId, arr);
+    kidsOf.set(n.parentId, arr);
   }
-  // Stable sibling order: by source position (start). The walk produces them
-  // in order anyway, but explicit sort makes layout deterministic if a future
-  // walker batches nodes differently.
-  for (const arr of childrenByParent.values()) arr.sort((a, b) => a.start - b.start);
+  // Stable source order so the layout reads the way the code does.
+  for (const arr of kidsOf.values()) arr.sort((a, b) => a.start - b.start);
 
   const byId = new Map<string, TreemapNode>();
   const out = new Map<string | null, TreemapNode[]>();
   const rootAst = ast.nodes.find((n) => n.id === ast.rootId);
-  if (!rootAst) {
-    return { byId, childrenByParent: out, rootId: ast.rootId };
-  }
+  if (!rootAst) return { byId, childrenByParent: out, rootId: ast.rootId };
 
-  const rootNode: TreemapNode = {
-    id: rootAst.id,
-    parentId: null,
-    syntaxKind: rootAst.syntaxKind,
-    name: rootAst.name,
-    start: rootAst.start,
-    end: rootAst.end,
-    rect: outerRect,
-    depth: 0,
+  // Collapse pure syntactic scaffolding: an unlabeled node with exactly one
+  // child is just a pass-through wrapper (block → expr → binary → …). Skip
+  // it and hoist its child, repeating down the chain, so these don't stack
+  // into a tower of empty boxes and a real name ends up next to its content.
+  // Collapsed nodes are absent from the layout (not drawn/selectable);
+  // semantic-edge anchoring already lifts to the nearest visible ancestor.
+  const significant =
+    opts.significant ?? ((n) => opts.labelOf(n) !== null);
+  const collapse = (n: AstNode): AstNode => {
+    let cur = n;
+    for (;;) {
+      if (significant(cur)) return cur;
+      const k = kidsOf.get(cur.id);
+      if (!k || k.length !== 1) return cur;
+      cur = k[0];
+    }
   };
-  byId.set(rootNode.id, rootNode);
-  out.set(null, [rootNode]);
 
-  layoutChildrenOf(rootAst, rootNode.rect, 1);
+  // A relational [left] op [right] block: operands side by side with a gap
+  // for the operator glyph (drawn by the renderer at `opRel`). `leftSized`
+  // xor `leftLabel` — a BinaryExpression's left box is its first operand; a
+  // `let i = j` declaration's left box is its own name (a label chip).
+  const relational = (
+    node: AstNode,
+    op: string,
+    leftSized: Sized | null,
+    leftLabel: { w: number; h: number } | null,
+    right: Sized,
+  ): Sized => {
+    const ob = opts.measure(op);
+    const lw = leftSized ? leftSized.w : leftLabel!.w;
+    const lh = leftSized ? leftSized.h : leftLabel!.h;
+    const rowH = Math.max(lh, right.h, ob.h);
+    const rightX = lw + GAP + ob.w + GAP;
+    const kids: { sized: Sized; x: number; y: number }[] = [];
+    if (leftSized) kids.push({ sized: leftSized, x: 0, y: (rowH - lh) / 2 });
+    kids.push({ sized: right, x: rightX, y: (rowH - right.h) / 2 });
+    return {
+      node,
+      labelH: 0, // operator nodes never reserve a top label band
+      w: rightX + right.w + PAD * 2,
+      h: rowH + PAD * 2,
+      kids,
+      op,
+      opRel: { x: lw + GAP + ob.w / 2, y: rowH / 2 },
+      labelChip: leftSized ? undefined : { x: 0, y: (rowH - lh) / 2, w: lw, h: lh },
+    };
+  };
+
+  // ---- Phase 1: bottom-up intrinsic sizing ------------------------------
+  const size = (node: AstNode): Sized => {
+    const label = opts.labelOf(node);
+    const lb = label ? opts.measure(label) : { w: 0, h: 0 };
+    const kids = (kidsOf.get(node.id) ?? []).map(collapse);
+
+    if (node.op) {
+      // BinaryExpression: unlabeled, exactly two operands → [l] op [r].
+      if (!label && kids.length === 2) {
+        return relational(node, node.op, size(kids[0]), null, size(kids[1]));
+      }
+      // `let i = j`: the name is the left operand, drawn as a chip.
+      if (label && kids.length === 1) {
+        return relational(node, node.op, null, lb, size(kids[0]));
+      }
+      // Anything else (typed decl, destructuring, …) → normal packing.
+    }
+
+    if (kids.length === 0) {
+      return {
+        node,
+        labelH: lb.h,
+        w: lb.w + PAD * 2,
+        h: lb.h + PAD * 2,
+        kids: [],
+      };
+    }
+
+    const sizedKids = kids.map(size);
+    // Wrapped-row packing, source order preserved.
+    const placed: { sized: Sized; x: number; y: number }[] = [];
+    let rowX = 0;
+    let rowY = 0;
+    let rowH = 0;
+    let blockW = 0;
+    for (const k of sizedKids) {
+      if (rowX > 0 && rowX + k.w > wrapWidth) {
+        blockW = Math.max(blockW, rowX - GAP); // drop trailing gap
+        rowY += rowH + GAP;
+        rowX = 0;
+        rowH = 0;
+      }
+      placed.push({ sized: k, x: rowX, y: rowY });
+      rowX += k.w + GAP;
+      rowH = Math.max(rowH, k.h);
+    }
+    blockW = Math.max(blockW, rowX - GAP);
+    const blockH = rowY + rowH;
+
+    const contentW = Math.max(lb.w, blockW);
+    const contentH = lb.h + (lb.h > 0 ? GAP : 0) + blockH;
+    return {
+      node,
+      labelH: lb.h,
+      w: contentW + PAD * 2,
+      h: contentH + PAD * 2,
+      kids: placed,
+    };
+  };
+
+  const rootSized = size(rootAst);
+
+  // ---- Phase 2: translate the sized tree to absolute rects --------------
+  const assign = (s: Sized, x: number, y: number, depth: number): void => {
+    // Children block sits inside the padding, below this node's label band
+    // (operator nodes have labelH 0, so it sits directly inside the padding).
+    const cx = x + PAD;
+    const cy = y + PAD + s.labelH + (s.labelH > 0 ? GAP : 0);
+    const tn: TreemapNode = {
+      id: s.node.id,
+      parentId: s.node.parentId,
+      syntaxKind: s.node.syntaxKind,
+      name: s.node.name,
+      start: s.node.start,
+      end: s.node.end,
+      exported: s.node.exported,
+      rect: { x, y, w: s.w, h: s.h },
+      depth,
+    };
+    if (s.op && s.opRel) {
+      tn.op = s.op;
+      tn.opAnchor = { x: cx + s.opRel.x, y: cy + s.opRel.y };
+      if (s.labelChip) {
+        tn.labelChip = {
+          x: cx + s.labelChip.x,
+          y: cy + s.labelChip.y,
+          w: s.labelChip.w,
+          h: s.labelChip.h,
+        };
+      }
+    }
+    byId.set(s.node.id, tn);
+    if (s.kids.length === 0) return;
+    const tmKids: TreemapNode[] = [];
+    for (const p of s.kids) {
+      assign(p.sized, cx + p.x, cy + p.y, depth + 1);
+      tmKids.push(byId.get(p.sized.node.id)!);
+    }
+    out.set(s.node.id, tmKids);
+  };
+  assign(rootSized, opts.originX, opts.originY, 0);
+  out.set(null, [byId.get(rootSized.node.id)!]);
 
   return { byId, childrenByParent: out, rootId: ast.rootId };
-
-  function layoutChildrenOf(parent: AstNode, parentRect: Rect, depth: number): void {
-    const kids = childrenByParent.get(parent.id);
-    if (!kids || kids.length === 0) return;
-
-    // Asymmetric padding: a tall band on top reserves space for the parent's
-    // label; thin sides/bottom keep siblings visually separated. Both are
-    // capped against the parent rect so tiny parents don't request more
-    // padding than they can give (which would yield a zero-area inner rect).
-    const minSide = Math.min(parentRect.w, parentRect.h);
-    const sidePad = Math.min(PADDING, Math.max(MIN_PADDING, minSide * 0.04));
-    const topPad = Math.min(TOP_LABEL_PADDING, Math.max(MIN_PADDING, minSide * 0.18));
-    const inner: Rect = {
-      x: parentRect.x + sidePad,
-      y: parentRect.y + topPad,
-      w: Math.max(0, parentRect.w - sidePad * 2),
-      h: Math.max(0, parentRect.h - topPad - sidePad),
-    };
-
-    const slices = sliceAndDice(kids, inner);
-    const treemapKids: TreemapNode[] = [];
-    for (let i = 0; i < kids.length; i++) {
-      const kid = kids[i];
-      const node: TreemapNode = {
-        id: kid.id,
-        parentId: kid.parentId,
-        syntaxKind: kid.syntaxKind,
-        name: kid.name,
-        start: kid.start,
-        end: kid.end,
-        rect: slices[i],
-        depth,
-      };
-      byId.set(node.id, node);
-      treemapKids.push(node);
-      layoutChildrenOf(kid, node.rect, depth + 1);
-    }
-    out.set(parent.id, treemapKids);
-  }
 }
 
-// Squarified treemap (Bruls, Huijberts & van Wijk, 2000). Produces cells with
-// aspect ratios close to 1 instead of the long strips slice-and-dice gave us
-// — important because AST roots typically have one large child (the class /
-// function body) and several tiny ones (imports, identifiers), and slicing
-// always-along-the-longer-axis assigned full-height strips to those tiny
-// imports, wasting vertical space and squashing the big child horizontally.
-//
-// The algorithm:
-//   1. Compute each child's area (proportional to character span).
-//   2. Sort children by area, descending — required for the worst-aspect
-//      heuristic to be monotone.
-//   3. Greedily add items to the current "row" while the worst aspect ratio
-//      improves; when adding the next item would worsen it, commit the row
-//      and start a new row in what's left of the rect.
-function sliceAndDice(items: AstNode[], rect: Rect): Rect[] {
-  if (items.length === 0) return [];
-  if (rect.w <= 0 || rect.h <= 0) {
-    return items.map(() => ({ x: rect.x, y: rect.y, w: 0, h: 0 }));
-  }
-
-  const weights = items.map((n) => Math.max(1, n.end - n.start));
-  const totalWeight = weights.reduce((s, v) => s + v, 0);
-  const totalArea = rect.w * rect.h;
-
-  // Walk children IN SOURCE ORDER. The earlier squarified version sorted by
-  // area descending, which scrambled top-to-bottom reading order — the
-  // largest item (the class body) ended up leftmost while the imports that
-  // come first in source were pushed right. Keeping input order makes the
-  // visual layout match the way the code reads.
-  const decorated = items.map((_, i) => ({
-    idx: i,
-    area: (weights[i] / totalWeight) * totalArea,
-  }));
-
-  const out: Rect[] = new Array(items.length);
-  let remainingRect = rect;
-  let row: typeof decorated = [];
-  let i = 0;
-
-  while (i < decorated.length) {
-    const next = decorated[i];
-    // Run the row along the LONGER side; subsequent rows stack along the
-    // SHORTER side. For a wide rect this means rows go top-to-bottom, items
-    // within a row left-to-right, which matches source order reading.
-    const span = Math.max(remainingRect.w, remainingRect.h);
-    const tryRow = row.length === 0 ? [next] : row.concat(next);
-
-    if (row.length === 0 || worstAspect(tryRow, span) <= worstAspect(row, span)) {
-      row = tryRow;
-      i++;
-    } else {
-      remainingRect = commitRow(row, remainingRect, out);
-      row = [];
-    }
-  }
-  if (row.length > 0) commitRow(row, remainingRect, out);
-
-  return out;
+// Intrinsic size of the whole AST = the root's content-sized box, clamped to
+// a sane maximum (and an absolute floor). Because sizing is bottom-up there
+// is no fixpoint: lay out once at the origin and read the root's size.
+export interface FitInteriorOpts {
+  labelOf: (n: { name: string | null; syntaxKind: string }) => string | null;
+  significant?: (n: { name: string | null; syntaxKind: string }) => boolean;
+  measure: (text: string) => { w: number; h: number };
+  min: { w: number; h: number };
+  max: { w: number; h: number };
+  wrapWidth?: number;
 }
 
-function worstAspect(row: { area: number }[], span: number): number {
-  if (row.length === 0 || span <= 0) return Infinity;
-  let sum = 0;
-  let max = 0;
-  let min = Infinity;
-  for (const r of row) {
-    sum += r.area;
-    if (r.area > max) max = r.area;
-    if (r.area < min) min = r.area;
-  }
-  if (sum === 0 || min === 0) return Infinity;
-  // Items run along `span`. Each item's slice = (area_i/sum)*span; depth
-  // across the row = sum/span. Worst aspect is dominated by the item with
-  // the most extreme area relative to the others.
-  const s2 = span * span;
-  const sum2 = sum * sum;
-  return Math.max((s2 * max) / sum2, sum2 / (s2 * min));
+export function fitInterior(
+  ast: FileAstResponse,
+  opts: FitInteriorOpts,
+): { w: number; h: number } {
+  const layout = layoutAst(ast, {
+    originX: 0,
+    originY: 0,
+    labelOf: opts.labelOf,
+    significant: opts.significant,
+    measure: opts.measure,
+    wrapWidth: opts.wrapWidth,
+  });
+  const root = layout.byId.get(layout.rootId)?.rect;
+  if (!root) return { w: opts.min.w, h: opts.min.h };
+  return {
+    w: Math.ceil(clamp(root.w, opts.min.w, opts.max.w)),
+    h: Math.ceil(clamp(root.h, opts.min.h, opts.max.h)),
+  };
 }
 
-// Place a committed row inside `rect` (writing into `out`) and return the
-// rect remaining for subsequent rows.
-function commitRow(
-  row: { idx: number; area: number }[],
-  rect: Rect,
-  out: Rect[],
-): Rect {
-  if (row.length === 0) return rect;
-  const sumArea = row.reduce((s, r) => s + r.area, 0);
-  if (sumArea === 0) {
-    for (const r of row) out[r.idx] = { x: rect.x, y: rect.y, w: 0, h: 0 };
-    return rect;
-  }
-
-  // Lay the row along the LONGER side; the next row sits on the OTHER
-  // side. For a wider-than-tall rect the row sits along the top spanning
-  // full width with items left-to-right, and the next row falls below it.
-  // For a taller rect the row sits at the left spanning full height with
-  // items top-to-bottom, and the next row sits to the right.
-  // Either way, the first item lands at the rect's origin (top-left) and
-  // subsequent items extend along the natural reading direction.
-  const horizontal = rect.w >= rect.h;
-  const span = horizontal ? rect.w : rect.h;
-  const depth = sumArea / span;
-
-  let offset = 0;
-  for (const r of row) {
-    const slice = (r.area / sumArea) * span;
-    if (horizontal) {
-      out[r.idx] = { x: rect.x + offset, y: rect.y, w: slice, h: depth };
-    } else {
-      out[r.idx] = { x: rect.x, y: rect.y + offset, w: depth, h: slice };
-    }
-    offset += slice;
-  }
-
-  return horizontal
-    ? { x: rect.x, y: rect.y + depth, w: rect.w, h: Math.max(0, rect.h - depth) }
-    : { x: rect.x + depth, y: rect.y, w: Math.max(0, rect.w - depth), h: rect.h };
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
 }

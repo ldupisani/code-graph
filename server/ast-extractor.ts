@@ -68,6 +68,8 @@ export function extractAst(
       parentId,
       syntaxKind: syntaxKindName(node.getKind()),
       name: friendlyName(node, inlined),
+      op: operatorOf(node),
+      exported: exportedOf(node),
       start: node.getStart(),
       end: node.getEnd(),
     });
@@ -345,6 +347,36 @@ const KIND_ALIAS_OVERRIDES: Record<string, string> = {
 function syntaxKindName(kind: ts.SyntaxKind): string {
   const name = ts.SyntaxKind[kind];
   return KIND_ALIAS_OVERRIDES[name] ?? name;
+}
+
+// Operator glyph for "relational" nodes the client renders as
+// [left] op [right]: a BinaryExpression's actual operator (covers `=`, `+`,
+// `===`, `&&`, `+=`, …) or the implicit `=` of an initialized variable
+// declaration (`let i = j`). Undefined for everything else.
+function operatorOf(node: Node): string | undefined {
+  if (Node.isBinaryExpression(node)) {
+    return node.getOperatorToken().getText();
+  }
+  if (Node.isVariableDeclaration(node) && node.getInitializer()) {
+    return '=';
+  }
+  return undefined;
+}
+
+// Part of the module's public surface? Exportable declarations carry an
+// `isExported()` (covers `export class/fn/const/...`, and `class X {}; export
+// { X }`); `export ...` / `export default ...` statements count too. Returns
+// undefined (omitted from the wire) when not exported, to keep payloads lean.
+function exportedOf(node: Node): true | undefined {
+  if (Node.isExportable(node) && node.isExported()) return true;
+  const k = node.getKind();
+  if (
+    k === ts.SyntaxKind.ExportDeclaration ||
+    k === ts.SyntaxKind.ExportAssignment
+  ) {
+    return true;
+  }
+  return undefined;
 }
 
 function isTrivialToken(kind: ts.SyntaxKind): boolean {

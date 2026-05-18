@@ -10,11 +10,24 @@ import { getFileAst } from '../api/client';
 import {
   applyExpansion,
   buildFileLayout,
+  EXPANDED_MAX,
+  EXPANDED_MIN,
   type FileLayoutResult,
 } from '../graph/layout';
+import { fileLabel, labelScreenBox } from '../graph/labels';
 import { useGraphStore } from '../graph/store';
-import { layoutAst, type Rect, type TreemapLayout, type TreemapNode } from '../graph/treemap';
-import type { ProjectResponse, SemanticEdge, SemanticEdgeKind } from '../api/types';
+import {
+  fitInterior,
+  layoutAst,
+  type TreemapLayout,
+  type TreemapNode,
+} from '../graph/treemap';
+import type {
+  FileAstResponse,
+  ProjectResponse,
+  SemanticEdge,
+  SemanticEdgeKind,
+} from '../api/types';
 import type { SimFileNode } from '../graph/types';
 
 const COLORS = {
@@ -28,11 +41,13 @@ const COLORS = {
   astBorder: 0x33333a,
   astSelected: 0x3a6fb0,
   astSelectedBorder: 0xffffff,
+  // Per-kind outlines: structural kinds get a colored border instead of a
+  // text label, so they're identifiable without crowding the layout.
+  astOutlineBlock: 0xe06cff, // magenta — Block
+  astOutlineObject: 0xe8c84a, // yellow — ObjectLiteralExpression
   text: 0xeeeeee,
   textDim: 0xb0b0b8,
-  edge: 0x666670,
-  edgeFaded: 0x2c2c30,
-  edgeHighlight: 0x6db1ff,
+  edge: 0x565a63, // import links: subdued but always visible
 } as const;
 
 const SEMANTIC_EDGE_STYLE: Record<
@@ -46,10 +61,16 @@ const SEMANTIC_EDGE_STYLE: Record<
 
 // LOD: rects whose smaller side is below this many screen pixels are not drawn.
 const CULL_PX = 4;
-// Labels only appear when a rect is at least this many screen pixels in each
-// dimension. Tuned so a 4-letter kind label like "if" or "return" is legible.
-const LABEL_MIN_W_PX = 40;
-const LABEL_MIN_H_PX = 14;
+// Below this camera zoom the view "simplifies": call links, operator glyphs
+// and generic kind labels (type/if/arrow fn…) drop out, leaving only real
+// names. Zoom in past it for full detail.
+const SIMPLIFY_BELOW = 1.5;
+// Block/object kind outlines are cheap structural cues (just a colored
+// border, no text), so they come back much earlier when zooming in than the
+// rest of the detail — at this lower zoom threshold.
+const OUTLINE_BELOW = 0.5;
+// Labels appear only while their container is at least the label's own box
+// (text + insets) on screen — see labelScreenBox / the gate in drawAstNode.
 
 // Friendly short labels for non-named AST kinds. Keeps the on-screen label
 // concise (e.g. `ReturnStatement` -> "return") so even narrow rects can host
@@ -72,15 +93,11 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
   ContinueStatement: 'continue',
   ThrowStatement: 'throw',
   EmptyStatement: ';',
-  Block: 'block',
-  VariableStatement: 'var',
-  ExpressionStatement: 'expr',
   // Expressions
   CallExpression: 'call',
   NewExpression: 'new',
   PropertyAccessExpression: 'access',
   ElementAccessExpression: 'index',
-  BinaryExpression: 'binary',
   PrefixUnaryExpression: 'unary',
   PostfixUnaryExpression: 'unary',
   ConditionalExpression: 'ternary',
@@ -90,9 +107,7 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
   YieldExpression: 'yield',
   SpreadElement: 'spread',
   TemplateExpression: 'template',
-  ObjectLiteralExpression: 'object',
   ArrayLiteralExpression: 'array',
-  ParenthesizedExpression: '(...)',
   AsExpression: 'as',
   NonNullExpression: 'non-null',
   // Other
@@ -106,18 +121,132 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
   Parameter: 'param',
 };
 
+// Names ALWAYS take precedence. Unnamed nodes get a label only if their kind
+// is in the curated meaningful set above — pure syntactic scaffolding
+// (Block, ExpressionStatement, BinaryExpression, parens, var statements, and
+// anything not curated) returns null, so it neither competes with a real
+// name nor reserves a label band. Such single-child wrappers are then
+// flattened away entirely by the layout (see layoutAst).
 function labelFor(node: { name: string | null; syntaxKind: string }): string | null {
   if (node.name) return node.name;
-  const explicit = SYNTAX_KIND_LABELS[node.syntaxKind];
-  if (explicit) return explicit;
-  // Fallback: trim suffix, lowercase first letter (e.g. "TaggedTemplateExpression" -> "taggedTemplate").
-  const trimmed = node.syntaxKind
-    .replace(/Declaration$/, '')
-    .replace(/Statement$/, '')
-    .replace(/Expression$/, '')
-    .replace(/Clause$/, '');
-  if (!trimmed) return null;
-  return trimmed.charAt(0).toLowerCase() + trimmed.slice(1);
+  return SYNTAX_KIND_LABELS[node.syntaxKind] ?? null;
+}
+
+// Kinds shown as a colored outline instead of a text label. They carry no
+// label (decluttered) but stay visually identifiable by border color.
+const KIND_OUTLINE: Record<string, number> = {
+  Block: COLORS.astOutlineBlock,
+  ObjectLiteralExpression: COLORS.astOutlineObject,
+};
+
+// A node is "significant" — worth its own box, never collapsed as a
+// pass-through — if it shows a label OR carries a kind outline. (A magenta
+// `block` or yellow `object` must survive even as a single-child wrapper,
+// otherwise its outline would never be drawn.)
+function isSignificant(node: { name: string | null; syntaxKind: string }): boolean {
+  return labelFor(node) !== null || KIND_OUTLINE[node.syntaxKind] !== undefined;
+}
+
+// Label text colored like the code editor (Monaco `vs-dark` / Dark+ family,
+// matching EditorPane's theme): types teal, functions yellow, control-flow
+// pink, other keywords blue, strings salmon, numbers green, everything
+// identifier-ish light blue, fallback default foreground.
+const SYNTAX = {
+  type: 0x4ec9b0,
+  func: 0xdcdcaa,
+  variable: 0x9cdcfe,
+  control: 0xc586c0,
+  keyword: 0x569cd6,
+  string: 0xce9178,
+  number: 0xb5cea8,
+  default: 0xd4d4d4,
+} as const;
+
+// AST kind → syntax category. Anything unmapped falls back to `default`,
+// which also covers operator glyphs (operators are default fg in vs-dark).
+const SYNTAX_CATEGORY: Record<string, keyof typeof SYNTAX> = {
+  ClassDeclaration: 'type',
+  ClassExpression: 'type',
+  InterfaceDeclaration: 'type',
+  EnumDeclaration: 'type',
+  EnumMember: 'type',
+  TypeAliasDeclaration: 'type',
+  TypeReference: 'type',
+  ExpressionWithTypeArguments: 'type',
+  FunctionDeclaration: 'func',
+  FunctionExpression: 'func',
+  ArrowFunction: 'func',
+  MethodDeclaration: 'func',
+  MethodSignature: 'func',
+  Constructor: 'func',
+  GetAccessor: 'func',
+  SetAccessor: 'func',
+  CallExpression: 'func',
+  NewExpression: 'func',
+  VariableDeclaration: 'variable',
+  Parameter: 'variable',
+  PropertyDeclaration: 'variable',
+  PropertySignature: 'variable',
+  PropertyAssignment: 'variable',
+  ShorthandPropertyAssignment: 'variable',
+  BindingElement: 'variable',
+  PropertyAccessExpression: 'variable',
+  ElementAccessExpression: 'variable',
+  Identifier: 'variable',
+  ReturnStatement: 'control',
+  IfStatement: 'control',
+  ForStatement: 'control',
+  ForInStatement: 'control',
+  ForOfStatement: 'control',
+  WhileStatement: 'control',
+  DoStatement: 'control',
+  SwitchStatement: 'control',
+  CaseClause: 'control',
+  DefaultClause: 'control',
+  BreakStatement: 'control',
+  ContinueStatement: 'control',
+  ThrowStatement: 'control',
+  TryStatement: 'control',
+  CatchClause: 'control',
+  AwaitExpression: 'control',
+  YieldExpression: 'control',
+  ImportDeclaration: 'keyword',
+  ExportDeclaration: 'keyword',
+  ExportAssignment: 'keyword',
+  ImportClause: 'keyword',
+  NamedImports: 'keyword',
+  NamedExports: 'keyword',
+  ImportSpecifier: 'keyword',
+  ExportSpecifier: 'keyword',
+  HeritageClause: 'keyword',
+  AsExpression: 'keyword',
+  NonNullExpression: 'keyword',
+  SpreadElement: 'keyword',
+  StringLiteral: 'string',
+  NoSubstitutionTemplateLiteral: 'string',
+  TemplateExpression: 'string',
+  NumericLiteral: 'number',
+  BigIntLiteral: 'number',
+};
+
+function syntaxColor(node: { syntaxKind: string }): number {
+  return SYNTAX[SYNTAX_CATEGORY[node.syntaxKind] ?? 'default'];
+}
+
+// "Higher-level construct": a type-level declaration or anything exported.
+// When zoomed out far enough that labels no longer fit their boxes, only
+// these keep their text (everything else — calls, ifs, property keys,
+// operands — drops out). Classes/interfaces/enums/type-aliases by kind,
+// plus exported declarations regardless of kind.
+const HIGH_LEVEL_KINDS = new Set([
+  'ClassDeclaration',
+  'ClassExpression',
+  'InterfaceDeclaration',
+  'EnumDeclaration',
+  'TypeAliasDeclaration',
+]);
+function isHighLevel(node: { syntaxKind: string; exported?: boolean }): boolean {
+  return node.exported === true || HIGH_LEVEL_KINDS.has(node.syntaxKind);
 }
 
 // Camera state persisted across PixiCanvas rebuilds (e.g. when a filesystem
@@ -193,8 +322,9 @@ export function PixiCanvas({ project }: CanvasProps) {
       const semanticEdgeGfx = new Graphics();
       world.addChild(semanticEdgeGfx);
 
-      // Vertical band reserved at the top of an expanded file for its name.
-      const TITLE_STRIP = 24;
+      // The filename is now drawn ABOVE the box (outside it), so only a small
+      // top inset is kept inside so AST content doesn't touch the border.
+      const TITLE_STRIP = 6;
 
       // Per-file AST treemap layouts, populated when a file is expanded.
       const subtreeByFileId = new Map<string, TreemapLayout>();
@@ -210,6 +340,11 @@ export function PixiCanvas({ project }: CanvasProps) {
         visibleById.set(r.id, r);
       };
 
+      // When a node is selected the camera eases to keep it screen-centered
+      // (tracking it through any expand re-layout), until it's centered or
+      // the user takes manual camera control. null = not following.
+      let followId: string | null = null;
+
       // Pool of Pixi Text objects re-used across frames. `visible` is toggled
       // for unused entries, avoiding GC churn.
       const labelPool = new LabelPool(labelLayer);
@@ -220,24 +355,62 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       // ----- expansion handling -----
 
+      // Exact-fit sizing is a few treemap passes — memoize per (file, AST)
+      // so expand/collapse toggles don't recompute. Keyed on the AST object
+      // identity so a file-watcher AST update invalidates it.
+      const expandedSizeCache = new Map<
+        string,
+        { ast: FileAstResponse; size: { w: number; h: number } }
+      >();
+
+      function expandedSizeFor(fileId: string): { w: number; h: number } | null {
+        const ast = useGraphStore.getState().asts.get(fileId);
+        if (!ast) return null; // AST still loading — fall back to collapsed
+        const cached = expandedSizeCache.get(fileId);
+        if (cached && cached.ast === ast) return cached.size;
+        const interior = fitInterior(ast, {
+          labelOf: labelFor,
+          significant: isSignificant,
+          // Exactly the box the renderer's LOD gate checks below, so a cell
+          // sized here shows its label at 1:1 and nothing larger.
+          measure: labelScreenBox,
+          min: EXPANDED_MIN,
+          max: EXPANDED_MAX,
+        });
+        // Widen if needed so the file's own basename strip still fits, and
+        // add the title strip the AST is laid out beneath.
+        const sim = layout.byId.get(fileId);
+        const size = {
+          w: Math.max(interior.w, sim?.collapsedW ?? 0),
+          h: interior.h + TITLE_STRIP,
+        };
+        expandedSizeCache.set(fileId, { ast, size });
+        return size;
+      }
+
       function applyExpansionToSim() {
-        applyExpansion(layout, useGraphStore.getState().expandedFiles);
+        applyExpansion(
+          layout,
+          useGraphStore.getState().expandedFiles,
+          expandedSizeFor,
+        );
       }
 
       function buildSubtreeLayout(fileId: string): void {
         const ast = useGraphStore.getState().asts.get(fileId);
         if (!ast) return;
-        const sim = layout.byId.get(fileId);
-        if (!sim) return;
-        // Lay out into the file's interior below the title strip so the AST
-        // doesn't overlap the file's name.
-        const rect: Rect = {
-          x: 0,
-          y: TITLE_STRIP,
-          w: sim.width,
-          h: Math.max(0, sim.height - TITLE_STRIP),
-        };
-        subtreeByFileId.set(fileId, layoutAst(ast, rect));
+        // Content-sized: the layout sizes itself to its text, so we only pass
+        // the origin (below the title strip, so the AST clears the filename).
+        subtreeByFileId.set(
+          fileId,
+          layoutAst(ast, {
+            originX: 0,
+            originY: TITLE_STRIP,
+            labelOf: labelFor,
+            significant: isSignificant,
+            measure: labelScreenBox,
+          }),
+        );
       }
 
       function dropSubtreeLayout(fileId: string): void {
@@ -258,7 +431,7 @@ export function PixiCanvas({ project }: CanvasProps) {
 
         // 1. Import edges (under rects — they connect file centers and look
         //    cleanest terminating at the rect borders).
-        drawEdges(layout, worldGfx, selection);
+        drawEdges(layout, worldGfx, cameraScale);
 
         // 2. Files + AST subtrees on `worldGfx`. pushRect keeps visibleById
         //    in sync so the edge pass below can find precise anchors.
@@ -271,7 +444,15 @@ export function PixiCanvas({ project }: CanvasProps) {
 
         // 4. Semantic edges, drawn last on a dedicated graphics layered above
         //    labels. Border-clipped + arrowheaded so they're always visible.
-        drawSemanticEdges(project.semanticEdges, semanticEdgeGfx, visibleById, subtreeByFileId);
+        drawSemanticEdges(
+          project.semanticEdges,
+          semanticEdgeGfx,
+          visibleById,
+          subtreeByFileId,
+          cameraScale,
+          selection,
+          state.expandedFiles,
+        );
       }
 
       function drawFile(sim: SimFileNode, selection: string | null): void {
@@ -280,11 +461,70 @@ export function PixiCanvas({ project }: CanvasProps) {
         const expanded = useGraphStore.getState().expandedFiles.has(sim.id);
         const isSelected = selection === sim.id;
 
-        const fill = isSelected
-          ? COLORS.fileSelected
-          : expanded
-          ? COLORS.fileExpanded
-          : COLORS.file;
+        // The filename is ALWAYS drawn above the node (centered, counter-
+        // scaled to constant size) — never inside it — so it can't overlap
+        // the box content or the dot at any zoom.
+        const labelScale = 1 / cameraScale;
+        const aboveGap = 8 / cameraScale; // screen-constant gap above the node
+        const putName = (topY: number): void => {
+          labelPool.put({
+            text: fileLabel(sim.relativePath),
+            worldX: sim.x,
+            worldY: topY - aboveGap,
+            color: COLORS.text,
+            size: 12,
+            anchorX: 0.5,
+            anchorY: 1, // text's bottom sits `aboveGap` above the node
+            scale: labelScale,
+          });
+        };
+
+        // Collapsed files are ALWAYS a small, constant-size "closed file"
+        // icon (a dog-eared page) at every zoom level — never a sized box or
+        // a dot. The filename floats above it.
+        if (!expanded) {
+          const iw = 16 / cameraScale; // screen-constant page size
+          const ih = 20 / cameraScale;
+          const fold = 6 / cameraScale; // folded top-right corner
+          const ix = sim.x - iw / 2;
+          const iy = sim.y - ih / 2;
+          const body = isSelected ? COLORS.fileSelected : COLORS.file;
+          const line = isSelected
+            ? COLORS.fileBorderSelected
+            : COLORS.fileBorder;
+          worldGfx
+            .poly([
+              ix, iy,
+              ix + iw - fold, iy,
+              ix + iw, iy + fold,
+              ix + iw, iy + ih,
+              ix, iy + ih,
+            ])
+            .fill({ color: body })
+            .stroke({ color: line, width: 1 / cameraScale });
+          // The folded corner, slightly distinct so it reads as a page.
+          worldGfx
+            .poly([
+              ix + iw - fold, iy,
+              ix + iw, iy + fold,
+              ix + iw - fold, iy + fold,
+            ])
+            .fill({ color: line, alpha: 0.6 });
+          pushRect({
+            id: sim.id,
+            fileId: sim.id,
+            kind: 'file',
+            x,
+            y,
+            w: sim.width,
+            h: sim.height,
+            area: sim.width * sim.height,
+          });
+          putName(iy);
+          return;
+        }
+
+        const fill = isSelected ? COLORS.fileSelected : COLORS.fileExpanded;
         const stroke = isSelected ? COLORS.fileBorderSelected : COLORS.fileBorder;
         worldGfx
           .roundRect(x, y, sim.width, sim.height, 6)
@@ -302,21 +542,7 @@ export function PixiCanvas({ project }: CanvasProps) {
           area: sim.width * sim.height,
         });
 
-        // File label — always drawn for file rects. Counter-scale so the
-        // text stays constant on screen even as the user zooms.
-        const labelScale = 1 / cameraScale;
-        labelPool.put({
-          text: shortenPath(sim.relativePath),
-          worldX: sim.x,
-          // Centre vertically in the title strip when expanded; centre on
-          // the rect when collapsed. Both positions are world coords so the
-          // label tracks the rect under zoom.
-          worldY: expanded ? y + TITLE_STRIP / 2 : sim.y,
-          color: COLORS.text,
-          size: 12,
-          anchorY: 0.5,
-          scale: labelScale,
-        });
+        putName(y);
 
         if (expanded) {
           let tree = subtreeByFileId.get(sim.id);
@@ -357,14 +583,39 @@ export function PixiCanvas({ project }: CanvasProps) {
         const minScreen = Math.min(wOnScreen, hOnScreen);
         if (minScreen < CULL_PX) return;
 
+        // Zoomed-out "simplified" tier: drop operators and generic kind
+        // labels — keep only real names.
+        const simplified = cameraScale < SIMPLIFY_BELOW;
+
         const isSelected = selection === node.id;
         const tint = depthTint(node.depth);
         const fillColor = isSelected ? COLORS.astSelected : tint;
-        const borderColor = isSelected ? COLORS.astSelectedBorder : COLORS.astBorder;
+        // Kind outlines have their own (much lower) zoom threshold so they
+        // reappear well before the rest of the detail does.
+        const kindOutline =
+          cameraScale < OUTLINE_BELOW
+            ? undefined
+            : KIND_OUTLINE[node.syntaxKind];
+        let borderColor: number = COLORS.astBorder;
+        let borderWidth = 0.5;
+        let borderAlpha = 0.9;
+        if (isSelected) {
+          borderColor = COLORS.astSelectedBorder;
+          borderWidth = 1.5;
+          borderAlpha = 1;
+        } else if (kindOutline !== undefined) {
+          // Selection still overrides the kind color so the active node
+          // reads unambiguously. Counter-scale the width by 1/cameraScale so
+          // the block/object outline stays a constant ~1px on screen and
+          // doesn't thicken as you zoom in.
+          borderColor = kindOutline;
+          borderWidth = 1 / cameraScale;
+          borderAlpha = 1;
+        }
         worldGfx
           .rect(x, y, node.rect.w, node.rect.h)
           .fill({ color: fillColor, alpha: isSelected ? 1 : 0.92 })
-          .stroke({ color: borderColor, width: isSelected ? 1.5 : 0.5, alpha: 0.9 });
+          .stroke({ color: borderColor, width: borderWidth, alpha: borderAlpha });
 
         pushRect({
           id: node.id,
@@ -383,28 +634,94 @@ export function PixiCanvas({ project }: CanvasProps) {
         // statements/expressions are still identifiable. Suppress when the
         // parent's label is identical, to avoid stacking in cases like an
         // ImportSpecifier whose Identifier child shares the same text.
+        // Show the label only while it actually fits its container ON SCREEN.
+        // The label is counter-scaled (constant screen size), so as you zoom
+        // out the container shrinks under it — gate on the same box the sizer
+        // used so the label is hidden the moment it would spill out, instead
+        // of overflowing.
         const labelText = labelFor(node);
-        if (
+        const labelBox = labelText ? labelScreenBox(labelText) : null;
+        // In the simplified tier only real names survive — generic kind
+        // labels (type / if / arrow fn / call / access …) drop out.
+        const nameOk = !simplified || node.name != null;
+        if (node.labelChip && labelText && labelBox && nameOk) {
+          // Relational left operand (e.g. `i` in `let i = j`): the name is
+          // drawn centered in its reserved chip, not as a top-of-box label.
+          const chip = node.labelChip;
+          if (
+            chip.w * cameraScale >= labelBox.w &&
+            chip.h * cameraScale >= labelBox.h
+          ) {
+            labelPool.put({
+              text: labelText,
+              worldX: baseX + chip.x + chip.w / 2,
+              worldY: baseY + chip.y + chip.h / 2,
+              color: syntaxColor(node),
+              size: 11,
+              anchorX: 0.5,
+              anchorY: 0.5,
+              scale: 1 / cameraScale,
+            });
+          }
+        } else if (
           labelText &&
-          wOnScreen >= LABEL_MIN_W_PX &&
-          hOnScreen >= LABEL_MIN_H_PX
+          labelBox &&
+          nameOk &&
+          // Normally gated on fitting its box on screen; but high-level
+          // constructs (classes/interfaces/exports) keep their label even
+          // when zoomed out past the point it fits, so the structure stays
+          // readable while lower-level semantics drop out.
+          (isHighLevel(node) ||
+            (wOnScreen >= labelBox.w && hOnScreen >= labelBox.h))
         ) {
           const parent = node.parentId ? tree.byId.get(node.parentId) : null;
           const parentLabel = parent ? labelFor(parent) : null;
           if (parentLabel !== labelText) {
-            // Margins are in screen pixels: divide by cameraScale to convert
-            // to world units so the label sits the same distance from the
-            // rect's corner regardless of zoom level.
-            const marginX = 4 / cameraScale;
-            const marginY = 3 / cameraScale;
+            const hasKids = !!tree.childrenByParent.get(node.id)?.length;
+            if (hasKids) {
+              // Container: the label titles the children, so it sits at the
+              // top-left. Margins are screen px → /cameraScale to world.
+              labelPool.put({
+                text: labelText,
+                worldX: x + 4 / cameraScale,
+                worldY: y + 3 / cameraScale,
+                color: syntaxColor(node),
+                size: 11,
+                anchorX: 0,
+                anchorY: 0,
+                scale: 1 / cameraScale,
+              });
+            } else {
+              // Leaf / value (an operand like `20`, `i`, `j`): center it in
+              // its box, symmetric with the left chip and the operator glyph.
+              labelPool.put({
+                text: labelText,
+                worldX: x + node.rect.w / 2,
+                worldY: y + node.rect.h / 2,
+                color: syntaxColor(node),
+                size: 11,
+                anchorX: 0.5,
+                anchorY: 0.5,
+                scale: 1 / cameraScale,
+              });
+            }
+          }
+        }
+
+        // The operator glyph, drawn centered between the two operand boxes
+        // (`[i] = [j]`, `[[i] + [1]] + [j]`). Same constant-on-screen
+        // counter-scaling and fits-on-screen gate as labels.
+        if (node.op && node.opAnchor && !simplified) {
+          const opBox = labelScreenBox(node.op);
+          if (wOnScreen >= opBox.w && hOnScreen >= opBox.h) {
             labelPool.put({
-              text: labelText,
-              worldX: x + marginX,
-              worldY: y + marginY,
-              color: COLORS.textDim,
+              text: node.op,
+              worldX: baseX + node.opAnchor.x,
+              worldY: baseY + node.opAnchor.y,
+              color: SYNTAX.default,
               size: 11,
-              anchorX: 0,
-              anchorY: 0,
+              anchorX: 0.5,
+              anchorY: 0.5,
               scale: 1 / cameraScale,
             });
           }
@@ -417,7 +734,44 @@ export function PixiCanvas({ project }: CanvasProps) {
         }
       }
 
-      const tickerCb = () => draw();
+      // Ease the camera so the followed node sits at screen center. Runs
+      // after draw() so visibleById reflects this frame. Re-reads the node's
+      // live position each tick, so it tracks the node through an expand
+      // re-layout and releases once centered.
+      function updateFollow(): void {
+        if (followId === null) return;
+        let cx: number;
+        let cy: number;
+        const simNode = layout.byId.get(followId);
+        if (simNode) {
+          cx = simNode.x;
+          cy = simNode.y;
+        } else {
+          const r =
+            visibleById.get(followId) ??
+            findVisibleAnchor(followId, visibleById, subtreeByFileId);
+          if (!r) return; // not resolvable yet — try again next frame
+          cx = r.x + r.w / 2;
+          cy = r.y + r.h / 2;
+        }
+        const targetX = app.screen.width / 2 - cx * cameraScale;
+        const targetY = app.screen.height / 2 - cy * cameraScale;
+        world.x += (targetX - world.x) * 0.18;
+        world.y += (targetY - world.y) * 0.18;
+        if (
+          Math.abs(targetX - world.x) < 0.5 &&
+          Math.abs(targetY - world.y) < 0.5
+        ) {
+          world.x = targetX;
+          world.y = targetY;
+          followId = null; // centered & settled — release the camera
+        }
+      }
+
+      const tickerCb = () => {
+        draw();
+        updateFollow();
+      };
       app.ticker.add(tickerCb);
 
       // Dev-only debug hook for headless visual testing. Lets a Playwright
@@ -469,13 +823,19 @@ export function PixiCanvas({ project }: CanvasProps) {
         },
         hitTest: (worldX: number, worldY: number) => smallestContaining(hitRects, worldX, worldY),
         onClick: handleClick,
+        onUserCameraMove: () => {
+          followId = null;
+        },
       });
 
       function handleClick(target: HitRect | null) {
         if (!target) {
           useGraphStore.getState().setSelection(null);
+          followId = null;
           return;
         }
+        // Center the selected node on screen (the ticker eases toward it).
+        followId = target.id;
         if (target.kind === 'file') {
           void onFileClick(target.fileId);
         } else {
@@ -547,21 +907,89 @@ export function PixiCanvas({ project }: CanvasProps) {
 // Helpers (out of the React component to keep the hook body smaller)
 // ---------------------------------------------------------------------------
 
-function drawEdges(layout: FileLayoutResult, gfx: Graphics, selection: string | null): void {
-  // Edges connect files; only file selections influence the highlight/fade
-  // pattern. Selecting an AST node leaves all edges in their default style.
-  const selectedFileId = selection !== null && layout.byId.has(selection) ? selection : null;
+// Pixi v8 Graphics has no native line dash, so a dashed stroke is just each
+// "on" span emitted as its own moveTo/lineTo subpath; the caller strokes them
+// all with one .stroke(). Lengths are world units (callers pass screen-
+// constant values via 1/cameraScale where the layer is counter-scaled).
+function emitDashed(
+  gfx: Graphics,
+  pts: { x: number; y: number }[],
+  dash: number,
+  gap: number,
+): void {
+  if (pts.length < 2) return;
+  let on = true;
+  let left = dash;
+  let ax = pts[0].x;
+  let ay = pts[0].y;
+  gfx.moveTo(ax, ay);
+  for (let i = 1; i < pts.length; i++) {
+    const bx = pts[i].x;
+    const by = pts[i].y;
+    let segLen = Math.hypot(bx - ax, by - ay);
+    if (segLen < 1e-6) continue;
+    const dx = (bx - ax) / segLen;
+    const dy = (by - ay) / segLen;
+    while (segLen > 1e-6) {
+      const step = Math.min(left, segLen);
+      ax += dx * step;
+      ay += dy * step;
+      if (on) gfx.lineTo(ax, ay);
+      segLen -= step;
+      left -= step;
+      if (left <= 1e-6) {
+        on = !on;
+        left = on ? dash : gap;
+        gfx.moveTo(ax, ay);
+      }
+    }
+  }
+}
+
+// Flatten a cubic bezier to a polyline so it can be dashed.
+function cubicPath(
+  p0: { x: number; y: number },
+  c1: { x: number; y: number },
+  c2: { x: number; y: number },
+  p3: { x: number; y: number },
+  steps: number,
+): { x: number; y: number }[] {
+  const pts: { x: number; y: number }[] = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const u = 1 - t;
+    const a = u * u * u;
+    const b = 3 * u * u * t;
+    const c = 3 * u * t * t;
+    const d = t * t * t;
+    pts.push({
+      x: a * p0.x + b * c1.x + c * c2.x + d * p3.x,
+      y: a * p0.y + b * c1.y + c * c2.y + d * p3.y,
+    });
+  }
+  return pts;
+}
+
+function drawEdges(
+  layout: FileLayoutResult,
+  gfx: Graphics,
+  cameraScale: number,
+): void {
+  // Import links: always shown, one consistent subdued style at every zoom.
+  // Screen-constant thin width so they never vanish when zoomed out but stay
+  // a quiet background layer beneath the bright semantic edges.
   for (const link of layout.links) {
     const s = typeof link.source === 'string' ? layout.byId.get(link.source) : link.source;
     const t = typeof link.target === 'string' ? layout.byId.get(link.target) : link.target;
     if (!s || !t) continue;
-    const adjacent = selectedFileId !== null && (s.id === selectedFileId || t.id === selectedFileId);
-    const faded = selectedFileId !== null && !adjacent;
-    const color = adjacent ? COLORS.edgeHighlight : faded ? COLORS.edgeFaded : COLORS.edge;
     gfx
       .moveTo(s.x, s.y)
       .lineTo(t.x, t.y)
-      .stroke({ color, width: adjacent ? 2 : 1, alpha: faded ? 0.35 : 0.95 });
+      .stroke({
+        color: COLORS.edge,
+        width: 1.5 / cameraScale, // ~1.5px on screen, zoom-stable
+        alpha: 0.7,
+      });
   }
 }
 
@@ -581,12 +1009,16 @@ function semanticBezierControls(
     Math.min(Math.max(v, lo), hi);
   const dx = callee.x - caller.x;
   const dy = callee.y - caller.y;
-  // Horizontal reach: proportional to span, floored so tiny/adjacent rects
-  // still get a visible bow, capped so huge spans don't overshoot.
-  const h = clamp(0.4 * Math.abs(dx) + 24, 40, 240);
+  // How far the callee sits *behind* the caller (to its left). The curve has
+  // to double back here, which is exactly when it cusps — feed that back-
+  // travel into the handle length so the loop rounds out instead of kinking.
+  const back = Math.max(0, -dx);
+  // Horizontal reach: proportional to span + back-travel, with a generous
+  // floor (short edges still bow smoothly) and a high cap.
+  const h = clamp(0.5 * Math.abs(dx) + 0.7 * back + 40, 64, 320);
   // Vertical bias: walk the curve down out of the bottom-right corner first
   // so it clears the source rect's body before arcing toward the callee.
-  const v = clamp(0.25 * Math.abs(dy) + 16, 24, 120);
+  const v = clamp(0.35 * Math.abs(dy) + 20, 28, 150);
   return {
     cp1: { x: caller.x + h, y: caller.y + v },
     cp2: { x: callee.x - h, y: callee.y },
@@ -609,8 +1041,12 @@ function inheritanceBezierControls(
     Math.min(Math.max(v, lo), hi);
   const dx = end.x - start.x;
   const dy = end.y - start.y;
-  const reach = clamp(0.4 * Math.abs(dy) + 24, 40, 240);
-  const bias = clamp(0.25 * Math.abs(dx) + 16, 24, 120) * Math.sign(dx || 1);
+  // Back-travel: the subclass top sitting *above* the superclass bottom is
+  // the cusp case (curve exits downward then has to climb back up). Feed it
+  // into the reach so that loop rounds out instead of kinking.
+  const back = Math.max(0, -dy);
+  const reach = clamp(0.5 * Math.abs(dy) + 0.7 * back + 40, 64, 320);
+  const bias = clamp(0.3 * Math.abs(dx) + 18, 24, 150) * Math.sign(dx || 1);
   return {
     cp1: { x: start.x + bias, y: start.y + reach },
     cp2: { x: end.x, y: end.y - reach },
@@ -622,7 +1058,16 @@ function drawSemanticEdges(
   gfx: Graphics,
   visibleById: Map<string, HitRect>,
   subtreeByFileId: Map<string, TreemapLayout>,
+  cameraScale: number,
+  selection: string | null,
+  expandedFiles: ReadonlySet<string>,
 ): void {
+  // Connector geometry (curve path, port/outline positions) stays in world
+  // space so it tracks the nodes, but every *size* — line width, outline
+  // width, port radius, arrowhead — is multiplied by 1/cameraScale so it
+  // renders at a constant screen size and doesn't thicken as you zoom in.
+  // Same technique the labels use (see labelScale = 1 / cameraScale).
+  const invScale = 1 / cameraScale;
   // Many AST-level edges may lift to the same pair of visible anchors —
   // dedupe per (kind, fromAnchor.id, toAnchor.id) so we draw one thick edge
   // instead of N stacked translucent ones.
@@ -631,22 +1076,68 @@ function drawSemanticEdges(
   // circles with alpha < 1 would additively darken into a blob, so dedupe the
   // markers independently of the edge dedupe above.
   const drawnPorts = new Set<string>();
+  // The called element gets a thin outline in the edge color; dedupe per
+  // (kind, rect) so overlapping calls don't stack the stroke into a blob.
+  const drawnOutlines = new Set<string>();
   for (const edge of edges) {
+    // Call links drop out entirely in the simplified (zoomed-out) tier.
+    // Otherwise a call link is only meaningful when you can see who's
+    // calling: if the caller's own node isn't on screen (its file is
+    // collapsed, or it was LOD-culled) the edge would just dangle from a
+    // lifted ancestor, so require the calling node itself to be directly
+    // visible. (`extends`/`implements` still lift to a visible ancestor.)
+    if (
+      edge.kind === 'calls' &&
+      (cameraScale < SIMPLIFY_BELOW || !visibleById.has(edge.fromId))
+    ) {
+      continue;
+    }
     const from = findVisibleAnchor(edge.fromId, visibleById, subtreeByFileId);
     const to = findVisibleAnchor(edge.toId, visibleById, subtreeByFileId);
     if (!from || !to || from.id === to.id) continue;
+    // Call links are dimmed to 50% until you select one of their ends, then
+    // shown at full strength. Match the raw endpoints and the resolved
+    // visible anchors (the callee may have lifted to an ancestor/file you'd
+    // actually click).
+    const callerSelected =
+      selection !== null &&
+      (selection === edge.fromId || selection === from.id);
+    const calleeSelected =
+      selection !== null &&
+      (selection === edge.toId || selection === to.id);
+    // "Caller or callee selected" — drives the 50%↔full dim and the callee
+    // outline.
+    const callSelected = callerSelected || calleeSelected;
     const key = `${edge.kind}|${from.id}|${to.id}`;
     if (seen.has(key)) continue;
     seen.add(key);
 
     // Each kind has its own port geometry. `calls`/`implements` read as
-    // dataflow: out of the caller's bottom-right, into the callee's left edge
-    // (clear of the top-left label). `extends` reads as a class hierarchy:
-    // out of the BOTTOM of the thing being extended (the superclass, `to`),
-    // into the TOP of the thing that extends it (the subclass, `from`). A
-    // cubic bezier joins the two ports so the line bows into open space, and
-    // the arrowhead is oriented along the curve's end tangent.
+    // dataflow: out of the caller's bottom-right, into the callee's top-left
+    // corner (where its label sits, so the call lands on the named thing).
+    // `extends` reads as a class hierarchy: out of the BOTTOM of the thing
+    // being extended (the superclass, `to`), into the TOP of the thing that
+    // extends it (the subclass, `from`). A cubic bezier joins the two ports
+    // so the line bows into open space, and the arrowhead is oriented along
+    // the curve's end tangent. The called element also gets a thin outline
+    // in the edge color so the reference target is easy to spot.
     const style = SEMANTIC_EDGE_STYLE[edge.kind];
+    let edgeAlpha = style.alpha;
+    let dashed = false;
+    if (edge.kind === 'calls') {
+      // 30% until the caller/callee is selected, then full strength.
+      edgeAlpha = callSelected ? style.alpha : 0.3;
+    } else {
+      // extends / implements: dashed + 50% by default; fully opaque when the
+      // implementing/extending node's file is expanded; solid (and opaque)
+      // when that node itself is selected.
+      const h = edge.fromId.lastIndexOf('#');
+      const srcFile = h > 0 ? edge.fromId.slice(0, h) : edge.fromId;
+      const srcSelected =
+        selection === edge.fromId || selection === from.id;
+      dashed = !srcSelected;
+      edgeAlpha = srcSelected || expandedFiles.has(srcFile) ? 1 : 0.5;
+    }
     let startPort: { x: number; y: number };
     let endPort: { x: number; y: number };
     let cp1: { x: number; y: number };
@@ -657,23 +1148,50 @@ function drawSemanticEdges(
       ({ cp1, cp2 } = inheritanceBezierControls(startPort, endPort));
     } else {
       startPort = { x: from.x + from.w, y: from.y + from.h }; // bottom-right of caller
-      endPort = { x: to.x, y: to.y + to.h / 2 };              // left-mid of callee
+      endPort = { x: to.x, y: to.y };                         // top-left of callee
       ({ cp1, cp2 } = semanticBezierControls(startPort, endPort));
     }
 
-    gfx
-      .moveTo(startPort.x, startPort.y)
-      .bezierCurveTo(cp1.x, cp1.y, cp2.x, cp2.y, endPort.x, endPort.y)
-      .stroke({ color: style.color, width: style.width, alpha: style.alpha });
+    if (dashed) {
+      emitDashed(
+        gfx,
+        cubicPath(startPort, cp1, cp2, endPort, 48),
+        3.5 * invScale, // fine dash, screen-constant
+        2.5 * invScale,
+      );
+      gfx.stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+    } else {
+      gfx
+        .moveTo(startPort.x, startPort.y)
+        .bezierCurveTo(cp1.x, cp1.y, cp2.x, cp2.y, endPort.x, endPort.y)
+        .stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+    }
 
-    // World-space radius (this layer is not counter-scaled, unlike labels) so
-    // the port scales with the line/arrowhead through zoom and LOD lifting.
-    const portR = style.arrowSize * 0.35;
+    // Counter-scaled radius so the port stays a constant size on screen,
+    // matching the (also counter-scaled) line, arrowhead and outline.
+    const portR = style.arrowSize * 0.35 * invScale;
     for (const p of [startPort, endPort]) {
       const portKey = `${edge.kind}|${Math.round(p.x)},${Math.round(p.y)}`;
       if (drawnPorts.has(portKey)) continue;
       drawnPorts.add(portKey);
-      gfx.circle(p.x, p.y, portR).fill({ color: style.color, alpha: style.alpha });
+      gfx.circle(p.x, p.y, portR).fill({ color: style.color, alpha: edgeAlpha });
+    }
+
+    // Selection-gated outlines in the edge color (orange for calls), width
+    // matching the connecting line. The callee is outlined when it or its
+    // caller is selected; the caller is outlined only when it itself is
+    // selected. (calls/implements only — `extends` has its own treatment.)
+    if (edge.kind !== 'extends') {
+      const outline = (rect: HitRect, role: string): void => {
+        const k = `${edge.kind}|${role}|${rect.id}`;
+        if (drawnOutlines.has(k)) return;
+        drawnOutlines.add(k);
+        gfx
+          .rect(rect.x, rect.y, rect.w, rect.h)
+          .stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+      };
+      if (callSelected) outline(to, 'callee');
+      if (callerSelected) outline(from, 'caller');
     }
 
     // A cubic's end derivative is proportional to (P3 - P2), so the incoming
@@ -683,9 +1201,9 @@ function drawSemanticEdges(
       endPort.x,
       endPort.y,
       Math.atan2(endPort.y - cp2.y, endPort.x - cp2.x),
-      style.arrowSize,
+      style.arrowSize * invScale,
       style.color,
-      style.alpha,
+      edgeAlpha,
     );
   }
 }
@@ -766,9 +1284,6 @@ function depthTint(depth: number): number {
   return (r << 16) | (g << 8) | b;
 }
 
-function shortenPath(p: string, max = 32): string {
-  return p.length <= max ? p : '…' + p.slice(-(max - 1));
-}
 
 interface CameraDeps {
   app: Application;
@@ -778,10 +1293,14 @@ interface CameraDeps {
   setCameraScale: (s: number) => void;
   hitTest: (wx: number, wy: number) => HitRect | null;
   onClick: (target: HitRect | null) => void;
+  // Called when the user takes manual camera control (drag-pan or zoom) so an
+  // in-progress auto-pan/follow can bow out.
+  onUserCameraMove: () => void;
 }
 
 function wireCamera(deps: CameraDeps): () => void {
   const { app, world, container, setCameraScale, hitTest, onClick } = deps;
+  const { onUserCameraMove } = deps;
   app.stage.eventMode = 'static';
   app.stage.hitArea = app.screen;
 
@@ -814,6 +1333,7 @@ function wireCamera(deps: CameraDeps): () => void {
     movedDistance = Math.max(movedDistance, Math.hypot(dx, dy));
     if (movedDistance > DRAG_DEADZONE) {
       pendingTarget = null;
+      onUserCameraMove();
       world.x = worldStart.x + dx;
       world.y = worldStart.y + dy;
     }
@@ -835,6 +1355,7 @@ function wireCamera(deps: CameraDeps): () => void {
 
   const onWheel = (e: WheelEvent) => {
     e.preventDefault();
+    onUserCameraMove();
     const rect = container.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;

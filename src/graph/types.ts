@@ -17,6 +17,10 @@ export interface SimFileNode {
   fy?: number | null;
   width: number;
   height: number;
+  // The minimized box, sized to this file's basename label + padding. Stored
+  // so collapsing restores the content size rather than a global constant.
+  collapsedW: number;
+  collapsedH: number;
   relativePath: string;
 }
 

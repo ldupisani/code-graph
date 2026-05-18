@@ -77,6 +77,14 @@ export interface AstNode {
   parentId: string | null;
   syntaxKind: string;     // ts.SyntaxKind name (e.g. "ClassDeclaration")
   name: string | null;    // friendly identifier text when present
+  // Operator glyph for relational nodes — BinaryExpression's operator
+  // (`=`, `+`, `===`, …) or `=` for a VariableDeclaration initializer.
+  // The renderer draws it between the two related operand boxes.
+  op?: string;
+  // True when this node is part of the module's public surface (an exported
+  // declaration, `export`/`export default`). Used for zoomed-out LOD: only
+  // high-level constructs keep their label when text no longer fits.
+  exported?: boolean;
   start: number;          // char offset in source, inclusive
   end: number;            // char offset, exclusive
 }

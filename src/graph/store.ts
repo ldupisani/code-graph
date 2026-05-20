@@ -59,6 +59,14 @@ export const useGraphStore = create<GraphStore>((set) => ({
     }),
 }));
 
+// Dev-only escape hatch: lets the chrome-devtools-mcp / browser console drive
+// the app (e.g. `useGraphStore.getState().expandFile('src/index.ts')`) when a
+// canvas-only click would be awkward. Stripped in production builds.
+if (import.meta.env.DEV && typeof window !== 'undefined') {
+  (window as unknown as { useGraphStore: typeof useGraphStore }).useGraphStore =
+    useGraphStore;
+}
+
 function filterToKnownFiles(
   expanded: ReadonlySet<string>,
   project: ProjectResponse,

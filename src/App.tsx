@@ -16,12 +16,23 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
+  // Last-opened path is restored from localStorage so a dev-server reload
+  // (triggered by editing force-graph tunables — see the HMR hook in
+  // PixiCanvas.tsx) lands back where we left off instead of on the empty
+  // form. Read once via useState's initializer so it's available on first
+  // render — both for auto-reopen and for seeding the FolderPicker input.
+  const [initialPath] = useState<string>(() => {
+    try { return localStorage.getItem('code-graph:lastPath') ?? ''; } catch { return ''; }
+  });
+
   async function handleOpen(path: string) {
     setLoading(true);
     setError(null);
     try {
       const data = await openProject({ path });
       setProject(data);
+      // Only stored on success so a bad path can't trap us across reloads.
+      try { localStorage.setItem('code-graph:lastPath', path); } catch {}
       console.log('[code-graph] project loaded', data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -30,6 +41,13 @@ export function App() {
       setLoading(false);
     }
   }
+
+  // On mount, auto-reopen the saved path. Runs once; if it fails the error
+  // surfaces in the FolderPicker and the user can pick a new path.
+  useEffect(() => {
+    if (initialPath) void handleOpen(initialPath);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Subscribe to filesystem events for the current project; on any event,
   // re-run openProject (debounced) and update via refreshProject. Camera +
@@ -77,7 +95,12 @@ export function App() {
         }}
       >
         <strong style={{ letterSpacing: 0.5 }}>code-graph</strong>
-        <FolderPicker onSubmit={handleOpen} loading={loading} error={error} />
+        <FolderPicker
+          onSubmit={handleOpen}
+          loading={loading}
+          error={error}
+          initialPath={initialPath}
+        />
         {project ? <ProjectStats project={project} refreshing={refreshing} /> : null}
       </header>
 

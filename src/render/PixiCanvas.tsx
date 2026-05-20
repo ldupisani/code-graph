@@ -17,11 +17,14 @@ import {
 import { fileLabel, labelScreenBox, measureMono } from '../graph/labels';
 import { useGraphStore } from '../graph/store';
 import {
-  fitInterior,
   layoutAst,
   type TreemapLayout,
   type TreemapNode,
 } from '../graph/treemap';
+import {
+  buildAstForceLayout,
+  type AstForceLayout,
+} from '../graph/astForce';
 import type {
   FileAstResponse,
   ProjectResponse,
@@ -149,6 +152,11 @@ function labelFor(node: {
   }
   return SYNTAX_KIND_LABELS[node.syntaxKind] ?? null;
 }
+
+// Kinds whose label is treated like a real name for LOD: it survives the
+// simplified tier and only drops when it no longer fits on screen (rather
+// than disappearing early with the other generic kind labels).
+const NAME_LIKE_KINDS = new Set(['ImportDeclaration', 'ReturnStatement']);
 
 // Kinds shown as a colored outline instead of a text label. They carry no
 // label (decluttered) but stay visually identifiable by border color.
@@ -297,6 +305,18 @@ interface HitRect {
   area: number;
 }
 
+// Force-graph tunables live as module-level `const`s in astForce.ts and
+// layout.ts. React Fast Refresh re-evaluates those modules on save but the
+// effect below only re-runs when `project` changes — so the *running*
+// simulation and the AST layout cache keep referencing the old constants.
+// Accepting the hot-update here and forcing a full reload restores the
+// "edit constant → see it" iteration loop.
+if (import.meta.hot) {
+  import.meta.hot.accept(['../graph/astForce', '../graph/layout'], () => {
+    location.reload();
+  });
+}
+
 export function PixiCanvas({ project }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
@@ -327,6 +347,19 @@ export function PixiCanvas({ project }: CanvasProps) {
       const layout = buildFileLayout(project);
       const world = new Container();
       app.stage.addChild(world);
+      if (import.meta.env.DEV && typeof window !== 'undefined') {
+        (window as unknown as { __codegraph: unknown }).__codegraph = {
+          layout, world,
+          getFileSize: (id: string) => {
+            const n = layout.byId.get(id);
+            return n ? { w: n.width, h: n.height, x: n.x, y: n.y } : null;
+          },
+          getAstForce: (id: string) => astForceByFileId.get(id),
+          ensureExpandedLayout,
+          applyExpansionToSim: () => applyExpansionToSim(),
+          getCameraScale: () => world.scale.x,
+        };
+      }
       // Restore camera if we're rebuilding the same project (filesystem
       // refresh); otherwise center.
       if (savedCamera && savedCamera.rootPath === project.rootPath) {
@@ -390,6 +423,10 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       // ----- expansion handling -----
 
+      // Per-file fractal force-graph layout for the AST's top-level
+      // statements (see astForce.ts). Settled once per (file, AST); built
+      // lazily by ensureExpandedLayout and consumed by drawSubtree.
+      const astForceByFileId = new Map<string, AstForceLayout>();
       // Exact-fit sizing is a few treemap passes — memoize per (file, AST)
       // so expand/collapse toggles don't recompute. Keyed on the AST object
       // identity so a file-watcher AST update invalidates it.
@@ -398,12 +435,36 @@ export function PixiCanvas({ project }: CanvasProps) {
         { ast: FileAstResponse; size: { w: number; h: number } }
       >();
 
-      function expandedSizeFor(fileId: string): { w: number; h: number } | null {
+      // Idempotent builder: produces (and caches) the TreemapLayout AND the
+      // per-file fractal force layout, plus the squared file-box size that
+      // both inform. Returns null if the AST isn't loaded yet (file just
+      // expanded and we're awaiting the fetch).
+      //
+      // The treemap is laid out at origin (0, 0) — its absolute rect
+      // coordinates only matter for *relative* descendant offsets within
+      // each top-level subtree. drawSubtree translates each subtree to its
+      // force-decided position.
+      function ensureExpandedLayout(fileId: string): {
+        tree: TreemapLayout;
+        force: AstForceLayout;
+        size: { w: number; h: number };
+      } | null {
         const ast = useGraphStore.getState().asts.get(fileId);
-        if (!ast) return null; // AST still loading — fall back to collapsed
-        const cached = expandedSizeCache.get(fileId);
-        if (cached && cached.ast === ast) return cached.size;
-        const interior = fitInterior(ast, {
+        if (!ast) return null;
+        const cachedSize = expandedSizeCache.get(fileId);
+        const cachedTree = subtreeByFileId.get(fileId);
+        const cachedForce = astForceByFileId.get(fileId);
+        if (
+          cachedSize &&
+          cachedSize.ast === ast &&
+          cachedTree &&
+          cachedForce
+        ) {
+          return { tree: cachedTree, force: cachedForce, size: cachedSize.size };
+        }
+        const tree = layoutAst(ast, {
+          originX: 0,
+          originY: 0,
           labelOf: labelFor,
           significant: isSignificant,
           pruneEmpty: (n) => n.syntaxKind === 'Block', // drop empty `{}`
@@ -416,18 +477,34 @@ export function PixiCanvas({ project }: CanvasProps) {
           // Exactly the box the renderer's LOD gate checks below, so a cell
           // sized here shows its label at 1:1 and nothing larger.
           measure: labelScreenBox,
-          min: EXPANDED_MIN,
-          max: EXPANDED_MAX,
         });
-        // Symmetric padding (= TITLE_STRIP) on all four sides around the AST
-        // content. The filename floats above the box, so the box no longer
-        // needs to be widened to fit it.
+        subtreeByFileId.set(fileId, tree);
+        const force = buildAstForceLayout({
+          fileId,
+          ast,
+          tree,
+          semanticEdges: project.semanticEdges,
+        });
+        astForceByFileId.set(fileId, force);
+        // Square the file's content area to the larger cluster dimension,
+        // clamped to the same bounds fitInterior used. Symmetric TITLE_STRIP
+        // padding wraps the content on all four sides.
+        const minSide = Math.max(EXPANDED_MIN.w, EXPANDED_MIN.h);
+        const maxSide = Math.min(EXPANDED_MAX.w, EXPANDED_MAX.h);
+        const side = Math.min(
+          maxSide,
+          Math.max(minSide, Math.ceil(force.bounds.side)),
+        );
         const size = {
-          w: interior.w + TITLE_STRIP * 2,
-          h: interior.h + TITLE_STRIP * 2,
+          w: side + TITLE_STRIP * 2,
+          h: side + TITLE_STRIP * 2,
         };
         expandedSizeCache.set(fileId, { ast, size });
-        return size;
+        return { tree, force, size };
+      }
+
+      function expandedSizeFor(fileId: string): { w: number; h: number } | null {
+        return ensureExpandedLayout(fileId)?.size ?? null;
       }
 
       function applyExpansionToSim() {
@@ -439,30 +516,13 @@ export function PixiCanvas({ project }: CanvasProps) {
       }
 
       function buildSubtreeLayout(fileId: string): void {
-        const ast = useGraphStore.getState().asts.get(fileId);
-        if (!ast) return;
-        // Content-sized: the layout sizes itself to its text. Inset by
-        // TITLE_STRIP on all sides so the padding is symmetric (matches the
-        // box sizing in expandedSizeFor).
-        subtreeByFileId.set(
-          fileId,
-          layoutAst(ast, {
-            originX: TITLE_STRIP,
-            originY: TITLE_STRIP,
-            labelOf: labelFor,
-            significant: isSignificant,
-            pruneEmpty: (n) => n.syntaxKind === 'Block', // drop empty `{}`
-            prune: (n) => n.syntaxKind === 'HeritageClause',
-            reserveBand: (n) => n.syntaxKind === 'Constructor',
-            rowGroup: (n) =>
-              n.syntaxKind === 'HeritageClause' ? 'extends' : 'n',
-            measure: labelScreenBox,
-          }),
-        );
+        ensureExpandedLayout(fileId);
       }
 
       function dropSubtreeLayout(fileId: string): void {
         subtreeByFileId.delete(fileId);
+        astForceByFileId.delete(fileId);
+        expandedSizeCache.delete(fileId);
       }
 
       // ----- per-frame draw -----
@@ -618,10 +678,39 @@ export function PixiCanvas({ project }: CanvasProps) {
         fileId: string,
         selection: string | null,
       ): void {
-        const rootChildren = tree.childrenByParent.get(tree.rootId);
-        if (!rootChildren) return;
-        for (const child of rootChildren) {
-          drawAstNode(child, baseX, baseY, fileId, tree, selection);
+        // Top-level statements are positioned by the per-file fractal force
+        // layout, not the treemap's wrapped-row defaults. Each top-level
+        // subtree translates as a rigid body — descendants render unchanged
+        // because drawAstNode uses (baseX + node.rect.x, baseY + node.rect.y)
+        // and we adjust baseX/baseY per top-level by the delta from its
+        // treemap position to its sim-decided position.
+        const force = astForceByFileId.get(fileId);
+        if (!force) return;
+        // Use the file's ACTUAL rendered width as the content side so the
+        // cluster centers inside the (possibly clamped) box — using
+        // `force.bounds.side` directly would overflow whenever sizing was
+        // clamped by EXPANDED_MAX.
+        const sim = layout.byId.get(fileId);
+        const fileSide = sim ? sim.width : force.bounds.side + TITLE_STRIP * 2;
+        const contentSide = Math.max(0, fileSide - TITLE_STRIP * 2);
+        const { minX, minY, bboxW, bboxH } = force.bounds;
+        const fileOriginX =
+          baseX + TITLE_STRIP + (contentSide - bboxW) / 2 - minX;
+        const fileOriginY =
+          baseY + TITLE_STRIP + (contentSide - bboxH) / 2 - minY;
+        for (const sn of force.nodes) {
+          const tn = sn.tree;
+          // Old top-left from the treemap → new top-left from the sim.
+          const dx = sn.x - tn.rect.w / 2 - tn.rect.x;
+          const dy = sn.y - tn.rect.h / 2 - tn.rect.y;
+          drawAstNode(
+            tn,
+            fileOriginX + dx,
+            fileOriginY + dy,
+            fileId,
+            tree,
+            selection,
+          );
         }
       }
 
@@ -915,9 +1004,13 @@ export function PixiCanvas({ project }: CanvasProps) {
             });
           }
         };
-        // In the simplified tier only real names survive — generic kind
-        // labels (type / if / arrow fn / call / access …) drop out.
-        const nameOk = !simplified || node.name != null;
+        // In the simplified tier only real names (and name-like kinds such
+        // as import/return) survive — other generic kind labels (type / if /
+        // arrow fn / call / access …) drop out.
+        const nameOk =
+          !simplified ||
+          node.name != null ||
+          NAME_LIKE_KINDS.has(node.syntaxKind);
         if (node.labelChip && labelText && labelBox && nameOk) {
           // Relational left operand (e.g. `i` in `let i = j`): the name is
           // drawn centered in its reserved chip, not as a top-of-box label.

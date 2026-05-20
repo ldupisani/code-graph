@@ -42,11 +42,11 @@ export async function openProject(rawPath: string): Promise<ProjectResponse> {
 
   const files: FileNode[] = sourceFiles.map((sf) => buildFileNode(sf, rootPath));
   const fileIdByAbs = new Map(files.map((f) => [f.absolutePath, f.id]));
-  const edges = buildImportEdges(sourceFiles, fileIdByAbs);
 
   // Walk every source file once. The map of (ts-morph Node → AstNode id) is
   // shared across files so the semantic-edge pass can resolve cross-file
-  // declarations to the right id.
+  // declarations to the right id — and so the import-edge pass below can
+  // tag each edge with its owning ImportDeclaration AST node.
   const asts = new Map<string, FileAstResponse>();
   const idByNode = new Map<Node, string>();
   for (const sf of sourceFiles) {
@@ -56,6 +56,12 @@ export async function openProject(rawPath: string): Promise<ProjectResponse> {
     asts.set(fileId, result.response);
     for (const [node, id] of result.idByNode) idByNode.set(node, id);
   }
+
+  // Import edges are built AFTER AST extraction so each can be stamped with
+  // the AST id of the ImportDeclaration it originated from. That id lets the
+  // renderer anchor import lines on the specific block when the source file
+  // is expanded.
+  const edges = buildImportEdges(sourceFiles, fileIdByAbs, idByNode);
 
   const semanticEdges = buildSemanticEdges(sourceFiles, idByNode);
 
@@ -127,6 +133,7 @@ function buildFileNode(sf: SourceFile, rootPath: string): FileNode {
 function buildImportEdges(
   sourceFiles: readonly SourceFile[],
   fileIdByAbs: Map<string, string>,
+  idByNode: ReadonlyMap<Node, string>,
 ): ImportEdge[] {
   const edges: ImportEdge[] = [];
   for (const sf of sourceFiles) {
@@ -142,6 +149,7 @@ function buildImportEdges(
         kind: 'imports',
         fromId,
         toId,
+        fromAstNodeId: idByNode.get(imp),
       });
     }
   }

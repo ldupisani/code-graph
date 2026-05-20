@@ -27,6 +27,7 @@ import {
 } from '../graph/astForce';
 import type {
   FileAstResponse,
+  ImportEdge,
   ProjectResponse,
   SemanticEdge,
   SemanticEdgeKind,
@@ -383,9 +384,10 @@ export function PixiCanvas({ project }: CanvasProps) {
       const semanticEdgeGfx = new Graphics();
       world.addChild(semanticEdgeGfx);
 
-      // The filename is now drawn ABOVE the box (outside it), so only a small
-      // top inset is kept inside so AST content doesn't touch the border.
-      const TITLE_STRIP = 6;
+      // Visual rim between the cluster's bounding-circle radius and the file
+      // boundary actually drawn. Pure breathing room — the file's name is
+      // drawn outside (above) the boundary, not inside it.
+      const FILE_RIM = 10;
 
       // Per-file AST treemap layouts, populated when a file is expanded.
       const subtreeByFileId = new Map<string, TreemapLayout>();
@@ -486,19 +488,19 @@ export function PixiCanvas({ project }: CanvasProps) {
           semanticEdges: project.semanticEdges,
         });
         astForceByFileId.set(fileId, force);
-        // Square the file's content area to the larger cluster dimension,
-        // clamped to the same bounds fitInterior used. Symmetric TITLE_STRIP
-        // padding wraps the content on all four sides.
+        // File is drawn as a circle of (cluster-radius + FILE_RIM). Its
+        // SimFileNode footprint is the bounding *square* of that circle so
+        // the existing edge-port logic — which probes top/bottom/left/right
+        // midpoints of the hit rect — naturally lands on the circle
+        // boundary. Width === height ⇒ collisionRadius in layout.ts uses
+        // r = w/2 + pad (see the expanded branch there).
         const minSide = Math.max(EXPANDED_MIN.w, EXPANDED_MIN.h);
         const maxSide = Math.min(EXPANDED_MAX.w, EXPANDED_MAX.h);
-        const side = Math.min(
+        const diameter = Math.min(
           maxSide,
-          Math.max(minSide, Math.ceil(force.bounds.side)),
+          Math.max(minSide, Math.ceil(2 * (force.bounds.radius + FILE_RIM))),
         );
-        const size = {
-          w: side + TITLE_STRIP * 2,
-          h: side + TITLE_STRIP * 2,
-        };
+        const size = { w: diameter, h: diameter };
         expandedSizeCache.set(fileId, { ast, size });
         return { tree, force, size };
       }
@@ -537,9 +539,18 @@ export function PixiCanvas({ project }: CanvasProps) {
         visibleById.clear();
         labelPool.beginFrame();
 
-        // 1. Import edges (under rects — they connect file centers and look
-        //    cleanest terminating at the rect borders).
-        drawEdges(layout, worldGfx, cameraScale, visibleSemanticPairs);
+        // 1. Import edges (under rects). Now anchored to the specific
+        //    `import` AST node on the source side when that file is
+        //    expanded, and clipped to the file's circle on the target
+        //    side — see drawEdges for the geometry.
+        drawEdges(
+          layout,
+          project.edges,
+          astForceByFileId,
+          worldGfx,
+          cameraScale,
+          visibleSemanticPairs,
+        );
 
         // 2. Files + AST subtrees on `worldGfx`. pushRect keeps visibleById
         //    in sync so the edge pass below can find precise anchors.
@@ -636,18 +647,28 @@ export function PixiCanvas({ project }: CanvasProps) {
           return;
         }
 
-        // Expanded files: translucent background, no outline — except when
-        // selected, where the selection blue is a thick outline (half the
-        // title-strip width) instead of recoloring the background.
+        // Expanded files: a translucent CIRCLE encompassing the cluster.
+        // sim.width === sim.height by construction (see ensureExpandedLayout)
+        // so radius = half the footprint. Selection thickens the stroke.
+        const fileRadius = sim.width / 2;
         worldGfx
-          .roundRect(x, y, sim.width, sim.height, 6)
+          .circle(sim.x, sim.y, fileRadius)
           .fill({ color: COLORS.fileExpanded, alpha: 0.7 });
         if (isSelected) {
           worldGfx
-            .roundRect(x, y, sim.width, sim.height, 6)
-            .stroke({ color: COLORS.fileSelected, width: TITLE_STRIP / 2 });
+            .circle(sim.x, sim.y, fileRadius)
+            .stroke({ color: COLORS.fileSelected, width: FILE_RIM / 2 });
         }
 
+        // Hit rect is the bounding square of the circle. Two reasons:
+        //   (1) HitRect is an AABB by design — the smallest-area containing
+        //       rect wins, which is the same answer for clicks anywhere on
+        //       the visible circle (and the four "corner" pixels outside the
+        //       circle but inside the square are visually empty, so a click
+        //       there is unambiguously about this file).
+        //   (2) The edge-port logic (callConnector) probes the four edge-
+        //       midpoints of this rect — which sit exactly on the circle
+        //       boundary, so semantic connectors land cleanly.
         pushRect({
           id: sim.id,
           fileId: sim.id,
@@ -673,8 +694,8 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       function drawSubtree(
         tree: TreemapLayout,
-        baseX: number,
-        baseY: number,
+        _baseX: number,
+        _baseY: number,
         fileId: string,
         selection: string | null,
       ): void {
@@ -686,27 +707,26 @@ export function PixiCanvas({ project }: CanvasProps) {
         // treemap position to its sim-decided position.
         const force = astForceByFileId.get(fileId);
         if (!force) return;
-        // Use the file's ACTUAL rendered width as the content side so the
-        // cluster centers inside the (possibly clamped) box — using
-        // `force.bounds.side` directly would overflow whenever sizing was
-        // clamped by EXPANDED_MAX.
         const sim = layout.byId.get(fileId);
-        const fileSide = sim ? sim.width : force.bounds.side + TITLE_STRIP * 2;
-        const contentSide = Math.max(0, fileSide - TITLE_STRIP * 2);
-        const { minX, minY, bboxW, bboxH } = force.bounds;
-        const fileOriginX =
-          baseX + TITLE_STRIP + (contentSide - bboxW) / 2 - minX;
-        const fileOriginY =
-          baseY + TITLE_STRIP + (contentSide - bboxH) / 2 - minY;
+        if (!sim) return;
+        // Anchor the cluster's centroid on the file's world position so the
+        // surrounding circle (centered on sim.x/y) genuinely encloses every
+        // node. Baking the centroid offset into the per-subtree translation
+        // — instead of computing a file-box top-left — means we no longer
+        // depend on the file having a rectangular content area at all.
+        const offsetX = sim.x - force.bounds.cx;
+        const offsetY = sim.y - force.bounds.cy;
         for (const sn of force.nodes) {
           const tn = sn.tree;
-          // Old top-left from the treemap → new top-left from the sim.
+          // sn.{x,y} is the sim node's center; tn.rect.{x,y} is the
+          // treemap-relative top-left of the subtree root. The delta maps
+          // the (untransformed) drawAstNode recursion back onto the sim.
           const dx = sn.x - tn.rect.w / 2 - tn.rect.x;
           const dy = sn.y - tn.rect.h / 2 - tn.rect.y;
           drawAstNode(
             tn,
-            fileOriginX + dx,
-            fileOriginY + dy,
+            offsetX + dx,
+            offsetY + dy,
             fileId,
             tree,
             selection,
@@ -790,10 +810,9 @@ export function PixiCanvas({ project }: CanvasProps) {
         let borderWidth = 0.5;
         let borderAlpha = 0.9;
         if (isSelected) {
-          // Selection blue as a thick outline (half the title-strip width),
-          // not a background recolor.
+          // Selection blue as a thick outline, not a background recolor.
           borderColor = COLORS.astSelected;
-          borderWidth = TITLE_STRIP / 2;
+          borderWidth = FILE_RIM / 2;
           borderAlpha = 1;
         } else if (kindOutline !== undefined) {
           // Selection still overrides the kind color so the active node
@@ -1369,6 +1388,8 @@ function cubicPath(
 
 function drawEdges(
   layout: FileLayoutResult,
+  edges: readonly ImportEdge[],
+  astForceByFileId: Map<string, AstForceLayout>,
   gfx: Graphics,
   cameraScale: number,
   visibleSemanticPairs: ReadonlySet<string>,
@@ -1376,14 +1397,50 @@ function drawEdges(
   // Import links: a quiet subdued background layer. Suppressed when a
   // calls/extends/implements link is already visible between the same two
   // files — that semantic relationship makes the import implicit.
-  for (const link of layout.links) {
-    const s = typeof link.source === 'string' ? layout.byId.get(link.source) : link.source;
-    const t = typeof link.target === 'string' ? layout.byId.get(link.target) : link.target;
+  //
+  // Endpoints:
+  //   - Source: when the importing file is expanded and we know the AST id
+  //     of the `import` statement, anchor at that block's CENTER in world
+  //     coords (cluster centroid → file center mapping). The line visibly
+  //     emerges from the specific statement that owns it.
+  //   - Target: when the imported file is expanded, clip the line to the
+  //     file's circle boundary along the source→target direction so it
+  //     doesn't plunge through the AST contents to a phantom centre point.
+  for (const edge of edges) {
+    const s = layout.byId.get(edge.fromId);
+    const t = layout.byId.get(edge.toId);
     if (!s || !t) continue;
-    if (visibleSemanticPairs.has(`${s.id} ${t.id}`)) continue;
+    if (visibleSemanticPairs.has(`${edge.fromId} ${edge.toId}`)) continue;
+
+    // Source point: import-block center if available, else file center.
+    let sx = s.x;
+    let sy = s.y;
+    if (s.expanded && edge.fromAstNodeId) {
+      const force = astForceByFileId.get(edge.fromId);
+      const sn = force?.byId.get(edge.fromAstNodeId);
+      if (force && sn) {
+        sx = s.x - force.bounds.cx + sn.x;
+        sy = s.y - force.bounds.cy + sn.y;
+      }
+    }
+
+    // Target point: clip to circle if expanded.
+    let tx = t.x;
+    let ty = t.y;
+    if (t.expanded) {
+      const r = t.width / 2;
+      const dx = tx - sx;
+      const dy = ty - sy;
+      const dist = Math.hypot(dx, dy);
+      if (dist > r) {
+        tx -= (dx / dist) * r;
+        ty -= (dy / dist) * r;
+      }
+    }
+
     gfx
-      .moveTo(s.x, s.y)
-      .lineTo(t.x, t.y)
+      .moveTo(sx, sy)
+      .lineTo(tx, ty)
       .stroke({
         color: COLORS.edge,
         width: 1.5 / cameraScale, // ~1.5px on screen, zoom-stable

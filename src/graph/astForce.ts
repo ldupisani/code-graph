@@ -35,14 +35,23 @@ export interface AstForceLayout {
     nodes: SimAstNode[];
     links: SimAstLink[];
     byId: Map<string, SimAstNode>;
-    // Settled cluster bounds in sim coordinates. The renderer translates the
-    // cluster so (minX, minY) maps to the file box's content origin.
+    // Settled cluster geometry in sim coordinates. The renderer centers the
+    // cluster centroid (cx, cy) on the file's world position and draws a
+    // circle of `radius` around it — the file's visible boundary.
     bounds: {
         minX: number;
         minY: number;
         bboxW: number;
         bboxH: number;
-        side: number; // = max(bboxW, bboxH); the file box is squared to this
+        // Cluster centroid (the bbox center). Used by the renderer to align
+        // the cluster with the file's sim position when drawing.
+        cx: number;
+        cy: number;
+        // Smallest radius (around the centroid) that contains every node's
+        // rect corner. The file is drawn as a circle of this radius plus a
+        // visual rim — guarantees the circle visually encompasses every
+        // top-level node.
+        radius: number;
     };
 }
 
@@ -74,6 +83,13 @@ const INHERIT_Y_STRENGTH = 0.22;
 // the cluster settles to the tightest packing collide permits.
 const COMPRESS_STRENGTH = 0.05;
 const SQUARE_STRENGTH = 0.06;
+// Imports cluster to the TOP. Strength of the directional bias that
+// pushes ImportDeclaration nodes above every non-import node — same
+// equal-and-opposite "push apart when ordering is violated" pattern as
+// callsX/callsY/inheritY, so it stops automatically once the imports
+// are above (no cluster blowup) and the centroid stays stable
+// (forceCenter doesn't have to fight it).
+const IMPORT_ABOVE_STRENGTH = 0.25;
 const WEIGHT_CAP = 3;
 const SETTLE_TICKS = 300;
 
@@ -178,6 +194,38 @@ function directionalAstForce(edges: readonly DirAstEdge[], axis: "x" | "y", stre
     return force;
 }
 
+// Cross-product directional bias: every (import, non-import) pair gets a
+// push apart along Y whenever the import isn't yet sufficiently above the
+// non-import. "Sufficiently" = AABB y-separation (sum of half-heights +
+// pad), so the force matches the geometry forceCollide is enforcing —
+// it stops the moment the import is one collide-step above its neighbour
+// rather than continuing to inflate the cluster.
+function importAboveOthersForce(strength: number, pad: number) {
+    let imports: SimAstNode[] = [];
+    let others: SimAstNode[] = [];
+    function force(alpha: number): void {
+        if (imports.length === 0 || others.length === 0) return;
+        for (const a of imports) {
+            for (const b of others) {
+                // b should sit BELOW a along Y. Deficit > 0 means a is
+                // not yet far enough above b (or is even below it).
+                const desiredGap = (a.rect.h + b.rect.h) / 2 + pad;
+                const actualGap = b.y - a.y;
+                const deficit = desiredGap - actualGap;
+                if (deficit <= 0) continue;
+                const push = strength * alpha * deficit * 0.5;
+                a.vy = (a.vy ?? 0) - push;
+                b.vy = (b.vy ?? 0) + push;
+            }
+        }
+    }
+    force.initialize = (n: SimAstNode[]): void => {
+        imports = n.filter((x) => x.tree.syntaxKind === "ImportDeclaration");
+        others = n.filter((x) => x.tree.syntaxKind !== "ImportDeclaration");
+    };
+    return force;
+}
+
 // Equalize the cluster's x and y ranges toward their geometric mean: pull
 // the wider axis inward (toward 0, the cluster center) and the narrower
 // axis outward. forceCenter(0,0) cooperates by holding the cluster
@@ -268,13 +316,23 @@ export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
     }
     const spread = Math.max(60, maxDiag * 0.8);
 
-    const nodes: SimAstNode[] = topLevel.map((tn, i) => ({
-        id: tn.id,
-        x: Math.cos(i * 2.4) * spread,
-        y: Math.sin(i * 2.4) * spread,
-        rect: tn.rect,
-        tree: tn,
-    }));
+    // Imports are biased to the cluster top (see importTopBiasForce). The
+    // bias alone can't always overcome collide if an import starts *below*
+    // the rest of the cluster, so we pre-seed them at y < 0 (top) — the
+    // bias then just maintains the position. Others get the usual ring
+    // angle but mirrored into the lower half so they start opposite the
+    // imports and don't collide with them on tick 1.
+    const nodes: SimAstNode[] = topLevel.map((tn, i) => {
+        const isImport = tn.syntaxKind === "ImportDeclaration";
+        const angle = i * 2.4;
+        return {
+            id: tn.id,
+            x: Math.cos(angle) * spread,
+            y: isImport ? -spread : Math.abs(Math.sin(angle) * spread),
+            rect: tn.rect,
+            tree: tn,
+        };
+    });
     const byId = new Map(nodes.map((n) => [n.id, n]));
 
     // Sim links: every intra-file calls/extends/implements edge whose lifted
@@ -315,6 +373,11 @@ export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
         .force("center", forceCenter(0, 0))
         .force("x", forceX<SimAstNode>(0).strength(COMPRESS_STRENGTH))
         .force("y", forceY<SimAstNode>(0).strength(COMPRESS_STRENGTH))
+        // Imports bias upward: bounded directional force that pushes
+        // every (import, non-import) pair apart along Y until the import
+        // is at least one AABB-collide-step above the non-import. Stops
+        // when that's satisfied, so the cluster doesn't blow up.
+        .force("importTop", importAboveOthersForce(IMPORT_ABOVE_STRENGTH, COLLIDE_PAD))
         .force("collide", aabbCollideForce(COLLIDE_PAD, COLLIDE_ITERS))
         .force("callsX", directionalAstForce(callEdges, "x", CALLS_X_STRENGTH))
         .force("callsY", directionalAstForce(callEdges, "y", CALLS_Y_STRENGTH))
@@ -348,12 +411,31 @@ export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
     }
     const bboxW = maxX - minX;
     const bboxH = maxY - minY;
-    const side = Math.max(bboxW, bboxH);
+    const cx = minX + bboxW / 2;
+    const cy = minY + bboxH / 2;
+
+    // Smallest radius around the centroid that contains every rect corner.
+    // We use rect corners (not just centers) so the circle visually
+    // encompasses each top-level node entirely. A square cluster of side s
+    // gives radius ≈ s·√2/2 — wider than just bbox/2 — which is the
+    // geometric minimum for full enclosure.
+    let radius = 0;
+    for (const n of nodes) {
+        const hw = n.rect.w / 2;
+        const hh = n.rect.h / 2;
+        // The farthest corner from the centroid is always the corner on the
+        // same diagonal as the centroid→node-center vector — no need to
+        // probe all four.
+        const dxAbs = Math.abs(n.x - cx) + hw;
+        const dyAbs = Math.abs(n.y - cy) + hh;
+        const d = Math.hypot(dxAbs, dyAbs);
+        if (d > radius) radius = d;
+    }
 
     return {
         nodes,
         links,
         byId,
-        bounds: {minX, minY, bboxW, bboxH, side},
+        bounds: {minX, minY, bboxW, bboxH, cx, cy, radius},
     };
 }

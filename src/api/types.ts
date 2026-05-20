@@ -38,6 +38,12 @@ export interface ImportEdge {
   kind: 'imports';
   fromId: string;
   toId: string;
+  // AST id of the specific `ImportDeclaration` inside fromId that owns this
+  // edge. The renderer uses it to anchor the import line on the exact
+  // statement block when the source file is expanded — otherwise the line
+  // would always start at the file's centroid and pass through unrelated AST
+  // content. Falls back to the file rect when the AST isn't loaded yet.
+  fromAstNodeId?: string;
 }
 
 export interface ProjectRequest {

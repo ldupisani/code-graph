@@ -1493,6 +1493,94 @@ function callConnector(
   };
 }
 
+// Pick a pair of OPPOSITE face midpoints on `via` to terminate the two
+// halves of a via-routed connector. The pair is always (top, bottom) or
+// (left, right) — never adjacent faces — so the two curves emerge from
+// genuinely opposite sides and leave a visible gap across the import
+// binding (the dashed-outlined rect that sits between them reads as a
+// "portal" the connector passes through).
+//
+// Within a pair, the orientation (which face is entry vs exit) is chosen
+// to minimise total `dist(entry, FROM) + dist(exit, TO)`. The axis itself
+// (horizontal vs vertical) is chosen by comparing both arrangements'
+// totals, so when FROM is below and TO is above we get (bottom, top); when
+// FROM is to the right and TO to the left we get (right, left); etc.
+function viaPortsOpposite(
+  from: { x: number; y: number; w: number; h: number },
+  via: { x: number; y: number; w: number; h: number },
+  to: { x: number; y: number; w: number; h: number },
+): {
+  entry: { x: number; y: number; nx: number; ny: number };
+  exit: { x: number; y: number; nx: number; ny: number };
+} {
+  const cf = { x: from.x + from.w / 2, y: from.y + from.h / 2 };
+  const ct = { x: to.x + to.w / 2, y: to.y + to.h / 2 };
+  const cv = { x: via.x + via.w / 2, y: via.y + via.h / 2 };
+  const top = { x: cv.x, y: via.y, nx: 0, ny: -1 };
+  const bottom = { x: cv.x, y: via.y + via.h, nx: 0, ny: 1 };
+  const left = { x: via.x, y: cv.y, nx: -1, ny: 0 };
+  const right = { x: via.x + via.w, y: cv.y, nx: 1, ny: 0 };
+  const pairs: [
+    { x: number; y: number; nx: number; ny: number },
+    { x: number; y: number; nx: number; ny: number },
+  ][] = [
+    [top, bottom],
+    [left, right],
+  ];
+  type Choice = {
+    entry: { x: number; y: number; nx: number; ny: number };
+    exit: { x: number; y: number; nx: number; ny: number };
+    score: number;
+  };
+  let best: Choice = { entry: pairs[0][0], exit: pairs[0][1], score: Infinity };
+  for (const [a, b] of pairs) {
+    const o1 = Math.hypot(a.x - cf.x, a.y - cf.y) + Math.hypot(b.x - ct.x, b.y - ct.y);
+    const o2 = Math.hypot(b.x - cf.x, b.y - cf.y) + Math.hypot(a.x - ct.x, a.y - ct.y);
+    if (o1 < best.score) best = { entry: a, exit: b, score: o1 };
+    if (o2 < best.score) best = { entry: b, exit: a, score: o2 };
+  }
+  return { entry: best.entry, exit: best.exit };
+}
+
+// Cubic curve from an arbitrary fixed start port (with its outward normal)
+// to the closest face midpoint on `to`. Mirror of callConnector but with
+// one endpoint pinned — used to anchor both halves of a via-routed edge
+// at the same point on the via-binding.
+function curveFromPortToRect(
+  start: { x: number; y: number; nx: number; ny: number },
+  to: { x: number; y: number; w: number; h: number },
+): {
+  startPort: { x: number; y: number };
+  endPort: { x: number; y: number };
+  cp1: { x: number; y: number };
+  cp2: { x: number; y: number };
+} {
+  const cx = to.x + to.w / 2;
+  const cy = to.y + to.h / 2;
+  const candidates = [
+    { x: cx, y: to.y, nx: 0, ny: -1 },
+    { x: cx, y: to.y + to.h, nx: 0, ny: 1 },
+    { x: to.x, y: cy, nx: -1, ny: 0 },
+    { x: to.x + to.w, y: cy, nx: 1, ny: 0 },
+  ];
+  let best = candidates[0];
+  let bestD = Infinity;
+  for (const c of candidates) {
+    const d = Math.hypot(c.x - start.x, c.y - start.y);
+    if (d < bestD) {
+      bestD = d;
+      best = c;
+    }
+  }
+  const h = Math.min(Math.max(bestD * 0.5, 36), 260);
+  return {
+    startPort: { x: start.x, y: start.y },
+    endPort: { x: best.x, y: best.y },
+    cp1: { x: start.x + start.nx * h, y: start.y + start.ny * h },
+    cp2: { x: best.x + best.nx * h, y: best.y + best.ny * h },
+  };
+}
+
 // Control points for the inheritance connector: BOTTOM of the superclass
 // (`start`, the thing being extended) → TOP of the subclass (`end`, the thing
 // that extends it). Fixed vertical class-hierarchy geometry:
@@ -1657,19 +1745,25 @@ function drawSemanticEdges(
     // For the via-routed path we also need a second curve's controls.
     let cp1b: { x: number; y: number } | null = null;
     let cp2b: { x: number; y: number } | null = null;
-    let midPort: { x: number; y: number } | null = null;
+    let midPortIn: { x: number; y: number } | null = null;
+    let midPortOut: { x: number; y: number } | null = null;
     if (via) {
-      // Two-segment path: from → via, then via → to. Use callConnector for
-      // both sides so the curves enter/exit each rect along its closest
-      // face — gives a continuous-looking poly-curve regardless of where
-      // the import block sits inside the file. The midpoint port lies on
-      // an edge of `via`, which is exactly the rect we'll dash an outline
-      // around below.
-      const segA = callConnector(from, via);
-      const segB = callConnector(via, to);
-      startPort = segA.startPort;
-      midPort = segA.endPort;
-      ({ cp1, cp2 } = segA);
+      // Two distinct curve segments terminating on OPPOSITE faces of the
+      // via rect — entry face is closest to FROM, exit face is its
+      // direct opposite (and lands closest to TO). The dashed-outlined
+      // via box sits between the two curves like a portal: the connector
+      // visibly passes through the import binding rather than around it.
+      const ports = viaPortsOpposite(from, via, to);
+      // Curve A: FROM → via.entry. Build it as port→rect and then swap
+      // start/end so cubicPath orders the points from→via.
+      const segA = curveFromPortToRect(ports.entry, from);
+      startPort = segA.endPort;
+      cp1 = segA.cp2;
+      cp2 = segA.cp1;
+      midPortIn = segA.startPort;
+      // Curve B: via.exit → TO. As-is.
+      const segB = curveFromPortToRect(ports.exit, to);
+      midPortOut = segB.startPort;
       cp1b = segB.cp1;
       cp2b = segB.cp2;
       endPort = segB.endPort;
@@ -1683,19 +1777,30 @@ function drawSemanticEdges(
     }
 
     if (dashed) {
-      emitDashed(
-        gfx,
-        cubicPath(startPort, cp1, cp2, midPort ?? endPort, 48),
-        3.5 * invScale, // fine dash, screen-constant
-        2.5 * invScale,
-      );
-      gfx.stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
-      if (via && midPort && cp1b && cp2b) {
-        // Second curve: via → to. Same dash so the two segments read as
-        // one routed connector.
+      // First segment. When the line is routed via an import binding the
+      // FROM→via.entry hop is always intra-file (the binding lives in the
+      // source file's own cluster) and short — a curve there reads as
+      // decorative noise, so we draw a straight dashed line. The
+      // second segment (via.exit → TO) stays curved because it generally
+      // crosses to another file.
+      if (via && midPortIn) {
+        emitDashed(gfx, [startPort, midPortIn], 3.5 * invScale, 2.5 * invScale);
+      } else {
         emitDashed(
           gfx,
-          cubicPath(midPort, cp1b, cp2b, endPort, 48),
+          cubicPath(startPort, cp1, cp2, endPort, 48),
+          3.5 * invScale, // fine dash, screen-constant
+          2.5 * invScale,
+        );
+      }
+      gfx.stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+      if (via && midPortOut && cp1b && cp2b) {
+        // Second curve: via.exit → to. Same dash so the two segments
+        // read as one routed connector. The gap between midPortIn and
+        // midPortOut is the dashed-outlined import binding.
+        emitDashed(
+          gfx,
+          cubicPath(midPortOut, cp1b, cp2b, endPort, 48),
           3.5 * invScale,
           2.5 * invScale,
         );
@@ -1713,13 +1818,21 @@ function drawSemanticEdges(
         gfx.stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
       }
     } else {
-      gfx
-        .moveTo(startPort.x, startPort.y)
-        .bezierCurveTo(cp1.x, cp1.y, cp2.x, cp2.y, (midPort ?? endPort).x, (midPort ?? endPort).y)
-        .stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
-      if (via && midPort && cp1b && cp2b) {
+      // Same straight-vs-curved split for the selected/solid edge style.
+      if (via && midPortIn) {
         gfx
-          .moveTo(midPort.x, midPort.y)
+          .moveTo(startPort.x, startPort.y)
+          .lineTo(midPortIn.x, midPortIn.y)
+          .stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+      } else {
+        gfx
+          .moveTo(startPort.x, startPort.y)
+          .bezierCurveTo(cp1.x, cp1.y, cp2.x, cp2.y, endPort.x, endPort.y)
+          .stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+      }
+      if (via && midPortOut && cp1b && cp2b) {
+        gfx
+          .moveTo(midPortOut.x, midPortOut.y)
           .bezierCurveTo(cp1b.x, cp1b.y, cp2b.x, cp2b.y, endPort.x, endPort.y)
           .stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
         gfx

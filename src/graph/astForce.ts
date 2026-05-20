@@ -31,29 +31,71 @@ export interface SimAstLink {
     target: string | SimAstNode;
 }
 
-export interface AstForceLayout {
+// Settled bounds shared by every container's force layout — file root
+// AND nested containers (classes / interfaces). The renderer reads this
+// to draw the container as a circle and to translate sim coords into
+// world coords.
+export interface ContainerBounds {
+    minX: number;
+    minY: number;
+    bboxW: number;
+    bboxH: number;
+    // Cluster centroid (the bbox center). The renderer maps this to the
+    // container's world position when drawing.
+    cx: number;
+    cy: number;
+    // Smallest radius around the centroid that encloses every member rect
+    // corner. The container is drawn as a circle of (radius + rim).
+    radius: number;
+}
+
+// A single force-laid-out container. The same shape powers both the file
+// root (whose members are top-level statements) and nested containers
+// (classes / interfaces, whose members are properties / methods /
+// constructors). Nesting is currently one level deep (only top-level
+// classes get their own layout); deeper nesting would just need the
+// recursion to keep going.
+export interface ContainerForceLayout {
+    // AST id of the container — `tree.rootId` for the file root, the
+    // class/interface node id for nested containers.
+    containerId: string;
     nodes: SimAstNode[];
     links: SimAstLink[];
     byId: Map<string, SimAstNode>;
-    // Settled cluster geometry in sim coordinates. The renderer centers the
-    // cluster centroid (cx, cy) on the file's world position and draws a
-    // circle of `radius` around it — the file's visible boundary.
-    bounds: {
-        minX: number;
-        minY: number;
-        bboxW: number;
-        bboxH: number;
-        // Cluster centroid (the bbox center). Used by the renderer to align
-        // the cluster with the file's sim position when drawing.
-        cx: number;
-        cy: number;
-        // Smallest radius (around the centroid) that contains every node's
-        // rect corner. The file is drawn as a circle of this radius plus a
-        // visual rim — guarantees the circle visually encompasses every
-        // top-level node.
-        radius: number;
-    };
+    bounds: ContainerBounds;
 }
+
+export interface AstForceLayout {
+    // The file-root layout — equivalent to the previous flat shape,
+    // kept at the top level for backward compatibility with the
+    // renderer.
+    nodes: SimAstNode[];
+    links: SimAstLink[];
+    byId: Map<string, SimAstNode>;
+    bounds: ContainerBounds;
+    // Nested force layouts keyed by AST container id. Currently
+    // populated for top-level ClassDeclaration / InterfaceDeclaration
+    // nodes whose members are arranged as their own fractal force
+    // graph (instead of the bottom-up wrapped-row treemap that would
+    // otherwise produce a tall vertical column for member-heavy
+    // classes like lightspeed's Game).
+    containers: Map<string, ContainerForceLayout>;
+}
+
+// Member-container kinds whose direct children get their OWN force
+// layout (rather than the default treemap stacking). Each gets drawn
+// as a circle, like the file circle but smaller.
+const MEMBER_CONTAINER_KINDS = new Set(["ClassDeclaration", "InterfaceDeclaration"]);
+
+function isMemberContainer(tn: TreemapNode): boolean {
+    return MEMBER_CONTAINER_KINDS.has(tn.syntaxKind);
+}
+
+// Visual rim added between a nested container's member cluster radius
+// and the drawn circle. The file's analogous constant FILE_RIM is owned
+// by PixiCanvas; this one stays here because it factors into rect.w/h
+// (mutated below) which the file-level force layout consumes.
+const INNER_RIM = 8;
 
 interface DirAstEdge {
     aId: string;
@@ -146,16 +188,24 @@ function fileIdOf(astId: string): string {
     return i <= 0 ? astId : astId.slice(0, i);
 }
 
-// Walk up `tree.byId.parentId` until we hit the direct child of rootId —
-// that's the top-level statement containing this AST id. Returns null if
-// the id was pruned away, doesn't exist in the layout, or *is* the root.
-function liftToTopLevel(astId: string, tree: TreemapLayout): string | null {
+// Walk up `tree.byId.parentId` until we hit a direct child of
+// `containerId` — that's the member containing this AST id. With
+// `containerId = tree.rootId` this is the previous "lift to top-level
+// statement" behaviour; with a class id it returns the property /
+// method / constructor that owns the reference. Returns null if the id
+// was pruned, doesn't exist, IS the container, or sits in a different
+// container's subtree.
+function liftToContainerChild(
+    astId: string,
+    containerId: string,
+    tree: TreemapLayout,
+): string | null {
     let cur: string | null = astId;
     for (let guard = 0; guard < 1024; guard++) {
         if (!cur) return null;
         const node = tree.byId.get(cur);
         if (!node) return null;
-        if (node.parentId === tree.rootId) return node.id;
+        if (node.parentId === containerId) return node.id;
         if (node.parentId == null) return null;
         cur = node.parentId;
     }
@@ -273,6 +323,7 @@ function linkDistance(link: SimAstLink): number {
 function buildDirEdges(
     edges: readonly SemanticEdge[],
     fileId: string,
+    containerId: string,
     tree: TreemapLayout,
     kinds: ReadonlySet<SemanticEdge["kind"]>,
     pick: (e: SemanticEdge) => {aId: string; bId: string},
@@ -283,8 +334,8 @@ function buildDirEdges(
         if (!kinds.has(e.kind)) continue;
         if (fileIdOf(e.fromId) !== fileId || fileIdOf(e.toId) !== fileId) continue;
         const sel = pick(e);
-        const a = liftToTopLevel(sel.aId, tree);
-        const b = liftToTopLevel(sel.bId, tree);
+        const a = liftToContainerChild(sel.aId, containerId, tree);
+        const b = liftToContainerChild(sel.bId, containerId, tree);
         if (!a || !b || a === b) continue;
         if (!byId.has(a) || !byId.has(b)) continue;
         const key = `${a} ${b}`;
@@ -302,27 +353,37 @@ export interface BuildAstForceOpts {
     semanticEdges: readonly SemanticEdge[];
 }
 
-export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
-    const {fileId, tree, semanticEdges} = opts;
-    const topLevel = tree.childrenByParent.get(tree.rootId) ?? [];
-
-    // Seed in a small ring so the sim has something to spread out; spread
-    // scales with the largest node so neighbours aren't on top of each other
-    // before the first tick.
+// Settle a force layout for the direct children of `containerId`. Used
+// at two scales:
+//   - containerId = tree.rootId, members = top-level statements → the
+//     file-root layout (file is drawn as a big circle).
+//   - containerId = class/interface id, members = properties / methods
+//     / constructor → a nested layout (class drawn as a smaller circle).
+// At the inner scale most of the "import bias" plumbing is just a no-op
+// (members aren't ImportDeclarations) — we keep the same force chain
+// rather than fork it.
+function buildContainerForceLayout(
+    containerId: string,
+    members: readonly TreemapNode[],
+    tree: TreemapLayout,
+    semanticEdges: readonly SemanticEdge[],
+    fileId: string,
+): ContainerForceLayout {
+    // Seed in a small ring so the sim has something to spread out;
+    // spread scales with the largest member's diagonal so neighbours
+    // aren't on top of each other before the first tick.
     let maxDiag = 0;
-    for (const tn of topLevel) {
+    for (const tn of members) {
         const d = Math.hypot(tn.rect.w, tn.rect.h);
         if (d > maxDiag) maxDiag = d;
     }
     const spread = Math.max(60, maxDiag * 0.8);
 
-    // Imports are biased to the cluster top (see importTopBiasForce). The
-    // bias alone can't always overcome collide if an import starts *below*
-    // the rest of the cluster, so we pre-seed them at y < 0 (top) — the
-    // bias then just maintains the position. Others get the usual ring
-    // angle but mirrored into the lower half so they start opposite the
-    // imports and don't collide with them on tick 1.
-    const nodes: SimAstNode[] = topLevel.map((tn, i) => {
+    // Imports get pre-seeded at the cluster top so the importTop force
+    // (which is bounded) doesn't have to push them through the rest of
+    // the cluster against collide. Non-imports use the usual ring
+    // angle but mirrored into y > 0 so they don't start ON the imports.
+    const nodes: SimAstNode[] = members.map((tn, i) => {
         const isImport = tn.syntaxKind === "ImportDeclaration";
         const angle = i * 2.4;
         return {
@@ -335,8 +396,9 @@ export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
     });
     const byId = new Map(nodes.map((n) => [n.id, n]));
 
-    // Sim links: every intra-file calls/extends/implements edge whose lifted
-    // endpoints are two distinct top-level nodes. Deduped per (kind, a, b).
+    // Sim links: every intra-file calls/extends/implements edge whose
+    // lifted endpoints are two distinct DIRECT CHILDREN of this
+    // container. Deduped per (kind, a, b).
     const links: SimAstLink[] = [];
     const seen = new Set<string>();
     let linkSeq = 0;
@@ -345,8 +407,8 @@ export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
             continue;
         }
         if (fileIdOf(e.fromId) !== fileId || fileIdOf(e.toId) !== fileId) continue;
-        const a = liftToTopLevel(e.fromId, tree);
-        const b = liftToTopLevel(e.toId, tree);
+        const a = liftToContainerChild(e.fromId, containerId, tree);
+        const b = liftToContainerChild(e.toId, containerId, tree);
         if (!a || !b || a === b) continue;
         if (!byId.has(a) || !byId.has(b)) continue;
         const key = `${e.kind}|${a}|${b}`;
@@ -355,11 +417,8 @@ export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
         links.push({id: `astl-${linkSeq++}`, source: a, target: b});
     }
 
-    // Directional bias: caller LEFT of callee (calls), subclass BELOW
-    // superclass (extends/implements) — same conventions as the file-level
-    // simulation, weighted by edge multiplicity.
-    const callEdges = buildDirEdges(semanticEdges, fileId, tree, new Set(["calls"]), (e) => ({aId: e.fromId, bId: e.toId}), byId);
-    const inheritEdges = buildDirEdges(semanticEdges, fileId, tree, new Set(["extends", "implements"]), (e) => ({aId: e.toId, bId: e.fromId}), byId);
+    const callEdges = buildDirEdges(semanticEdges, fileId, containerId, tree, new Set(["calls"]), (e) => ({aId: e.fromId, bId: e.toId}), byId);
+    const inheritEdges = buildDirEdges(semanticEdges, fileId, containerId, tree, new Set(["extends", "implements"]), (e) => ({aId: e.toId, bId: e.fromId}), byId);
 
     const simulation = forceSimulation<SimAstNode>(nodes)
         .force(
@@ -373,10 +432,6 @@ export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
         .force("center", forceCenter(0, 0))
         .force("x", forceX<SimAstNode>(0).strength(COMPRESS_STRENGTH))
         .force("y", forceY<SimAstNode>(0).strength(COMPRESS_STRENGTH))
-        // Imports bias upward: bounded directional force that pushes
-        // every (import, non-import) pair apart along Y until the import
-        // is at least one AABB-collide-step above the non-import. Stops
-        // when that's satisfied, so the cluster doesn't blow up.
         .force("importTop", importAboveOthersForce(IMPORT_ABOVE_STRENGTH, COLLIDE_PAD))
         .force("collide", aabbCollideForce(COLLIDE_PAD, COLLIDE_ITERS))
         .force("callsX", directionalAstForce(callEdges, "x", CALLS_X_STRENGTH))
@@ -385,7 +440,7 @@ export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
         .force("square", squareBiasForce(SQUARE_STRENGTH))
         .alpha(1)
         .alphaDecay(0.035)
-        .stop(); // we drive ticks manually for synchronous settle
+        .stop();
 
     for (let i = 0; i < SETTLE_TICKS; i++) simulation.tick();
     simulation.stop();
@@ -414,18 +469,10 @@ export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
     const cx = minX + bboxW / 2;
     const cy = minY + bboxH / 2;
 
-    // Smallest radius around the centroid that contains every rect corner.
-    // We use rect corners (not just centers) so the circle visually
-    // encompasses each top-level node entirely. A square cluster of side s
-    // gives radius ≈ s·√2/2 — wider than just bbox/2 — which is the
-    // geometric minimum for full enclosure.
     let radius = 0;
     for (const n of nodes) {
         const hw = n.rect.w / 2;
         const hh = n.rect.h / 2;
-        // The farthest corner from the centroid is always the corner on the
-        // same diagonal as the centroid→node-center vector — no need to
-        // probe all four.
         const dxAbs = Math.abs(n.x - cx) + hw;
         const dyAbs = Math.abs(n.y - cy) + hh;
         const d = Math.hypot(dxAbs, dyAbs);
@@ -433,9 +480,72 @@ export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
     }
 
     return {
+        containerId,
         nodes,
         links,
         byId,
         bounds: {minX, minY, bboxW, bboxH, cx, cy, radius},
+    };
+}
+
+export function buildAstForceLayout(opts: BuildAstForceOpts): AstForceLayout {
+    const {fileId, tree, semanticEdges} = opts;
+    const topLevel = tree.childrenByParent.get(tree.rootId) ?? [];
+    const containers = new Map<string, ContainerForceLayout>();
+
+    // FIRST: nested containers (top-level classes / interfaces). We
+    // build each one's member force layout, then MUTATE the container's
+    // treemap rect to fit a circle around the cluster — so the
+    // file-root layout below sees the correctly-sized container rect
+    // rather than the bottom-up wrapped-row treemap size. Member
+    // rect.x/y is also overridden to the force-decided position
+    // relative to the container's top-left, so drawAstNode's existing
+    // (baseX + node.rect.x, baseY + node.rect.y) recursion just works.
+    for (const tn of topLevel) {
+        if (!isMemberContainer(tn)) continue;
+        const memberNodes = tree.childrenByParent.get(tn.id) ?? [];
+        if (memberNodes.length === 0) continue;
+
+        const sub = buildContainerForceLayout(
+            tn.id,
+            memberNodes,
+            tree,
+            semanticEdges,
+            fileId,
+        );
+        containers.set(tn.id, sub);
+
+        // Resize the container's treemap rect to encompass the cluster
+        // circle (plus visual rim). The file-root force layout below
+        // sees this updated rect and treats the class as the compact
+        // square node it now draws as, instead of the 18:1-tall column
+        // the wrapped-row treemap produced for member-heavy classes
+        // like Game. Members' rect.x/y are NOT mutated — treemap rects
+        // are file-absolute and mutating a member position would
+        // strand its descendants. drawAstNode reads sub.byId at render
+        // time and applies a per-member translation via the recursion
+        // baseX/baseY instead.
+        const diameter = 2 * (sub.bounds.radius + INNER_RIM);
+        tn.rect.w = diameter;
+        tn.rect.h = diameter;
+    }
+
+    // THEN: file-root layout. Uses the (possibly updated) top-level
+    // rects so a member-heavy class is treated as a compact ~square
+    // node rather than a 18:1-tall vertical column.
+    const root = buildContainerForceLayout(
+        tree.rootId,
+        topLevel,
+        tree,
+        semanticEdges,
+        fileId,
+    );
+
+    return {
+        nodes: root.nodes,
+        links: root.links,
+        byId: root.byId,
+        bounds: root.bounds,
+        containers,
     };
 }

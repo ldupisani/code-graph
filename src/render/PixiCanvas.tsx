@@ -14,7 +14,7 @@ import {
   EXPANDED_MIN,
   type FileLayoutResult,
 } from '../graph/layout';
-import { fileLabel, labelScreenBox, measureMono } from '../graph/labels';
+import { AST_LABEL_FONT, fileLabel, labelScreenBox, measureMono } from '../graph/labels';
 import { useGraphStore } from '../graph/store';
 import {
   layoutAst,
@@ -24,6 +24,7 @@ import {
 import {
   buildAstForceLayout,
   type AstForceLayout,
+  type ContainerForceLayout,
 } from '../graph/astForce';
 import type {
   FileAstResponse,
@@ -734,6 +735,114 @@ export function PixiCanvas({ project }: CanvasProps) {
         }
       }
 
+      // Draw a class / interface as a translucent circle around its
+      // members (instead of the bottom-up wrapped-row rect the treemap
+      // would have built). Members render at their force-decided
+      // positions via a per-child baseX/baseY adjustment passed to the
+      // recursive drawAstNode call — treemap rects stay file-absolute
+      // (so descendants of each member still translate correctly with
+      // the member as a rigid body).
+      function drawAstContainer(
+        node: TreemapNode,
+        x: number,
+        y: number,
+        container: ContainerForceLayout,
+        fileId: string,
+        tree: TreemapLayout,
+        selection: string | null,
+      ): void {
+        const cx = x + node.rect.w / 2;
+        const cy = y + node.rect.h / 2;
+        const radius = node.rect.w / 2;
+
+        const isSelected = selection === node.id;
+        // Interface = always dashed green (TypeScript interfaces are
+        // abstract by nature, no `abstract` keyword needed). Abstract
+        // class = dashed; concrete class = solid. Same colour grammar
+        // as the rect path further down.
+        const isInterface = node.syntaxKind === 'InterfaceDeclaration';
+        const isAbstract = !!node.abstract;
+        const dashed = isInterface || isAbstract;
+        const strokeColor = isSelected
+          ? COLORS.fileSelected
+          : isInterface || isAbstract
+            ? COLORS.astOutlineAbstract
+            : SYNTAX.type;
+        const strokeWidth = (isSelected ? FILE_RIM / 2 : 1) / cameraScale;
+        const strokeAlpha = 1;
+
+        // Circle fill: same translucent dark as the file circle, so a
+        // class reads as a "smaller file" of related members.
+        worldGfx.circle(cx, cy, radius).fill({ color: COLORS.fileExpanded, alpha: 0.55 });
+
+        if (dashed) {
+          // Sample the perimeter and dash it. Step count scales with
+          // radius so big circles stay smooth.
+          const N = Math.max(48, Math.round(radius * 0.6));
+          const path: { x: number; y: number }[] = [];
+          for (let i = 0; i <= N; i++) {
+            const a = (i / N) * Math.PI * 2;
+            path.push({ x: cx + Math.cos(a) * radius, y: cy + Math.sin(a) * radius });
+          }
+          emitDashed(worldGfx, path, 3.5 / cameraScale, 2.5 / cameraScale);
+          worldGfx.stroke({ color: strokeColor, width: strokeWidth, alpha: strokeAlpha });
+        } else {
+          worldGfx
+            .circle(cx, cy, radius)
+            .stroke({ color: strokeColor, width: strokeWidth, alpha: strokeAlpha });
+        }
+
+        // Hit rect: bounding square of the circle (same trade-off as
+        // file circles — the four corner regions are visually empty so
+        // a click there is unambiguously about this container).
+        pushRect({
+          id: node.id,
+          fileId,
+          kind: 'ast',
+          x,
+          y,
+          w: node.rect.w,
+          h: node.rect.h,
+          area: node.rect.w * node.rect.h,
+        });
+
+        // Class/interface name above the circle, like the file label.
+        const labelText = labelFor(node);
+        if (labelText) {
+          const aboveGap = 4 / cameraScale; // screen-constant gap
+          labelPool.put({
+            text: labelText,
+            worldX: cx,
+            worldY: y - aboveGap,
+            color: isInterface ? COLORS.astOutlineAbstract : SYNTAX.type,
+            size: AST_LABEL_FONT,
+            anchorX: 0.5,
+            anchorY: 1,
+            scale: 1 / cameraScale,
+          });
+        }
+
+        // Recurse into members with a per-member baseX/baseY computed
+        // so that the member's rect (whose treemap coords are absolute
+        // in the file's frame) lands at its force-decided position
+        // relative to this container's CENTRE. Descendants of each
+        // member then translate as a rigid body via their own treemap
+        // offsets — no descendant-rect mutation needed.
+        const kids = tree.childrenByParent.get(node.id);
+        if (!kids) return;
+        for (const k of kids) {
+          const sn = container.byId.get(k.id);
+          if (!sn) continue;
+          const memberCx = cx + (sn.x - container.bounds.cx);
+          const memberCy = cy + (sn.y - container.bounds.cy);
+          // drawAstNode draws k at (baseX' + k.rect.x, baseY' + k.rect.y).
+          // We want that top-left to equal (memberCx - k.rect.w/2, memberCy - k.rect.h/2).
+          const baseXk = memberCx - k.rect.w / 2 - k.rect.x;
+          const baseYk = memberCy - k.rect.h / 2 - k.rect.y;
+          drawAstNode(k, baseXk, baseYk, fileId, tree, selection);
+        }
+      }
+
       function drawAstNode(
         node: TreemapNode,
         baseX: number,
@@ -748,6 +857,20 @@ export function PixiCanvas({ project }: CanvasProps) {
         const hOnScreen = node.rect.h * cameraScale;
         const minScreen = Math.min(wOnScreen, hOnScreen);
         if (minScreen < CULL_PX) return;
+
+        // Member-container path: classes / interfaces whose members were
+        // arranged by their own fractal force layout (see astForce.ts's
+        // containers map). Draw a circle around the members instead of
+        // the wrapped-row rect that the treemap built, label above the
+        // circle (like a file label), and recurse into each member with
+        // a per-member baseX/baseY adjustment so it draws at its
+        // force-decided spot relative to the circle's centre.
+        const force = astForceByFileId.get(fileId);
+        const container = force?.containers.get(node.id);
+        if (container) {
+          drawAstContainer(node, x, y, container, fileId, tree, selection);
+          return;
+        }
 
         // Zoomed-out "simplified" tier: drop operators and generic kind
         // labels — keep only real names.

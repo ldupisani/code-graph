@@ -60,6 +60,13 @@ export interface SemanticEdge {
   kind: SemanticEdgeKind;
   fromId: string;
   toId: string;
+  // For cross-file edges where the source references the target via an
+  // import: the AST id of the local binding inside the source file (the
+  // ImportSpecifier for `import { X }`, or the default-import Identifier
+  // for `import X`). The renderer routes extends/implements connectors
+  // THROUGH this binding when the source file is expanded — visually
+  // showing the chain `subclass → imported name → external superclass`.
+  viaImportNodeId?: string;
 }
 
 export interface ProjectResponse {

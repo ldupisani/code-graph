@@ -12,15 +12,22 @@ import type { SemanticEdge } from '../src/api/types';
  * outside the project (e.g. `console.log`, npm packages) are skipped — they
  * resolve to declarations whose source file isn't in `idByNode`.
  */
+type EmitFn = (
+  kind: SemanticEdge['kind'],
+  fromId: string,
+  toId: string,
+  viaImportNodeId?: string,
+) => void;
+
 export function buildSemanticEdges(
   sourceFiles: readonly SourceFile[],
   idByNode: Map<Node, string>,
 ): SemanticEdge[] {
   const edges: SemanticEdge[] = [];
   let seq = 0;
-  const emit = (kind: SemanticEdge['kind'], fromId: string, toId: string) => {
+  const emit: EmitFn = (kind, fromId, toId, viaImportNodeId) => {
     if (fromId === toId) return; // skip self-loops
-    edges.push({ id: `e${seq++}`, kind, fromId, toId });
+    edges.push({ id: `e${seq++}`, kind, fromId, toId, viaImportNodeId });
   };
 
   for (const sf of sourceFiles) {
@@ -41,7 +48,7 @@ export function buildSemanticEdges(
 function emitInheritance(
   cls: Node,
   idByNode: Map<Node, string>,
-  emit: (kind: SemanticEdge['kind'], from: string, to: string) => void,
+  emit: EmitFn,
 ): void {
   const fromId = idByNode.get(cls);
   if (!fromId) return;
@@ -49,12 +56,12 @@ function emitInheritance(
   if (Node.isClassDeclaration(cls) || Node.isClassExpression(cls)) {
     const ext = cls.getExtends();
     if (ext) {
-      const target = resolveDeclaration(ext.getExpression(), idByNode);
-      if (target) emit('extends', fromId, target);
+      const res = resolveDeclaration(ext.getExpression(), idByNode);
+      if (res.targetId) emit('extends', fromId, res.targetId, res.viaImportNodeId);
     }
     for (const impl of cls.getImplements()) {
-      const target = resolveDeclaration(impl.getExpression(), idByNode);
-      if (target) emit('implements', fromId, target);
+      const res = resolveDeclaration(impl.getExpression(), idByNode);
+      if (res.targetId) emit('implements', fromId, res.targetId, res.viaImportNodeId);
     }
   }
 }
@@ -62,25 +69,25 @@ function emitInheritance(
 function emitInterfaceExtends(
   iface: Node,
   idByNode: Map<Node, string>,
-  emit: (kind: SemanticEdge['kind'], from: string, to: string) => void,
+  emit: EmitFn,
 ): void {
   if (!Node.isInterfaceDeclaration(iface)) return;
   const fromId = idByNode.get(iface);
   if (!fromId) return;
   for (const ext of iface.getExtends()) {
-    const target = resolveDeclaration(ext.getExpression(), idByNode);
-    if (target) emit('extends', fromId, target);
+    const res = resolveDeclaration(ext.getExpression(), idByNode);
+    if (res.targetId) emit('extends', fromId, res.targetId, res.viaImportNodeId);
   }
 }
 
 function emitCall(
   call: Node,
   idByNode: Map<Node, string>,
-  emit: (kind: SemanticEdge['kind'], from: string, to: string) => void,
+  emit: EmitFn,
 ): void {
   if (!Node.isCallExpression(call) && !Node.isNewExpression(call)) return;
-  const targetId = resolveDeclaration(call.getExpression(), idByNode);
-  if (!targetId) return;
+  const res = resolveDeclaration(call.getExpression(), idByNode);
+  if (!res.targetId) return;
   // Anchor the edge at the call site itself, not the enclosing function.
   // findVisibleAnchor on the client lifts up the parent chain when the call
   // rect isn't visible (low zoom or collapsed file), so zoomed-out views
@@ -89,22 +96,53 @@ function emitCall(
   // call rather than from the entire scope's border.
   const fromId = idByNode.get(call);
   if (!fromId) return;
-  emit('calls', fromId, targetId);
+  emit('calls', fromId, res.targetId, res.viaImportNodeId);
 }
 
-// Resolve an expression (the callee or the base type) to the AST id of its
-// declaration in this project. Returns undefined if the symbol is external or
-// cannot be resolved.
-function resolveDeclaration(expr: Node, idByNode: Map<Node, string>): string | undefined {
+// Resolve an expression (the callee or the base type) to BOTH the local
+// binding's AST id (an ImportSpecifier / default-import Identifier when the
+// reference goes via an import; the target itself for same-file refs) and
+// the target declaration's AST id (the actual class/function being extended
+// or called, possibly in another file).
+//
+// Returning both lets the client choose: by default it draws a direct
+// edge to the target; when the source file is expanded it can route the
+// connector THROUGH the local binding to show *which* import statement
+// brought the symbol into scope.
+function resolveDeclaration(
+  expr: Node,
+  idByNode: Map<Node, string>,
+): { targetId?: string; viaImportNodeId?: string } {
   let symbol = expr.getSymbol();
-  if (symbol) {
-    const aliased = symbol.getAliasedSymbol?.();
-    if (aliased) symbol = aliased;
-  }
-  if (!symbol) return undefined;
+  if (!symbol) return {};
+
+  // Pre-alias-resolution declarations: for an imported reference, these are
+  // the ImportSpecifier / default-import-Identifier nodes inside the source
+  // file. For a same-file reference, this is the original declaration.
+  let viaImportNodeId: string | undefined;
   for (const decl of symbol.getDeclarations()) {
     const id = idByNode.get(decl);
-    if (id) return id;
+    if (id) {
+      viaImportNodeId = id;
+      break;
+    }
   }
-  return undefined;
+
+  const aliased = symbol.getAliasedSymbol?.();
+  if (aliased) symbol = aliased;
+
+  let targetId: string | undefined;
+  for (const decl of symbol.getDeclarations()) {
+    const id = idByNode.get(decl);
+    if (id) {
+      targetId = id;
+      break;
+    }
+  }
+
+  // Same-file reference: local-binding == target. The renderer never has
+  // anything to route through, so don't emit the redundant via id.
+  if (viaImportNodeId === targetId) viaImportNodeId = undefined;
+
+  return { targetId, viaImportNodeId };
 }

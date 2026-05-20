@@ -1623,11 +1623,57 @@ function drawSemanticEdges(
       dashed = !srcSelected;
       edgeAlpha = srcSelected || expandedFiles.has(srcFile) ? 1 : 0.5;
     }
+    // Routing the extends/implements line THROUGH the import binding when
+    // the source file is expanded: subclass → local imported name → real
+    // superclass (which lives in another file). The import binding itself
+    // gets the dashed outline below so it visually stands in for the
+    // external symbol it represents.
+    let via: HitRect | null = null;
+    if (
+      (edge.kind === 'extends' || edge.kind === 'implements') &&
+      edge.viaImportNodeId
+    ) {
+      const srcFile = fromFile;
+      if (expandedFiles.has(srcFile)) {
+        const v = findVisibleAnchor(
+          edge.viaImportNodeId,
+          visibleById,
+          subtreeByFileId,
+        );
+        // Only honor the via-binding when it resolves to something INSIDE
+        // the source file's AST (not the fallback file rect). If LOD has
+        // culled it down to the file itself, the routed path would
+        // degenerate, so we draw the direct connector instead.
+        if (v && v.id !== from.id && v.id !== to.id && v.id !== srcFile) {
+          via = v;
+        }
+      }
+    }
+
     let startPort: { x: number; y: number };
     let endPort: { x: number; y: number };
     let cp1: { x: number; y: number };
     let cp2: { x: number; y: number };
-    if (edge.kind === 'extends') {
+    // For the via-routed path we also need a second curve's controls.
+    let cp1b: { x: number; y: number } | null = null;
+    let cp2b: { x: number; y: number } | null = null;
+    let midPort: { x: number; y: number } | null = null;
+    if (via) {
+      // Two-segment path: from → via, then via → to. Use callConnector for
+      // both sides so the curves enter/exit each rect along its closest
+      // face — gives a continuous-looking poly-curve regardless of where
+      // the import block sits inside the file. The midpoint port lies on
+      // an edge of `via`, which is exactly the rect we'll dash an outline
+      // around below.
+      const segA = callConnector(from, via);
+      const segB = callConnector(via, to);
+      startPort = segA.startPort;
+      midPort = segA.endPort;
+      ({ cp1, cp2 } = segA);
+      cp1b = segB.cp1;
+      cp2b = segB.cp2;
+      endPort = segB.endPort;
+    } else if (edge.kind === 'extends') {
       startPort = { x: to.x + to.w / 2, y: to.y + to.h }; // bottom of superclass
       endPort = { x: from.x + from.w / 2, y: from.y };    // top of subclass
       ({ cp1, cp2 } = inheritanceBezierControls(startPort, endPort));
@@ -1639,16 +1685,47 @@ function drawSemanticEdges(
     if (dashed) {
       emitDashed(
         gfx,
-        cubicPath(startPort, cp1, cp2, endPort, 48),
+        cubicPath(startPort, cp1, cp2, midPort ?? endPort, 48),
         3.5 * invScale, // fine dash, screen-constant
         2.5 * invScale,
       );
       gfx.stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+      if (via && midPort && cp1b && cp2b) {
+        // Second curve: via → to. Same dash so the two segments read as
+        // one routed connector.
+        emitDashed(
+          gfx,
+          cubicPath(midPort, cp1b, cp2b, endPort, 48),
+          3.5 * invScale,
+          2.5 * invScale,
+        );
+        gfx.stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+        // Dashed outline around the import-binding rect: marks it as the
+        // local stand-in for the external superclass/interface.
+        const rectPath = [
+          { x: via.x, y: via.y },
+          { x: via.x + via.w, y: via.y },
+          { x: via.x + via.w, y: via.y + via.h },
+          { x: via.x, y: via.y + via.h },
+          { x: via.x, y: via.y },
+        ];
+        emitDashed(gfx, rectPath, 3.5 * invScale, 2.5 * invScale);
+        gfx.stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+      }
     } else {
       gfx
         .moveTo(startPort.x, startPort.y)
-        .bezierCurveTo(cp1.x, cp1.y, cp2.x, cp2.y, endPort.x, endPort.y)
+        .bezierCurveTo(cp1.x, cp1.y, cp2.x, cp2.y, (midPort ?? endPort).x, (midPort ?? endPort).y)
         .stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+      if (via && midPort && cp1b && cp2b) {
+        gfx
+          .moveTo(midPort.x, midPort.y)
+          .bezierCurveTo(cp1b.x, cp1b.y, cp2b.x, cp2b.y, endPort.x, endPort.y)
+          .stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+        gfx
+          .rect(via.x, via.y, via.w, via.h)
+          .stroke({ color: style.color, width: style.width * invScale, alpha: edgeAlpha });
+      }
     }
 
     // Counter-scaled radius so the port stays a constant size on screen,
@@ -1679,12 +1756,14 @@ function drawSemanticEdges(
     }
 
     // A cubic's end derivative is proportional to (P3 - P2), so the incoming
-    // direction at the target port is (endPort - cp2).
+    // direction at the target port is (endPort - lastCp). When the line is
+    // routed via the import binding, the LAST curve's control is cp2b.
+    const lastCp = cp2b ?? cp2;
     drawArrowhead(
       gfx,
       endPort.x,
       endPort.y,
-      Math.atan2(endPort.y - cp2.y, endPort.x - cp2.x),
+      Math.atan2(endPort.y - lastCp.y, endPort.x - lastCp.x),
       style.arrowSize * invScale,
       style.color,
       edgeAlpha,

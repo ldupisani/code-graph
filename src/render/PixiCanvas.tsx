@@ -529,12 +529,69 @@ export function PixiCanvas({ project }: CanvasProps) {
         };
       }
       // Restore camera if we're rebuilding the same project (filesystem
-      // refresh); otherwise center.
+      // refresh); otherwise auto-fit the WHOLE project to the
+      // viewport so the user lands on a meaningful overview instead
+      // of the centre of an unstabilised mess at default zoom (which
+      // for a 500+ file React project is "in the middle of the
+      // wallpaper").
       if (savedCamera && savedCamera.rootPath === project.rootPath) {
         world.position.set(savedCamera.x, savedCamera.y);
         world.scale.set(savedCamera.scale);
       } else {
-        world.position.set(app.screen.width / 2, app.screen.height / 2);
+        // Warm the sim up synchronously so the bbox we frame
+        // against is representative — initial node positions are
+        // seeded on a tiny ring (see buildFileLayout), so without
+        // settling we'd auto-fit to a region the size of a coin.
+        // 50 ticks puts alpha at (1 - 0.035) ^ 50 ≈ 0.17 — past the
+        // major rearrangement, into the gentle settling phase.
+        // Cost is one-time at project open; tolerable.
+        layout.simulation.tick(50);
+        fitProjectToViewport();
+      }
+
+      // Frame the bounding box of all sim nodes in the viewport with
+      // ~6% margin on each side. Caps the zoom at 2 (don't zoom in
+      // on tiny projects) and 0.05 (don't disappear pathological
+      // ones). Sets cameraScale + world position directly — no
+      // animation, since this is the initial framing.
+      function fitProjectToViewport(): void {
+        const nodes = layout.nodes;
+        if (nodes.length === 0) {
+          world.position.set(
+            app.screen.width / 2,
+            app.screen.height / 2,
+          );
+          return;
+        }
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const n of nodes) {
+          const halfW = n.width / 2;
+          const halfH = n.height / 2;
+          if (n.x - halfW < minX) minX = n.x - halfW;
+          if (n.y - halfH < minY) minY = n.y - halfH;
+          if (n.x + halfW > maxX) maxX = n.x + halfW;
+          if (n.y + halfH > maxY) maxY = n.y + halfH;
+        }
+        const bboxW = maxX - minX;
+        const bboxH = maxY - minY;
+        const cx = (minX + maxX) / 2;
+        const cy = (minY + maxY) / 2;
+        const MARGIN = 0.88;
+        const fitW = (app.screen.width * MARGIN) / Math.max(1, bboxW);
+        const fitH = (app.screen.height * MARGIN) / Math.max(1, bboxH);
+        const scale = Math.max(
+          0.05,
+          Math.min(2, Math.min(fitW, fitH)),
+        );
+        world.scale.set(scale);
+        world.x = app.screen.width / 2 - cx * scale;
+        world.y = app.screen.height / 2 - cy * scale;
+        // cameraScale picks the new world.scale.x up at the `let
+        // cameraScale = world.scale.x` initialiser further down in
+        // this same IIFE — runs strictly after this function does.
       }
 
       // Scene graph layering, bottom-up (Pixi child order = z-order):

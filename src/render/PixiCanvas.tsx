@@ -70,8 +70,10 @@ const SEMANTIC_EDGE_STYLE: Record<
 
 // LOD: rects whose smaller side is below this many screen pixels are not drawn.
 const CULL_PX = 4;
-// Below this camera zoom the view "simplifies": operator glyphs and generic
-// kind labels (type/if/=>/…) drop out, leaving only real names. Zoom in
+// Below this camera zoom the view "simplifies": generic kind labels
+// (type/if/=>/…) drop out, leaving only real names. Operator glyphs
+// (=, *, +, …) stay — they're the meaning that holds a pair of named
+// operands together — and only drop when they no longer fit. Zoom in
 // past it for full detail.
 const SIMPLIFY_BELOW = 1.5;
 // Block/object kind outlines are cheap structural cues (just a colored
@@ -1713,9 +1715,14 @@ export function PixiCanvas({ project }: CanvasProps) {
         }
 
         // The operator glyph, drawn centered between the two operand boxes
-        // (`[i] = [j]`, `[[i] + [1]] + [j]`). Same constant-on-screen
-        // counter-scaling and fits-on-screen gate as labels.
-        if (node.op && node.opAnchor && !simplified) {
+        // (`[i] = [j]`, `[[i] + [1]] + [j]`). Counter-scaled so it stays
+        // a constant on-screen size and gated only on fitting its box:
+        // operators carry the same semantic weight as the variable names
+        // they sit between (an `=` between `i` and `j` is what makes the
+        // pair an assignment), so they survive the simplified-tier drop
+        // as long as there's room for the glyph. Dropping them with the
+        // generic kind labels was leaving "[i] [j]" hanging in mid-air.
+        if (node.op && node.opAnchor) {
           const opBox = labelScreenBox(node.op);
           if (wOnScreen >= opBox.w && hOnScreen >= opBox.h) {
             labelPool.put({

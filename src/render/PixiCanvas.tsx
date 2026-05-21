@@ -2184,6 +2184,30 @@ export function PixiCanvas({ project }: CanvasProps) {
               h: node.rect.h,
             });
           }
+          // If this collapsed cell has a kind label (e.g. '{}' for
+          // ObjectLiteralExpression) AND the cell is large enough on
+          // screen to fit it, draw the label centered. Otherwise the
+          // cell renders as a bare outline — fine for Block (the
+          // magenta kind outline IS the signal) but uninformative for
+          // ObjectLiteralExpression where the user wants to see '{}'
+          // confirming what kind of thing the rect represents. Same
+          // fits-on-screen gate as the regular-cell label below.
+          const collapsedLabel = labelFor(node);
+          if (collapsedLabel) {
+            const lb = labelScreenBox(collapsedLabel);
+            if (wOnScreen >= lb.w && hOnScreen >= lb.h) {
+              labelPool.put({
+                text: collapsedLabel,
+                worldX: x + node.rect.w / 2,
+                worldY: y + node.rect.h / 2,
+                color: syntaxColor(node),
+                size: 11,
+                anchorX: 0.5,
+                anchorY: 0.5,
+                scale: 1 / cameraScale,
+              });
+            }
+          }
           return;
         }
 

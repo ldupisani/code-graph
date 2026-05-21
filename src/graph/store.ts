@@ -24,6 +24,17 @@ export interface GraphStore {
   expandedAstNodes: ReadonlySet<string>;
   asts: ReadonlyMap<string, FileAstResponse>;
   edgeFilter: EdgeFilter;
+  // Id of the rect under the cursor. React HUD components (e.g.
+  // HoverTooltip) subscribe to this to know what to show. The
+  // PixiCanvas renderer keeps its own closure-scoped copy too, so
+  // per-frame label / outline brightening reads it cheaply without
+  // going through React.
+  hoveredId: string | null;
+  // Screen-space rect of the hovered HitRect at the moment hover
+  // began. Lets HoverTooltip anchor itself to the rect without
+  // subscribing to per-frame camera updates. Stale if the user pans
+  // while hovering — small UX cost, big complexity saving.
+  hoveredScreenRect: { x: number; y: number; w: number; h: number } | null;
   setProject: (p: ProjectResponse | null) => void;
   refreshProject: (p: ProjectResponse) => void;
   setSelection: (id: string | null) => void;
@@ -32,6 +43,10 @@ export interface GraphStore {
   collapseFile: (fileId: string) => void;
   toggleAstNode: (id: string) => void;
   setEdgeFilter: (next: Partial<EdgeFilter>) => void;
+  setHover: (
+    id: string | null,
+    screenRect: { x: number; y: number; w: number; h: number } | null,
+  ) => void;
 }
 
 const ALL_EDGES_ON: EdgeFilter = { imports: true, calls: true, extends: true };
@@ -43,6 +58,8 @@ export const useGraphStore = create<GraphStore>((set) => ({
   expandedAstNodes: new Set<string>(),
   asts: new Map<string, FileAstResponse>(),
   edgeFilter: { ...ALL_EDGES_ON },
+  hoveredId: null,
+  hoveredScreenRect: null,
   setProject: (project) =>
     set({
       project,
@@ -95,6 +112,8 @@ export const useGraphStore = create<GraphStore>((set) => ({
     }),
   setEdgeFilter: (next) =>
     set((s) => ({ edgeFilter: { ...s.edgeFilter, ...next } })),
+  setHover: (hoveredId, hoveredScreenRect) =>
+    set({ hoveredId, hoveredScreenRect }),
 }));
 
 // Dev-only escape hatch: lets the chrome-devtools-mcp / browser console drive

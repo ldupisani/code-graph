@@ -122,6 +122,13 @@ export interface AstNode {
   // SYNTAX.type colour regardless of their syntaxKind's normal
   // category, matching how the editor highlights types.
   isType?: boolean;
+  // Source-text signature: `(p: T, q: U): R` for function-likes,
+  // `: T` for typed declarations (property / variable / parameter
+  // with an explicit type annotation). The hover tooltip in
+  // src/ui/HoverTooltip.tsx renders this so a user can survey a
+  // class's API by mousing across its members without expanding
+  // each one.
+  signature?: string;
   start: number;          // char offset in source, inclusive
   end: number;            // char offset, exclusive
 }

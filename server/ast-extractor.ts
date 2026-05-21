@@ -77,6 +77,7 @@ export function extractAst(
       accessibility: accessibilityOf(node),
       extendsName: extendsNameOf(node),
       isType: typeFlag,
+      signature: signatureOf(node),
       start: node.getStart(),
       end: node.getEnd(),
     });
@@ -537,6 +538,48 @@ function staticOf(node: Node): true | undefined {
 // IndexSignatureDeclaration.
 function readonlyOf(node: Node): true | undefined {
   return Node.isReadonlyable(node) && node.isReadonly() ? true : undefined;
+}
+
+// Source-text signature for a function-like or a typed declaration.
+// Returned text:
+//   * function/method/arrow/constructor/getter/setter:
+//       `(p: T, q: U): R`
+//     Built from each parameter's getText() and the explicit return
+//     type's getText(). Missing return type → omit the `: R`.
+//   * property / variable / parameter with an explicit type:
+//       `: T`
+//     Pulled from getTypeNode().getText(). No annotation → undefined.
+// Hover tooltip renders this. Cheap textual snapshot — no checker
+// involvement.
+function signatureOf(node: Node): string | undefined {
+  // Function-likes: parenthesised parameter list + optional return.
+  if (
+    Node.isFunctionDeclaration(node) ||
+    Node.isFunctionExpression(node) ||
+    Node.isArrowFunction(node) ||
+    Node.isMethodDeclaration(node) ||
+    Node.isMethodSignature(node) ||
+    Node.isConstructorDeclaration(node) ||
+    Node.isGetAccessorDeclaration(node) ||
+    Node.isSetAccessorDeclaration(node)
+  ) {
+    const params = node.getParameters().map((p) => p.getText());
+    const rt = node.getReturnTypeNode()?.getText();
+    return rt
+      ? `(${params.join(', ')}): ${rt}`
+      : `(${params.join(', ')})`;
+  }
+  // Typed declarations: just the `: T` slot.
+  if (
+    Node.isPropertyDeclaration(node) ||
+    Node.isPropertySignature(node) ||
+    Node.isVariableDeclaration(node) ||
+    Node.isParameterDeclaration(node)
+  ) {
+    const tn = node.getTypeNode();
+    return tn ? `: ${tn.getText()}` : undefined;
+  }
+  return undefined;
 }
 
 // Accessibility scope: 'private' / 'protected' / undefined (public).

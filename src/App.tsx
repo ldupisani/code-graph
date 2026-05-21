@@ -4,6 +4,7 @@ import { openProject, subscribeToWatch, type WatchEvent } from './api/client';
 import { useGraphStore } from './graph/store';
 import { PixiCanvas } from './render/PixiCanvas';
 import { EdgeFilterPills } from './ui/EdgeFilterPills';
+import { HoverTooltip } from './ui/HoverTooltip';
 import { EditorPane } from './ui/EditorPane';
 import { FolderPicker } from './ui/FolderPicker';
 import type { AstNode, FileNode, ProjectResponse } from './api/types';
@@ -113,6 +114,7 @@ export function App() {
                 <PixiCanvas project={project} />
                 <SelectionPanel />
                 <EdgeFilterPills />
+                <HoverTooltip />
                 <Hints />
               </div>
             </Panel>

@@ -2023,6 +2023,34 @@ export function PixiCanvas({ project }: CanvasProps) {
         onClick: handleClick,
         onHover: (target) => {
           hoveredHit = target;
+          // Mirror to the store so React HUD components (HoverTooltip)
+          // can subscribe. The closure copy above stays the source of
+          // truth for cheap per-frame label brightening. Screen-rect
+          // snapshot taken HERE means the tooltip anchors to the rect
+          // at hover-start; if the user pans while hovering the
+          // tooltip stays put — acceptable trade-off vs subscribing
+          // React to every animation frame.
+          const nextHoveredId = target?.id ?? null;
+          const cur = useGraphStore.getState();
+          if (cur.hoveredId !== nextHoveredId) {
+            let screenRect: {
+              x: number;
+              y: number;
+              w: number;
+              h: number;
+            } | null = null;
+            if (target) {
+              const canvasRect = container.getBoundingClientRect();
+              const s = world.scale.x;
+              screenRect = {
+                x: canvasRect.left + world.x + target.x * s,
+                y: canvasRect.top + world.y + target.y * s,
+                w: target.w * s,
+                h: target.h * s,
+              };
+            }
+            cur.setHover(nextHoveredId, screenRect);
+          }
           // Pointer cursor when the click would TOGGLE a Block — that's
           // a collapsed Block (its rect IS the toggle target) or an
           // expanded Block's top-right handle ('ast-toggle' kind).

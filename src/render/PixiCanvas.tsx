@@ -917,6 +917,44 @@ export function PixiCanvas({ project }: CanvasProps) {
         const i = rel.lastIndexOf('/');
         return i < 0 ? '' : rel.slice(0, i);
       };
+
+      // Take the first `depth` components of a relative path. Used to
+      // group deeply-nested files into a smaller number of meaningful
+      // architectural clusters. `src/components/data-display/list/item.tsx`
+      // at depth=2 → `src/components`. Returns '' for root-level files
+      // (one component or fewer) so they're skipped from clustering.
+      function clusterDirOf(rel: string, depth: number): string {
+        const parts = rel.split('/');
+        if (parts.length < 2) return '';
+        const take = Math.min(depth, parts.length - 1);
+        return parts.slice(0, take).join('/');
+      }
+
+      // Pick the smallest cluster depth where the total distinct
+      // groups falls into a manageable range for the current zoom
+      // level. The target band widens as the user zooms IN — more
+      // detail allowed. At extreme zoom-out we cap at ~10 groups so
+      // the scene reads as 'this many architectural blobs'; near
+      // full zoom we allow finer groupings (close to leaf-parent).
+      function chooseClusterDepth(): number {
+        const hideSupport = !useGraphStore.getState().showSupportFiles;
+        // 8 groups at scale 0; up to ~40 by scale 1; linear ramp.
+        const targetMax = Math.max(
+          6,
+          Math.min(50, Math.round(8 + cameraScale * 40)),
+        );
+        for (let d = 1; d <= 6; d++) {
+          const set = new Set<string>();
+          for (const f of layout.nodes) {
+            if (hideSupport && supportFileIds.has(f.id)) continue;
+            const c = clusterDirOf(f.relativePath, d);
+            if (c) set.add(c);
+          }
+          if (set.size === 0) continue;
+          if (set.size <= targetMax) return d;
+        }
+        return 6;
+      }
       const convexHull = (pts: Pt[]): Pt[] => {
         if (pts.length < 3) return pts.slice();
         const sorted = pts.slice().sort((a, b) => a.x - b.x || a.y - b.y);
@@ -981,13 +1019,22 @@ export function PixiCanvas({ project }: CanvasProps) {
         maxX: number;
         maxY: number;
       }
-      function computeDirectoryAggregates(): DirAgg[] {
+      function computeDirectoryAggregates(): {
+        aggs: DirAgg[];
+        fileToCluster: Map<string, string>;
+      } {
         const hideSupport = !useGraphStore.getState().showSupportFiles;
+        // Pick the cluster depth based on zoom — fewer / coarser
+        // groups when zoomed out. Avoids 60+ tiny super-nodes for
+        // deeply nested projects.
+        const depth = chooseClusterDepth();
         const byDir = new Map<string, SimFileNode[]>();
+        const fileToCluster = new Map<string, string>();
         for (const sim of layout.nodes) {
           if (hideSupport && supportFileIds.has(sim.id)) continue;
-          const dir = fileToDir.get(sim.id);
+          const dir = clusterDirOf(sim.relativePath, depth);
           if (!dir) continue; // skip root-level files in super-node mode
+          fileToCluster.set(sim.id, dir);
           let list = byDir.get(dir);
           if (!list) {
             list = [];
@@ -1025,10 +1072,10 @@ export function PixiCanvas({ project }: CanvasProps) {
             maxY,
           });
         }
-        return out;
+        return { aggs: out, fileToCluster };
       }
       function drawDirectorySuperNodes(): void {
-        const aggs = computeDirectoryAggregates();
+        const { aggs, fileToCluster } = computeDirectoryAggregates();
         if (aggs.length === 0) return;
         const aggsByDir = new Map<string, DirAgg>();
         for (const a of aggs) aggsByDir.set(a.dir, a);
@@ -1048,11 +1095,15 @@ export function PixiCanvas({ project }: CanvasProps) {
           const key = a < b ? `${a}|${b}` : `${b}|${a}`;
           pairWeight.set(key, (pairWeight.get(key) ?? 0) + 1);
         };
+        // Aggregate edges by the CHOSEN cluster path (not the
+        // leaf-parent in fileToDir), so two files in different leaf
+        // dirs under the same cluster contribute to the cluster's
+        // self-loop or get filtered (a===b skip in `bump`).
         if (st.edgeFilter.imports) {
           for (const e of project.edges) {
             if (hideSupport && (supportFileIds.has(e.fromId) || supportFileIds.has(e.toId))) continue;
-            const a = fileToDir.get(e.fromId);
-            const b = fileToDir.get(e.toId);
+            const a = fileToCluster.get(e.fromId);
+            const b = fileToCluster.get(e.toId);
             if (a && b) bump(a, b);
           }
         }
@@ -1067,8 +1118,8 @@ export function PixiCanvas({ project }: CanvasProps) {
           const fromF = fileIdOfAstId(e.fromId);
           const toF = fileIdOfAstId(e.toId);
           if (hideSupport && (supportFileIds.has(fromF) || supportFileIds.has(toF))) continue;
-          const a = fileToDir.get(fromF);
-          const b = fileToDir.get(toF);
+          const a = fileToCluster.get(fromF);
+          const b = fileToCluster.get(toF);
           if (a && b) bump(a, b);
         }
         for (const [key, weight] of pairWeight) {
@@ -1151,7 +1202,7 @@ export function PixiCanvas({ project }: CanvasProps) {
       // existing zoomFit + followAt infrastructure. Called when a
       // super-node is clicked at low zoom.
       function fitDirectoryInViewport(dir: string): void {
-        const aggs = computeDirectoryAggregates();
+        const { aggs } = computeDirectoryAggregates();
         const a = aggs.find((x) => x.dir === dir);
         if (!a) return;
         const w = Math.max(1, a.maxX - a.minX);
@@ -1170,10 +1221,16 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       const drawDirectoryBoundaries = (): void => {
         const hideSupport = !useGraphStore.getState().showSupportFiles;
+        // Same adaptive depth as the super-nodes — at low zoom we
+        // get a small number of broad architectural hulls
+        // ('src/components', 'src/partials'); zooming in resolves to
+        // finer leaf-directory hulls without ever swamping the
+        // scene with 60+ overlapping label strings.
+        const depth = chooseClusterDepth();
         const byDir = new Map<string, SimFileNode[]>();
         for (const sim of layout.nodes) {
           if (hideSupport && supportFileIds.has(sim.id)) continue;
-          const dir = dirnameOfRel(sim.relativePath);
+          const dir = clusterDirOf(sim.relativePath, depth);
           if (!dir) continue;
           let list = byDir.get(dir);
           if (!list) {

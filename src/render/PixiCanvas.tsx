@@ -1642,9 +1642,21 @@ export function PixiCanvas({ project }: CanvasProps) {
         // icon (a dog-eared page) at every zoom level — never a sized box or
         // a dot. The filename floats above it.
         if (!expanded) {
-          const iw = 16 / cameraScale; // screen-constant page size
-          const ih = 20 / cameraScale;
-          const fold = 6 / cameraScale; // folded top-right corner
+          // World-fixed icon size with a screen cap. Icons shrink
+          // with the world as you zoom OUT (so dense clusters stop
+          // overlapping themselves), but never grow past 16×20
+          // screen-px when you zoom IN — that's the size the user
+          // chose as comfortable, and "icons get bigger and bigger
+          // as you zoom in" is rarely useful.
+          //
+          // The min(WORLD, SCREEN/cameraScale) formulation:
+          //   * cameraScale ≤ 1 → world_iw = 16 (fixed world), so
+          //     on_screen = 16 × cameraScale (shrinks).
+          //   * cameraScale > 1 → world_iw = 16/cameraScale, so
+          //     on_screen = 16 (capped).
+          const iw = Math.min(16, 16 / cameraScale);
+          const ih = Math.min(20, 20 / cameraScale);
+          const fold = Math.min(6, 6 / cameraScale);
           const ix = sim.x - iw / 2;
           const iy = sim.y - ih / 2;
           // Colour the page body by the file's current cluster
@@ -1666,6 +1678,10 @@ export function PixiCanvas({ project }: CanvasProps) {
           const line = isSelected
             ? COLORS.fileBorderSelected
             : (cluster ? colourForDirectory(cluster) : COLORS.fileBorder);
+          // Stroke width also caps at 1 screen-px (same min() shape
+          // as the icon dimensions — shrink with world below 1:1,
+          // cap at 1 above).
+          const strokeW = Math.min(1, 1 / cameraScale);
           worldGfx
             .poly([
               ix, iy,
@@ -1675,7 +1691,7 @@ export function PixiCanvas({ project }: CanvasProps) {
               ix, iy + ih,
             ])
             .fill({ color: body, alpha: 1 * dimAlpha })
-            .stroke({ color: line, width: 1 / cameraScale, alpha: 1 * dimAlpha });
+            .stroke({ color: line, width: strokeW, alpha: 1 * dimAlpha });
           // The folded corner, slightly distinct so it reads as a page.
           worldGfx
             .poly([

@@ -690,11 +690,65 @@ export function PixiCanvas({ project }: CanvasProps) {
         addAdjacency(kind, fromFile, toFile);
       }
 
+      // Shift-key tracking for path tracing. wireCamera's onClick
+      // doesn't pass modifier state, so we mirror it via window key
+      // listeners. Captured on the click, consulted in handleClick.
+      let shiftHeld = false;
+      const onShiftDown = (e: KeyboardEvent): void => {
+        if (e.key === 'Shift') shiftHeld = true;
+      };
+      const onShiftUp = (e: KeyboardEvent): void => {
+        if (e.key === 'Shift') shiftHeld = false;
+      };
+      window.addEventListener('keydown', onShiftDown);
+      window.addEventListener('keyup', onShiftUp);
+
       // Cached live set + the inputs that produced it; recomputed in
       // the ticker when any of them change. liveFiles === null means
       // "no focus mode active, render everything at full brightness".
       let liveFiles: Set<string> | null = null;
       let liveFilesKey = '';
+
+      // BFS shortest-path between two file IDs through the visible
+      // adjacency, returning the ordered list of file IDs (inclusive
+      // of source and target) or null if disconnected. Respects the
+      // current edgeFilter so toggling 'imports' off makes
+      // import-only paths disappear from results.
+      const shortestPath = (
+        sourceFile: string,
+        targetFile: string,
+      ): string[] | null => {
+        if (sourceFile === targetFile) return [sourceFile];
+        const st = useGraphStore.getState();
+        const prev = new Map<string, string>();
+        const visited = new Set<string>([sourceFile]);
+        const queue: string[] = [sourceFile];
+        while (queue.length) {
+          const node = queue.shift()!;
+          if (node === targetFile) break;
+          for (const kind of ['imports', 'calls', 'extends'] as const) {
+            if (!st.edgeFilter[kind]) continue;
+            const b = fileEdgesByKind[kind];
+            for (const bucket of [b.in.get(node), b.out.get(node)]) {
+              if (!bucket) continue;
+              for (const n of bucket) {
+                if (visited.has(n)) continue;
+                visited.add(n);
+                prev.set(n, node);
+                queue.push(n);
+              }
+            }
+          }
+        }
+        if (!visited.has(targetFile)) return null;
+        const path: string[] = [];
+        let cur: string | undefined = targetFile;
+        while (cur != null) {
+          path.unshift(cur);
+          cur = prev.get(cur);
+        }
+        return path;
+      };
       const computeLiveFiles = (): Set<string> | null => {
         const st = useGraphStore.getState();
         if (!st.focusId) return null;
@@ -952,6 +1006,23 @@ export function PixiCanvas({ project }: CanvasProps) {
         // and by drawEdges + drawSemanticEdges via per-edge alpha.
         maybeRecomputeLiveFiles();
 
+        // Path-trace lookup: a set of "${a}|${b}" keys for every
+        // CONSECUTIVE pair in state.tracedPath (both directions, so
+        // edge-direction independence is automatic). drawEdges /
+        // drawSemanticEdges check this to thicken and unblock the
+        // path overlay even when focus dimming would otherwise apply.
+        const pathEdgeKeys: Set<string> = new Set();
+        const pathFileSet: Set<string> = new Set();
+        if (state.tracedPath && state.tracedPath.length > 0) {
+          for (const f of state.tracedPath) pathFileSet.add(f);
+          for (let i = 0; i < state.tracedPath.length - 1; i++) {
+            const a = state.tracedPath[i];
+            const b = state.tracedPath[i + 1];
+            pathEdgeKeys.add(`${a}|${b}`);
+            pathEdgeKeys.add(`${b}|${a}`);
+          }
+        }
+
         // 1. Import edges (under rects). Now anchored to the specific
         //    `import` AST node on the source side when that file is
         //    expanded, and clipped to the file's circle on the target
@@ -967,6 +1038,7 @@ export function PixiCanvas({ project }: CanvasProps) {
             cameraScale,
             visibleSemanticPairs,
             liveFiles,
+            pathEdgeKeys,
           );
         } else {
           visibleSemanticPairs.clear();
@@ -983,9 +1055,12 @@ export function PixiCanvas({ project }: CanvasProps) {
         //     layer above worldGfx + labelLayer) so the file rect AND
         //     its label are uniformly darkened. Live files (and the
         //     entire scene when focus mode is off) get no overlay.
+        //     Path-traced files (when set) override dimming — they
+        //     ARE the user's current question and must stay bright.
         if (liveFiles) {
           for (const sim of layout.nodes) {
             if (liveFiles.has(sim.id)) continue;
+            if (pathFileSet.has(sim.id)) continue;
             dimGfx
               .rect(
                 sim.x - sim.width / 2,
@@ -994,6 +1069,22 @@ export function PixiCanvas({ project }: CanvasProps) {
                 sim.height,
               )
               .fill({ color: COLORS.bg, alpha: 0.78 });
+          }
+        }
+        // 2c. Path overlay: thin yellow outline around every file
+        //     in the traced path, so even if focus is off they read
+        //     as "part of the path" at a glance.
+        if (pathFileSet.size > 0) {
+          for (const sim of layout.nodes) {
+            if (!pathFileSet.has(sim.id)) continue;
+            const r = sim.width / 2 + 6 / cameraScale;
+            worldGfx
+              .circle(sim.x, sim.y, r)
+              .stroke({
+                color: SYNTAX.func,
+                width: 2.5 / cameraScale,
+                alpha: 0.95,
+              });
           }
         }
 
@@ -1078,6 +1169,7 @@ export function PixiCanvas({ project }: CanvasProps) {
           visibleSemanticPairs,
           state.edgeFilter,
           liveFiles,
+          pathEdgeKeys,
         );
       }
 
@@ -2218,10 +2310,36 @@ export function PixiCanvas({ project }: CanvasProps) {
           const st = useGraphStore.getState();
           st.setSelection(null);
           st.setFocus(null);
+          st.setTracedPath(null);
           followId = null;
           followAt = null;
           return;
         }
+
+        // Shift-click + existing selection = trace shortest path from
+        // selection's file to the clicked target's file through the
+        // currently-visible edges. The path overlay is drawn on top
+        // of focus dimming, so the user can see exactly which files
+        // bridge their two endpoints.
+        const stShift = useGraphStore.getState();
+        if (
+          shiftHeld &&
+          stShift.selection != null &&
+          stShift.selection !== target.id
+        ) {
+          const sourceFile = stShift.selection.includes('#')
+            ? fileIdOfAstId(stShift.selection)
+            : stShift.selection;
+          const targetFile = target.fileId;
+          const path = shortestPath(sourceFile, targetFile);
+          stShift.setTracedPath(path);
+          // Skip the normal selection / follow / focus updates so the
+          // shift-click doesn't drag the camera around mid-path-trace.
+          return;
+        }
+        // Any non-shift click clears any active path trace; the user
+        // is moving on to a new question.
+        if (stShift.tracedPath) stShift.setTracedPath(null);
         // Default: follow this node immediately. The Block-toggle path
         // below overrides `followStartAt` so the pan waits until the
         // grow/shrink animation completes — otherwise the camera
@@ -2353,6 +2471,8 @@ export function PixiCanvas({ project }: CanvasProps) {
         };
         layout.simulation.stop();
         detachCamera();
+        window.removeEventListener('keydown', onShiftDown);
+        window.removeEventListener('keyup', onShiftUp);
         labelPool.destroy();
         for (const pane of overlayPanes) pane.labels.destroy();
         app.ticker.remove(tickerCb);
@@ -2452,6 +2572,12 @@ function drawEdges(
   // outside it dim down to ~18% so they recede into the background.
   // null = focus off, render all edges at full strength.
   liveFiles: ReadonlySet<string> | null,
+  // Path-trace edge keys: `${a}|${b}` (both directions) for every
+  // edge that's part of the user's current path. Path edges are
+  // drawn an extra time on top of the normal stroke, thicker and
+  // in the func / yellow colour, so they read as one continuous
+  // highlighted run regardless of dimming.
+  pathEdgeKeys: ReadonlySet<string>,
 ): void {
   // Import links: a quiet subdued background layer. Suppressed when a
   // calls/extends/implements link is already visible between the same two
@@ -2498,7 +2624,12 @@ function drawEdges(
     }
 
     let edgeAlpha = 0.7;
-    if (liveFiles && (!liveFiles.has(edge.fromId) || !liveFiles.has(edge.toId))) {
+    const onPath = pathEdgeKeys.has(`${edge.fromId}|${edge.toId}`);
+    if (
+      liveFiles &&
+      !onPath &&
+      (!liveFiles.has(edge.fromId) || !liveFiles.has(edge.toId))
+    ) {
       edgeAlpha *= 0.18;
     }
     gfx
@@ -2509,6 +2640,18 @@ function drawEdges(
         width: 1.5 / cameraScale, // ~1.5px on screen, zoom-stable
         alpha: edgeAlpha,
       });
+    if (onPath) {
+      // Re-stroke in func / yellow on top of the normal stroke so the
+      // path overlay is consistent across import + semantic edges.
+      gfx
+        .moveTo(sx, sy)
+        .lineTo(tx, ty)
+        .stroke({
+          color: SYNTAX.func,
+          width: 3.5 / cameraScale,
+          alpha: 0.85,
+        });
+    }
   }
 }
 
@@ -2693,6 +2836,10 @@ function drawSemanticEdges(
   // Edges with at least one endpoint NOT in this set are dimmed.
   // null means focus mode is off (everything renders at full strength).
   liveFiles: ReadonlySet<string> | null,
+  // Path-trace edge keys: `${fromFile}|${toFile}` (both directions)
+  // for every edge that's part of the user's current path. Path
+  // edges skip the focus-dimming multiplier so they stay bright.
+  pathEdgeKeys: ReadonlySet<string>,
 ): void {
   visibleSemanticPairs.clear();
   const fileOf = (id: string): string => {
@@ -2795,15 +2942,20 @@ function drawSemanticEdges(
       dashed = !srcSelected;
       edgeAlpha = srcSelected || expandedFiles.has(srcFile) ? 1 : 0.5;
     }
-    // Focus-mode dim: if EITHER endpoint's file is outside the live
-    // neighbourhood, multiply this edge's alpha down so it visually
-    // recedes alongside the dimmed files at its endpoints.
-    if (liveFiles) {
-      const fromFile = fileOf(edge.fromId);
-      const toFile = fileOf(edge.toId);
-      if (!liveFiles.has(fromFile) || !liveFiles.has(toFile)) {
-        edgeAlpha *= 0.18;
-      }
+    // Focus-mode dim + path-trace exemption: an edge that's part of
+    // the user's traced path always renders at full strength
+    // regardless of focus dimming, since the path IS the user's
+    // current question. Otherwise, if either endpoint's file is
+    // outside the live set, dim the edge. `fromFile` / `toFile` were
+    // computed above for the visibleSemanticPairs bookkeeping —
+    // reuse them.
+    const onPath = pathEdgeKeys.has(`${fromFile}|${toFile}`);
+    if (
+      liveFiles &&
+      !onPath &&
+      (!liveFiles.has(fromFile) || !liveFiles.has(toFile))
+    ) {
+      edgeAlpha *= 0.18;
     }
     // Routing the extends/implements line THROUGH the import binding when
     // the source file is expanded: subclass → local imported name → real
@@ -2975,6 +3127,29 @@ function drawSemanticEdges(
       style.color,
       edgeAlpha,
     );
+
+    // Path-trace overlay: re-stroke the connector in func / yellow on
+    // top of the normal curve so the path overlay reads consistently
+    // with the import edges' path stroke. Skip when this edge isn't
+    // part of the path.
+    if (onPath) {
+      if (via && midPortOut && cp1b && cp2b) {
+        // Two-segment routed path.
+        gfx
+          .moveTo(startPort.x, startPort.y)
+          .quadraticCurveTo(cp1.x, cp1.y, midPortIn!.x, midPortIn!.y)
+          .stroke({ color: SYNTAX.func, width: 3.5 * invScale, alpha: 0.85 });
+        gfx
+          .moveTo(midPortOut.x, midPortOut.y)
+          .bezierCurveTo(cp1b.x, cp1b.y, cp2b.x, cp2b.y, endPort.x, endPort.y)
+          .stroke({ color: SYNTAX.func, width: 3.5 * invScale, alpha: 0.85 });
+      } else {
+        gfx
+          .moveTo(startPort.x, startPort.y)
+          .bezierCurveTo(cp1.x, cp1.y, cp2.x, cp2.y, endPort.x, endPort.y)
+          .stroke({ color: SYNTAX.func, width: 3.5 * invScale, alpha: 0.85 });
+      }
+    }
   }
 }
 

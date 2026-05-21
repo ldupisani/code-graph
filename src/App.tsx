@@ -70,6 +70,7 @@ export function App() {
       if (e.key === 'Escape') {
         st.setSelection(null);
         st.setFocus(null);
+        st.setTracedPath(null);
         return;
       }
       if (e.key === '+' || e.key === '=') {

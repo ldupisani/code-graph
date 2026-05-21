@@ -52,6 +52,13 @@ export interface GraphStore {
   //   'out'  — only follow edges OUT of the focused node ('what does
   //            this call / import').
   focusDirection: 'both' | 'in' | 'out';
+  // Ordered list of file IDs that form a connecting path between
+  // two user-selected nodes (via Shift-click). null means no path
+  // is being traced. Renderer highlights every file in this list
+  // and every edge whose endpoints are consecutive entries — even
+  // through focus-mode dimming, since the path IS the user's
+  // current question and should never disappear.
+  tracedPath: readonly string[] | null;
   setProject: (p: ProjectResponse | null) => void;
   refreshProject: (p: ProjectResponse) => void;
   setSelection: (id: string | null) => void;
@@ -66,6 +73,7 @@ export interface GraphStore {
   ) => void;
   setFocus: (id: string | null, hops?: number) => void;
   setFocusDirection: (d: 'both' | 'in' | 'out') => void;
+  setTracedPath: (ids: readonly string[] | null) => void;
 }
 
 const ALL_EDGES_ON: EdgeFilter = { imports: true, calls: true, extends: true };
@@ -82,6 +90,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
   focusId: null,
   focusHops: 1,
   focusDirection: 'both',
+  tracedPath: null,
   setProject: (project) =>
     set({
       project,
@@ -93,6 +102,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
       focusId: null,
       focusHops: 1,
       focusDirection: 'both',
+      tracedPath: null,
     }),
   // Used after a filesystem-driven re-walk: file-level identity is stable so
   // we keep expansion state, but AST node IDs may have shifted (sequential
@@ -151,6 +161,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
       focusDirection: focusId ? s.focusDirection : 'both',
     })),
   setFocusDirection: (focusDirection) => set({ focusDirection }),
+  setTracedPath: (tracedPath) => set({ tracedPath }),
 }));
 
 // Dev-only escape hatch: lets the chrome-devtools-mcp / browser console drive

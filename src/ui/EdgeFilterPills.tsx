@@ -26,6 +26,7 @@ export function EdgeFilterPills() {
   const setEdgeFilter = useGraphStore((s) => s.setEdgeFilter);
   const focusId = useGraphStore((s) => s.focusId);
   const focusHops = useGraphStore((s) => s.focusHops);
+  const tracedPath = useGraphStore((s) => s.tracedPath);
 
   // Hide when no project is open — there are no edges to filter.
   if (!project) return null;
@@ -70,8 +71,21 @@ export function EdgeFilterPills() {
           </span>
           <DirectionGlyph />
           <span>
-            <Kbd>+</Kbd>/<Kbd>-</Kbd> · <Kbd>R</Kbd> · <Kbd>Esc</Kbd>
+            <Kbd>+</Kbd>/<Kbd>-</Kbd> · <Kbd>R</Kbd> · <Kbd>⇧</Kbd>+click
+            path · <Kbd>Esc</Kbd>
           </span>
+        </span>
+      )}
+      {tracedPath && tracedPath.length > 0 && (
+        <span
+          style={{
+            opacity: 0.85,
+            color: '#dcdcaa',
+            paddingLeft: '0.4rem',
+            borderLeft: '1px solid rgba(120, 120, 130, 0.35)',
+          }}
+        >
+          path: {tracedPath.length} file{tracedPath.length === 1 ? '' : 's'}
         </span>
       )}
     </div>

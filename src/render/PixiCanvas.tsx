@@ -161,16 +161,36 @@ function labelFor(node: {
   name: string | null;
   syntaxKind: string;
   extendsName?: string;
+  static?: boolean;
+  readonly?: boolean;
+  accessibility?: 'private' | 'protected';
 }): string | null {
   if (node.name) {
-    // Inline the extends clause on the header: "Dog extends Animal". The
-    // sizer measures this composite (single source of truth), the renderer
-    // draws it as colored segments.
-    return node.extendsName
-      ? `${node.name} extends ${node.extendsName}`
-      : node.name;
+    // Compose the full header text: "[private] [static] [readonly] name [extends Base]".
+    // labelScreenBox measures THIS composite (single source of truth);
+    // drawHeaderSegments below colours each part. Modifiers are tokens
+    // separated by single spaces, source order matching how you'd write
+    // them in TypeScript.
+    const modifiers = composeModifierPrefix(node);
+    const head = modifiers ? `${modifiers} ${node.name}` : node.name;
+    return node.extendsName ? `${head} extends ${node.extendsName}` : head;
   }
   return SYNTAX_KIND_LABELS[node.syntaxKind] ?? null;
+}
+
+// Join the modifier keywords in TypeScript source order. Returns an
+// empty string when none apply so labelFor / drawHeaderSegments can
+// detect "no modifiers" cheaply (string.length === 0 vs null).
+function composeModifierPrefix(node: {
+  static?: boolean;
+  readonly?: boolean;
+  accessibility?: 'private' | 'protected';
+}): string {
+  const parts: string[] = [];
+  if (node.accessibility) parts.push(node.accessibility);
+  if (node.static) parts.push('static');
+  if (node.readonly) parts.push('readonly');
+  return parts.join(' ');
 }
 
 // Kinds whose label is treated like a real name for LOD: it survives the
@@ -1604,20 +1624,28 @@ export function PixiCanvas({ project }: CanvasProps) {
         // out the container shrinks under it — gate on the same box the sizer
         // used so the label is hidden the moment it would spill out, instead
         // of overflowing.
-        // Draw the header as colored segments: name (type) + " extends "
-        // (keyword) + base (type), preserving syntax highlighting. Used in
-        // place of the single-color put when the node has an extends clause.
+        // Draw the header as colored segments — name (type), prefixed by
+        // any modifiers in keyword colour, optionally suffixed by
+        // " extends Base" (keyword + type). Used in place of the
+        // single-color put whenever the label needs more than one
+        // colour. Source order: "[private] [static] [readonly] Name
+        // [extends Base]".
         const segScale = 1 / cameraScale;
+        const modifierPrefix = composeModifierPrefix(node);
         const drawHeaderSegments = (
           startX: number,
           midY: number,
           centered: boolean,
         ): void => {
-          const segs = [
-            { t: node.name ?? '', c: syntaxColor(node) },
-            { t: ' extends ', c: SYNTAX.keyword },
-            { t: node.extendsName ?? '', c: SYNTAX.type },
-          ];
+          const segs: { t: string; c: number }[] = [];
+          if (modifierPrefix) {
+            segs.push({ t: modifierPrefix + ' ', c: SYNTAX.keyword });
+          }
+          segs.push({ t: node.name ?? '', c: syntaxColor(node) });
+          if (node.extendsName != null) {
+            segs.push({ t: ' extends ', c: SYNTAX.keyword });
+            segs.push({ t: node.extendsName, c: SYNTAX.type });
+          }
           let total = 0;
           for (const s of segs) total += measureMono(s.t, 11).w;
           let cx = centered ? startX - (total * segScale) / 2 : startX;
@@ -1637,9 +1665,14 @@ export function PixiCanvas({ project }: CanvasProps) {
           }
         };
         const composite = node.extendsName != null && node.name != null;
-        // The " extends Base" suffix is a non-name detail, so it drops in the
-        // simplified tier along with operators/kind labels — just the name.
+        // The " extends Base" suffix and the modifier keywords are
+        // non-name detail; both drop in the simplified tier along
+        // with operators/kind labels — just the name. The multi-colour
+        // header path runs whenever EITHER of them is present (and
+        // we're above simplified).
         const showExtends = composite && !simplified;
+        const showModifiers = modifierPrefix.length > 0 && !simplified;
+        const useSegments = showExtends || showModifiers;
         const labelText = labelFor(node);
         const labelBox = labelText ? labelScreenBox(labelText) : null;
         // (CallExpression labels arrive from the server as `▷ <callee>` —
@@ -1687,14 +1720,16 @@ export function PixiCanvas({ project }: CanvasProps) {
           const parent = node.parentId ? tree.byId.get(node.parentId) : null;
           const parentLabel = parent ? labelFor(parent) : null;
           if (parentLabel !== labelText) {
-            // In the simplified tier a composite header collapses to just
-            // the name (labelText is a narrowed string in this block).
+            // In the simplified tier the multi-colour header collapses
+            // to just the name (labelText is a narrowed string in this
+            // block). Drops the modifier prefix AND the " extends Base"
+            // suffix in one step.
             const headerText =
-              composite && simplified && node.name ? node.name : labelText;
+              simplified && node.name ? node.name : labelText;
             const hasKids = !!tree.childrenByParent.get(node.id)?.length;
             if (hasKids) {
               // Container: the label titles the children, top-left.
-              if (showExtends) {
+              if (useSegments) {
                 drawHeaderSegments(
                   x + 4 / cameraScale,
                   y + 3 / cameraScale,
@@ -1712,8 +1747,9 @@ export function PixiCanvas({ project }: CanvasProps) {
                   scale: 1 / cameraScale,
                 });
               }
-            } else if (showExtends) {
-              // Leaf class (empty body): centered composite header.
+            } else if (useSegments) {
+              // Leaf class (empty body) OR modifier-only leaf:
+              // centered multi-colour header.
               drawHeaderSegments(
                 x + node.rect.w / 2,
                 y + node.rect.h / 2,

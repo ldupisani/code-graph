@@ -21,6 +21,9 @@ export interface TreemapNode {
   depth: number;
   exported?: boolean;
   abstract?: boolean;
+  static?: boolean;
+  readonly?: boolean;
+  accessibility?: 'private' | 'protected';
   extendsName?: string;
   // True for nodes that should render in the type colour regardless of
   // their syntaxKind's normal category — currently set by the server
@@ -359,6 +362,9 @@ export function layoutAst(
       end: s.node.end,
       exported: s.node.exported,
       abstract: s.node.abstract,
+      static: s.node.static,
+      readonly: s.node.readonly,
+      accessibility: s.node.accessibility,
       extendsName: s.node.extendsName,
       isType: s.node.isType,
       rect: { x, y, w: s.w, h: s.h },

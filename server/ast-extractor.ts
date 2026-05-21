@@ -72,6 +72,9 @@ export function extractAst(
       op: operatorOf(node),
       exported: exportedOf(node),
       abstract: abstractOf(node),
+      static: staticOf(node),
+      readonly: readonlyOf(node),
+      accessibility: accessibilityOf(node),
       extendsName: extendsNameOf(node),
       isType: typeFlag,
       start: node.getStart(),
@@ -521,6 +524,29 @@ function exportedOf(node: Node): true | undefined {
 // the wire) otherwise, to keep payloads lean.
 function abstractOf(node: Node): true | undefined {
   return Node.isAbstractable(node) && node.isAbstract() ? true : undefined;
+}
+
+// `static` method / property / accessor / block. Same omit-when-false
+// convention.
+function staticOf(node: Node): true | undefined {
+  return Node.isStaticable(node) && node.isStatic() ? true : undefined;
+}
+
+// `readonly` property / parameter. ts-morph's Readonlyable surface covers
+// PropertyDeclaration, PropertySignature, ParameterDeclaration,
+// IndexSignatureDeclaration.
+function readonlyOf(node: Node): true | undefined {
+  return Node.isReadonlyable(node) && node.isReadonly() ? true : undefined;
+}
+
+// Accessibility scope: 'private' / 'protected' / undefined (public).
+// ts-morph's Scopeable is on the class-member declarations + parameter
+// properties; getScope() returns 'public' for the absence of any
+// modifier, which we map back to undefined so the wire stays lean.
+function accessibilityOf(node: Node): 'private' | 'protected' | undefined {
+  if (!Node.isScopeable(node)) return undefined;
+  const s = node.getScope();
+  return s === 'private' || s === 'protected' ? s : undefined;
 }
 
 // Base type text of a class/interface `extends` clause, rendered inline on

@@ -101,6 +101,15 @@ export interface AstNode {
   // True for an `abstract` declaration (class/method/property/accessor).
   // The renderer gives it a dashed box outline.
   abstract?: boolean;
+  // `static` member of a class. Renderer prepends "static" to the
+  // name in keyword colour, matching how the editor highlights it.
+  static?: boolean;
+  // `readonly` property / parameter. Same keyword-colour prefix
+  // treatment as `static`.
+  readonly?: boolean;
+  // Access modifier when not the default (public). Renders as the
+  // corresponding keyword in keyword colour preceding the name.
+  accessibility?: 'private' | 'protected';
   // For a class/interface, the base type text from its `extends` clause
   // (e.g. "Animal", or "A, B" for an interface). Rendered inline on the
   // header ("Dog extends Animal") instead of as a separate block.

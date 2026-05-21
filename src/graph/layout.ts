@@ -84,21 +84,26 @@ const LINK_CLEARANCE_PAD = 24; // world px the line should clear the box edge by
 // reads as 'organised by folder.' Link-loosening counter-force
 // also strengthens at low zoom — see linkLooseningForce.
 //
+// Ceiling lowered from 2.5× to 1.6× after observing it fling
+// outliers and balloon convex hulls when reheat hits low-zoom +
+// strong-mul + alpha=0.25 simultaneously. Modest amplitude is
+// enough to read the difference; bigger amplitude was destabilising.
+//
 // folderMul:
-//   cameraScale 0.1 → ~2.4   (strong folder pull, overview view)
-//   cameraScale 0.5 → ~1.5
-//   cameraScale 1.0 → 1.0    (baseline)
-//   cameraScale 2.0 → ~0.3   (folder fades, connectivity wins)
+//   cameraScale 0.1 → ~1.55  (folder pull noticeably stronger)
+//   cameraScale 0.5 → ~1.25
+//   cameraScale 1.0 → ~0.9 → clamped to 1.0 by `min` (baseline at 1)
+//   cameraScale 2.0 → 0.4    (folder fades, connectivity wins)
 function folderMul(cameraScale: number): number {
-    return Math.max(0.3, Math.min(2.5, 2.5 - cameraScale * 1.5));
+    return Math.max(0.4, Math.min(1.6, 1.6 - cameraScale * 0.6));
 }
 // linkLoosenMul:
-//   cameraScale 0.1 → 1.0    (counter-force at full strength)
-//   cameraScale 0.5 → ~0.5
+//   cameraScale 0.1 → ~0.6   (mild counter-force)
+//   cameraScale 0.5 → ~0.4
 //   cameraScale 1.0 → 0      (no-op — forceLink unopposed)
 //   cameraScale ≥ 1   → 0
 function linkLoosenMul(cameraScale: number): number {
-    return Math.max(0, Math.min(1, 1.1 - cameraScale * 1.1));
+    return Math.max(0, Math.min(0.7, 0.7 - cameraScale * 0.7));
 }
 
 interface DirectionalEdge {

@@ -497,6 +497,11 @@ export function PixiCanvas({ project }: CanvasProps) {
       const world = new Container();
       app.stage.addChild(world);
       let cameraScale = world.scale.x;
+      // Anchor used by setCameraScale to decide whether a fresh
+      // zoom session crosses the reheat threshold. Compared against
+      // the live cameraScale, NOT updated on every wheel event —
+      // see setCameraScale below.
+      let lastReheatScale = cameraScale;
 
       // getCameraScale is a closure-captured getter — the sim's
       // zoom-modulated forces (folder cluster / subsystem repulsion
@@ -565,6 +570,21 @@ export function PixiCanvas({ project }: CanvasProps) {
         layout.simulation.tick(50);
         fitProjectToViewport();
       }
+      // Sync the closure variable to world.scale.x AFTER auto-fit /
+      // restore. Without this the closure stayed at 1.0 (its
+      // initial value) until the first wheel event, at which point
+      // setCameraScale would see a 20× jump and trigger a violent
+      // reheat with the multipliers swinging in lock-step. The
+      // first frame's draw + the zoom-modulated forces also read
+      // this closure, so syncing here makes both consistent with
+      // what's actually on screen.
+      cameraScale = world.scale.x;
+      // Anchor for the reheat threshold — see setCameraScale. We
+      // only reheat when the zoom drifts >1.5× from the LAST
+      // reheat (not from the live cameraScale), so a single zoom
+      // session triggers at most one reheat regardless of how
+      // many wheel events arrive.
+      lastReheatScale = cameraScale;
 
       // Frame the bounding box of all sim nodes in the viewport with
       // ~6% margin on each side. Caps the zoom at 2 (don't zoom in
@@ -2802,19 +2822,23 @@ export function PixiCanvas({ project }: CanvasProps) {
         container,
         getCameraScale: () => cameraScale,
         setCameraScale: (s: number) => {
-          // Reheat the sim when zoom crosses a multiplicative
-          // threshold so the zoom-modulated forces (folder cluster /
-          // subsystem repulsion / link-loosen counter) can actually
-          // reshape the layout — without this, the sim sits at low
-          // alpha and the force-strength changes have no visible
-          // effect. Threshold tuned so casual zooms don't trigger
-          // it, but a clear overview ↔ detail transition does.
+          // Reheat the sim when zoom drifts >1.5× away from the
+          // LAST reheat anchor (not from the previous frame's
+          // cameraScale). Anchoring on the last reheat means a
+          // continuous overview-to-detail scroll triggers exactly
+          // one reheat — when the user actually crosses into a
+          // different zoom regime — instead of re-firing on every
+          // wheel tick once the layout has briefly settled near
+          // the threshold. Alpha lowered from 0.25 to 0.15: just
+          // enough for the new multipliers to bias the existing
+          // arrangement, not enough to fling outliers.
           if (
             s > 0 &&
-            cameraScale > 0 &&
-            (s / cameraScale > 1.5 || cameraScale / s > 1.5)
+            lastReheatScale > 0 &&
+            (s / lastReheatScale > 1.5 || lastReheatScale / s > 1.5)
           ) {
-            layout.simulation.alpha(0.25).restart();
+            layout.simulation.alpha(0.15).restart();
+            lastReheatScale = s;
           }
           cameraScale = s;
         },

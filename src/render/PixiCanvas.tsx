@@ -96,6 +96,14 @@ const FILE_LABEL_BELOW = 0.5;
 // at. Below this zoom they're hidden entirely so only cross-directory
 // connections remain visible. Zoom in past it for the local detail.
 const INTRA_DIR_BELOW = 0.6;
+// At extreme zoom-out the individual file icons + edges become an
+// unreadable wallpaper. Below this scale we switch to a directory-as-
+// node summary: each directory renders as ONE fat coloured circle at
+// its files' centroid, sized to its file count, with the directory
+// name + count as a large label. Inter-directory edges aggregate
+// into a single weighted line per (src-dir, dst-dir) pair. Click a
+// super-node to smoothly zoom in to that directory's bbox.
+const DIRECTORY_ZOOM_BELOW = 0.25;
 // Edge "screen length" below which the edge progressively dims. Short
 // edges (within-cluster local plumbing) get muted; long edges
 // (cross-cluster architectural connections) stay bright. Linear ramp
@@ -956,6 +964,202 @@ export function PixiCanvas({ project }: CanvasProps) {
           return { x: p.x + (dx / d) * pad, y: p.y + (dy / d) * pad };
         });
       };
+      // Directory super-node summary, drawn when the camera zooms
+      // below DIRECTORY_ZOOM_BELOW. Replaces the file-level scene
+      // with one big coloured circle per directory + aggregate
+      // weighted edges between them. Click a super-node to zoom in
+      // to its bbox.
+      interface DirAgg {
+        dir: string;
+        cx: number;
+        cy: number;
+        radius: number;
+        fileCount: number;
+        // World-bbox of the directory's files; used for click-to-zoom.
+        minX: number;
+        minY: number;
+        maxX: number;
+        maxY: number;
+      }
+      function computeDirectoryAggregates(): DirAgg[] {
+        const hideSupport = !useGraphStore.getState().showSupportFiles;
+        const byDir = new Map<string, SimFileNode[]>();
+        for (const sim of layout.nodes) {
+          if (hideSupport && supportFileIds.has(sim.id)) continue;
+          const dir = fileToDir.get(sim.id);
+          if (!dir) continue; // skip root-level files in super-node mode
+          let list = byDir.get(dir);
+          if (!list) {
+            list = [];
+            byDir.set(dir, list);
+          }
+          list.push(sim);
+        }
+        const out: DirAgg[] = [];
+        for (const [dir, mems] of byDir) {
+          let sx = 0;
+          let sy = 0;
+          let minX = Infinity;
+          let minY = Infinity;
+          let maxX = -Infinity;
+          let maxY = -Infinity;
+          for (const m of mems) {
+            sx += m.x;
+            sy += m.y;
+            const halfW = m.width / 2;
+            const halfH = m.height / 2;
+            if (m.x - halfW < minX) minX = m.x - halfW;
+            if (m.y - halfH < minY) minY = m.y - halfH;
+            if (m.x + halfW > maxX) maxX = m.x + halfW;
+            if (m.y + halfH > maxY) maxY = m.y + halfH;
+          }
+          out.push({
+            dir,
+            cx: sx / mems.length,
+            cy: sy / mems.length,
+            radius: Math.max(60, Math.min(220, 24 + Math.sqrt(mems.length) * 16)),
+            fileCount: mems.length,
+            minX,
+            minY,
+            maxX,
+            maxY,
+          });
+        }
+        return out;
+      }
+      function drawDirectorySuperNodes(): void {
+        const aggs = computeDirectoryAggregates();
+        if (aggs.length === 0) return;
+        const aggsByDir = new Map<string, DirAgg>();
+        for (const a of aggs) aggsByDir.set(a.dir, a);
+
+        // 1. Aggregate edges first (drawn below the super-nodes).
+        //    For each (fromDir, toDir) with fromDir != toDir, count
+        //    imports + semantic edges; render one line per pair with
+        //    width proportional to sqrt(count). Respects the user's
+        //    edgeFilter + showSupportFiles settings — same idea as
+        //    the per-edge passes but aggregated.
+        const st = useGraphStore.getState();
+        const hideSupport = !st.showSupportFiles;
+        const pairWeight = new Map<string, number>();
+        const bump = (a: string, b: string): void => {
+          if (a === b) return;
+          if (!aggsByDir.has(a) || !aggsByDir.has(b)) return;
+          const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+          pairWeight.set(key, (pairWeight.get(key) ?? 0) + 1);
+        };
+        if (st.edgeFilter.imports) {
+          for (const e of project.edges) {
+            if (hideSupport && (supportFileIds.has(e.fromId) || supportFileIds.has(e.toId))) continue;
+            const a = fileToDir.get(e.fromId);
+            const b = fileToDir.get(e.toId);
+            if (a && b) bump(a, b);
+          }
+        }
+        for (const e of project.semanticEdges) {
+          if (e.kind === 'calls' && !st.edgeFilter.calls) continue;
+          if (
+            (e.kind === 'extends' || e.kind === 'implements') &&
+            !st.edgeFilter.extends
+          ) {
+            continue;
+          }
+          const fromF = fileIdOfAstId(e.fromId);
+          const toF = fileIdOfAstId(e.toId);
+          if (hideSupport && (supportFileIds.has(fromF) || supportFileIds.has(toF))) continue;
+          const a = fileToDir.get(fromF);
+          const b = fileToDir.get(toF);
+          if (a && b) bump(a, b);
+        }
+        for (const [key, weight] of pairWeight) {
+          const sep = key.indexOf('|');
+          const a = aggsByDir.get(key.slice(0, sep));
+          const b = aggsByDir.get(key.slice(sep + 1));
+          if (!a || !b) continue;
+          worldGfx
+            .moveTo(a.cx, a.cy)
+            .lineTo(b.cx, b.cy)
+            .stroke({
+              color: COLORS.edge,
+              width: Math.min(8, 1 + Math.sqrt(weight)) / cameraScale,
+              alpha: 0.55,
+            });
+        }
+
+        // 2. Super-nodes themselves: one fat coloured circle per
+        //    directory. Hit-rect pushed so handleClick can route
+        //    'dir:*' clicks to zoom-to-bbox.
+        for (const a of aggs) {
+          const colour = colourForDirectory(a.dir);
+          worldGfx
+            .circle(a.cx, a.cy, a.radius)
+            .fill({ color: colour, alpha: 0.65 })
+            .stroke({
+              color: colour,
+              width: 2 / cameraScale,
+              alpha: 0.95,
+            });
+          // Name centred, file count below it. Counter-scaled so
+          // they read at constant on-screen size regardless of zoom.
+          labelPool.put({
+            text: a.dir,
+            worldX: a.cx,
+            worldY: a.cy - 6 / cameraScale,
+            color: COLORS.text,
+            size: 14,
+            anchorX: 0.5,
+            anchorY: 1,
+            scale: 1 / cameraScale,
+          });
+          labelPool.put({
+            text: `${a.fileCount} file${a.fileCount === 1 ? '' : 's'}`,
+            worldX: a.cx,
+            worldY: a.cy + 6 / cameraScale,
+            color: COLORS.textDim,
+            size: 11,
+            anchorX: 0.5,
+            anchorY: 0,
+            scale: 1 / cameraScale,
+          });
+          // HitRect for click-to-zoom-in. Bounding square of the
+          // circle; 'dir:' prefix on the id so handleClick can
+          // identify and route it without confusing it with a
+          // file id (file ids are server-issued opaque strings,
+          // never start with 'dir:').
+          pushRect({
+            id: 'dir:' + a.dir,
+            fileId: 'dir:' + a.dir,
+            kind: 'file',
+            x: a.cx - a.radius,
+            y: a.cy - a.radius,
+            w: a.radius * 2,
+            h: a.radius * 2,
+            area: a.radius * a.radius * 4,
+          });
+        }
+      }
+
+      // Smooth zoom to fit a directory's file bbox, reusing the
+      // existing zoomFit + followAt infrastructure. Called when a
+      // super-node is clicked at low zoom.
+      function fitDirectoryInViewport(dir: string): void {
+        const aggs = computeDirectoryAggregates();
+        const a = aggs.find((x) => x.dir === dir);
+        if (!a) return;
+        const w = Math.max(1, a.maxX - a.minX);
+        const h = Math.max(1, a.maxY - a.minY);
+        const TARGET = 0.85;
+        const fitW = (app.screen.width * TARGET) / w;
+        const fitH = (app.screen.height * TARGET) / h;
+        const scale = Math.max(0.2, Math.min(3, Math.min(fitW, fitH)));
+        zoomFit = {
+          targetScale: scale,
+          pivot: { x: (a.minX + a.maxX) / 2, y: (a.minY + a.maxY) / 2 },
+        };
+        followId = null;
+        followAt = null;
+      }
+
       const drawDirectoryBoundaries = (): void => {
         const hideSupport = !useGraphStore.getState().showSupportFiles;
         const byDir = new Map<string, SimFileNode[]>();
@@ -1352,14 +1556,19 @@ export function PixiCanvas({ project }: CanvasProps) {
           }
         }
 
-        // 1. Import edges (under rects). Now anchored to the specific
-        //    `import` AST node on the source side when that file is
-        //    expanded, and clipped to the file's circle on the target
-        //    side — see drawEdges for the geometry. Gated by the
-        //    user's edge filter; toggling 'imports' off skips this
-        //    pass entirely.
-        const hideSupportForEdges = !state.showSupportFiles;
-        if (state.edgeFilter.imports) {
+        // Two render modes depending on zoom level:
+        //   * cameraScale < DIRECTORY_ZOOM_BELOW: each directory
+        //     becomes ONE big super-node + aggregate weighted edges
+        //     between super-nodes. The file-level scene is hidden.
+        //   * otherwise: the normal file-level rendering (icons +
+        //     edges + hulls + focus dimming).
+        const inDirectoryMode = cameraScale < DIRECTORY_ZOOM_BELOW;
+        const hideSupport = !state.showSupportFiles;
+        const hideSupportForEdges = hideSupport;
+
+        // 1. Import edges (under rects). Skipped in directory mode —
+        //    drawDirectorySuperNodes draws its own aggregated edges.
+        if (!inDirectoryMode && state.edgeFilter.imports) {
           drawEdges(
             layout,
             project.edges,
@@ -1376,36 +1585,29 @@ export function PixiCanvas({ project }: CanvasProps) {
           visibleSemanticPairs.clear();
         }
 
-        // 1b. Directory boundaries (translucent convex hull + label
-        //     behind file circles). Drawn AFTER edges so import lines
-        //     pass cleanly through, and BEFORE files so file circles
-        //     sit on top of the boundary fill.
-        drawDirectoryBoundaries();
+        if (inDirectoryMode) {
+          drawDirectorySuperNodes();
+        } else {
+          // 1b. Directory boundaries (translucent convex hull + label
+          //     behind file circles). Drawn AFTER edges so import lines
+          //     pass cleanly through, and BEFORE files so file circles
+          //     sit on top of the boundary fill.
+          drawDirectoryBoundaries();
 
-        // 2. Files + AST subtrees on `worldGfx`. pushRect keeps visibleById
-        //    in sync so the edge pass below can find precise anchors.
-        //    Support files (.test / .stories / .spec / __tests__ /
-        //    __mocks__) are skipped when state.showSupportFiles is off
-        //    — they're architecturally peripheral and dominate the
-        //    visual by count in a typical React project.
-        const hideSupport = !state.showSupportFiles;
-        for (const sim of layout.nodes) {
-          if (hideSupport && supportFileIds.has(sim.id)) continue;
-          drawFile(sim, selection);
+          // 2. Files + AST subtrees on `worldGfx`. pushRect keeps
+          //    visibleById in sync so the edge pass below can find
+          //    precise anchors. Support files (.test / .stories /
+          //    .spec / __tests__ / __mocks__) are skipped when
+          //    state.showSupportFiles is off.
+          for (const sim of layout.nodes) {
+            if (hideSupport && supportFileIds.has(sim.id)) continue;
+            drawFile(sim, selection);
+          }
         }
 
-        // 2b. Focus-mode dimming. For each file outside the live set,
-        //     paint a translucent bg-coloured rect on dimGfx (one
-        //     layer above worldGfx + labelLayer) so the file rect is
-        //     visibly darkened. Match the rect to the VISIBLE content
-        //     — the screen-constant 16×20 icon for collapsed files,
-        //     the file circle's bounding box for expanded ones —
-        //     not sim.width/sim.height (which is the d3-force
-        //     collision footprint based on label length; rendering
-        //     that as a dim box draws a standalone dark rectangle
-        //     bigger than the icon and disconnected from it visually).
-        //     Path-traced files (when set) override dimming.
-        if (liveFiles) {
+        // 2b. Focus-mode dimming. Skipped in directory mode — at
+        //     super-node zoom there's nothing file-shaped to dim.
+        if (!inDirectoryMode && liveFiles) {
           for (const sim of layout.nodes) {
             if (liveFiles.has(sim.id)) continue;
             if (pathFileSet.has(sim.id)) continue;
@@ -1432,9 +1634,8 @@ export function PixiCanvas({ project }: CanvasProps) {
           }
         }
         // 2c. Path overlay: thin yellow outline around every file
-        //     in the traced path, so even if focus is off they read
-        //     as "part of the path" at a glance.
-        if (pathFileSet.size > 0) {
+        //     in the traced path. Skipped in directory mode.
+        if (!inDirectoryMode && pathFileSet.size > 0) {
           for (const sim of layout.nodes) {
             if (!pathFileSet.has(sim.id)) continue;
             const r = sim.width / 2 + 6 / cameraScale;
@@ -1526,23 +1727,27 @@ export function PixiCanvas({ project }: CanvasProps) {
         const overlayAstSet = new Set<string>();
         for (const r of overlayHitRects) overlayAstSet.add(r.id);
 
-        drawSemanticEdges(
-          project.semanticEdges,
-          semanticEdgeGfx,
-          semanticEdgeOverlayGfx,
-          overlayAstSet,
-          visibleById,
-          activeTree,
-          cameraScale,
-          selection,
-          state.expandedFiles,
-          visibleSemanticPairs,
-          state.edgeFilter,
-          liveFiles,
-          pathEdgeKeys,
-          hideSupportForEdges ? supportFileIds : null,
-          fileToDir,
-        );
+        // Semantic edges are file-level — skipped in directory mode
+        // where the aggregated super-node lines stand in for them.
+        if (!inDirectoryMode) {
+          drawSemanticEdges(
+            project.semanticEdges,
+            semanticEdgeGfx,
+            semanticEdgeOverlayGfx,
+            overlayAstSet,
+            visibleById,
+            activeTree,
+            cameraScale,
+            selection,
+            state.expandedFiles,
+            visibleSemanticPairs,
+            state.edgeFilter,
+            liveFiles,
+            pathEdgeKeys,
+            hideSupportForEdges ? supportFileIds : null,
+            fileToDir,
+          );
+        }
       }
 
       function drawFile(sim: SimFileNode, selection: string | null): void {
@@ -2702,6 +2907,16 @@ export function PixiCanvas({ project }: CanvasProps) {
           st.setTracedPath(null);
           followId = null;
           followAt = null;
+          return;
+        }
+
+        // Directory super-node click (only happens in directory mode):
+        // smoothly zoom IN to fit that directory's bounding box.
+        // Selection / focus stay untouched — this is purely a camera
+        // navigation. Once the zoom completes, the user is past
+        // DIRECTORY_ZOOM_BELOW and seeing files normally.
+        if (target.id.startsWith('dir:')) {
+          fitDirectoryInViewport(target.id.slice(4));
           return;
         }
 

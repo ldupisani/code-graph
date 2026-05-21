@@ -419,17 +419,19 @@ export function PixiCanvas({ project }: CanvasProps) {
       }
 
       // Scene graph layering, bottom-up:
-      //   worldGfx       — rects (file + AST) + file-level import edges
-      //   overlayGfx     — expanded-Block overlays, drawn ON TOP of the
-      //                    main scene so they read as a separate layer
+      //   worldGfx       — rects (file + AST) AND expanded-Block
+      //                    overlays. Pixi Graphics renders draw calls
+      //                    in order, so the overlay pass — which runs
+      //                    AFTER the main scene — naturally lands on
+      //                    top of it without needing a separate
+      //                    Graphics layer. (Hit priority for overlays
+      //                    is handled by a separate HitRect list, not
+      //                    by Graphics z-order.)
       //   labelLayer     — Pixi Text labels (on top of rects so they're legible)
       //   semanticEdgeGfx — semantic edges + arrowheads (on top of labels so
       //                     no call/extends arrow can be hidden by a label or rect)
       const worldGfx = new Graphics();
       world.addChild(worldGfx);
-
-      const overlayGfx = new Graphics();
-      world.addChild(overlayGfx);
 
       const labelLayer = new Container();
       world.addChild(labelLayer);
@@ -706,7 +708,6 @@ export function PixiCanvas({ project }: CanvasProps) {
         const selection = state.selection;
 
         worldGfx.clear();
-        overlayGfx.clear();
         semanticEdgeGfx.clear();
         hitRects.length = 0;
         overlayHitRects.length = 0;
@@ -1099,7 +1100,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         // file's content; same kind colour for the outline so the
         // user keeps the "this is a Block" association.
         const stroke = KIND_OUTLINE['Block'] ?? COLORS.astBorder;
-        overlayGfx
+        worldGfx
           .rect(x, y, w, h)
           .fill({ color: COLORS.fileExpanded, alpha: 0.95 })
           .stroke({ color: stroke, width: 1.5 / cameraScale, alpha: 1 });
@@ -1139,11 +1140,11 @@ export function PixiCanvas({ project }: CanvasProps) {
           const isHandleHovered =
             hoveredHit?.kind === 'ast-toggle' && hoveredHit.id === blockId;
           const lineW = (isHandleHovered ? 1.6 : 1) / cameraScale;
-          overlayGfx
+          worldGfx
             .rect(hx, hy, handleSize, handleSize)
             .fill({ color: stroke, alpha: isHandleHovered ? 0.5 : 0.25 })
             .stroke({ color: stroke, width: lineW, alpha: 1 });
-          overlayGfx
+          worldGfx
             .moveTo(hx + handleSize * 0.25, hy + handleSize / 2)
             .lineTo(hx + handleSize * 0.75, hy + handleSize / 2)
             .stroke({ color: stroke, width: lineW * 1.2, alpha: 1 });

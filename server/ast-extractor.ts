@@ -226,10 +226,12 @@ function isTypeImportBinding(node: Node): boolean {
   }
 
   // 3. Semantic check: resolve the binding's aliased symbol and look
-  //    at its declarations. If they're exclusively type-level kinds
-  //    (Interface / TypeAlias), the import is a type. A class is
-  //    deliberately NOT included — it's both a type and a value, and
-  //    the editor highlights it as a class, not a type.
+  //    at its declarations. An import gets the type colour if EVERY
+  //    declaration is type-relevant — interface, type alias, OR class.
+  //    Classes occupy both the value and type namespaces, and the user
+  //    wants them grouped with types here: an `import { Game }` reads
+  //    "Game is a class/type from elsewhere," which is the same mental
+  //    model as `import { ServerMessage }` (an interface).
   let symbol = node.getSymbol();
   if (!symbol) return false;
   const aliased = symbol.getAliasedSymbol?.();
@@ -240,7 +242,9 @@ function isTypeImportBinding(node: Node): boolean {
     const dk = d.getKind();
     return (
       dk === ts.SyntaxKind.InterfaceDeclaration ||
-      dk === ts.SyntaxKind.TypeAliasDeclaration
+      dk === ts.SyntaxKind.TypeAliasDeclaration ||
+      dk === ts.SyntaxKind.ClassDeclaration ||
+      dk === ts.SyntaxKind.ClassExpression
     );
   });
 }

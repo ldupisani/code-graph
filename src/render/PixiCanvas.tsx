@@ -265,8 +265,15 @@ const SYNTAX_CATEGORY: Record<string, keyof typeof SYNTAX> = {
   ImportClause: 'keyword',
   NamedImports: 'keyword',
   NamedExports: 'keyword',
-  ImportSpecifier: 'keyword',
-  ExportSpecifier: 'keyword',
+  // The `import` / `export` *statements* read as keywords (above), but the
+  // bound names INSIDE them read as identifier references: an import is
+  // bringing a value into scope, and the local binding sits in code the
+  // same way a variable identifier does. Match how the editor colours an
+  // identifier reference (light blue) rather than how it colours the
+  // `import` keyword (medium blue). Type / class imports override this
+  // via `isType` in syntaxColor() and land on green instead.
+  ImportSpecifier: 'variable',
+  ExportSpecifier: 'variable',
   HeritageClause: 'keyword',
   AsExpression: 'keyword',
   NonNullExpression: 'keyword',

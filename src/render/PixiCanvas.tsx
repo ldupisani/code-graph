@@ -1618,47 +1618,11 @@ export function PixiCanvas({ project }: CanvasProps) {
         const showExtends = composite && !simplified;
         const labelText = labelFor(node);
         const labelBox = labelText ? labelScreenBox(labelText) : null;
-        // A call site: the "call" word becomes a right-pointing triangle
-        // outline; the callee text (if any) follows in the node's color.
-        const isCall = node.syntaxKind === 'CallExpression';
-        const callee =
-          isCall && labelText && labelText.startsWith('call ')
-            ? labelText.slice(5)
-            : '';
-        const drawCallGlyph = (
-          startX: number,
-          refY: number,
-          centered: boolean,
-        ): void => {
-          const gs = 1 / cameraScale;
-          // One line-box tall; triangle and text are both anchored on its
-          // vertical center so they always read as centered with each other.
-          const lineH = measureMono('x', 11).h * gs; // line-box, for centering
-          const triH = 11 * gs; // same height as the label font
-          const triW = triH * 0.85;
-          const gap = 7 * gs; // breathing room between the glyph and the text
-          const calleeW = callee ? measureMono(callee, 11).w * gs : 0;
-          const totalW = triW + (callee ? gap + calleeW : 0);
-          const sx = centered ? startX - totalW / 2 : startX;
-          // `refY` is the line top for container labels, the line center for
-          // centered (leaf) labels — normalize to a center either way.
-          const cy = centered ? refY : refY + lineH / 2;
-          worldGfx
-            .poly([sx, cy - triH / 2, sx, cy + triH / 2, sx + triW, cy])
-            .stroke({ color: syntaxColor(node), width: gs, alpha: 1 });
-          if (callee) {
-            labelPool.put({
-              text: callee,
-              worldX: sx + triW + gap,
-              worldY: cy,
-              color: syntaxColor(node),
-              size: 11,
-              anchorX: 0,
-              anchorY: 0.5,
-              scale: gs,
-            });
-          }
-        };
+        // (CallExpression labels arrive from the server as `▷ <callee>` —
+        // the triangle is a literal character in the label, so we don't
+        // need a polygon path or a separate callee/glyph split anymore.
+        // The standard labelPool.put paths below render the whole thing
+        // as one text run in syntaxColor(node).)
         // In the simplified tier only real names (and name-like kinds such
         // as import/return) survive — other generic kind labels (type / if /
         // arrow fn / call / access …) drop out.
@@ -1712,12 +1676,6 @@ export function PixiCanvas({ project }: CanvasProps) {
                   y + 3 / cameraScale,
                   false,
                 );
-              } else if (isCall) {
-                drawCallGlyph(
-                  x + 4 / cameraScale,
-                  y + 3 / cameraScale,
-                  false,
-                );
               } else {
                 labelPool.put({
                   text: headerText,
@@ -1733,12 +1691,6 @@ export function PixiCanvas({ project }: CanvasProps) {
             } else if (showExtends) {
               // Leaf class (empty body): centered composite header.
               drawHeaderSegments(
-                x + node.rect.w / 2,
-                y + node.rect.h / 2,
-                true,
-              );
-            } else if (isCall) {
-              drawCallGlyph(
                 x + node.rect.w / 2,
                 y + node.rect.h / 2,
                 true,

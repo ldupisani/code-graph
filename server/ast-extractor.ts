@@ -108,8 +108,13 @@ export function extractAst(
 // Synthesised labels for `CallExpression` / `NewExpression`. When the callee
 // is collapsible — a bare Identifier (`foo()`) or a member-access chain
 // (`a.b.c()`, `this.foo()`, `obj["k"].bar()`) — emit a single label like
-// `call foo` / `call a.b.c` and add every node whose text contributed to it
+// `▷ foo` / `new a.b.c` and add every node whose text contributed to it
 // to `inlined`, so the visit pass skips the entire callee subtree.
+//
+// CallExpressions get a leading `▷` (U+25B7 WHITE RIGHT-POINTING TRIANGLE)
+// so the triangle reads as part of the label itself — the renderer treats
+// the whole string as one labelPool.put, no special-case polygon.
+// `new` keeps its keyword prefix.
 //
 // Returns null when the callee can't be cleanly captured (e.g. mixed
 // call+access chains like `a.b().c()`); the client then falls back to the
@@ -121,7 +126,7 @@ function synthesizeCallLabel(node: Node, inlined: Set<Node>): string | null {
   }
   const callee = getCalleeExpression(node);
   if (!callee) return null;
-  const prefix = kind === ts.SyntaxKind.NewExpression ? 'new ' : 'call ';
+  const prefix = kind === ts.SyntaxKind.NewExpression ? 'new ' : '▷ ';
 
   // Bare identifier callee: inline the single Identifier child.
   if (callee.getKind() === ts.SyntaxKind.Identifier) {

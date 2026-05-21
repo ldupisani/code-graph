@@ -418,23 +418,37 @@ export function PixiCanvas({ project }: CanvasProps) {
         world.position.set(app.screen.width / 2, app.screen.height / 2);
       }
 
-      // Scene graph layering, bottom-up:
-      //   worldGfx       — rects (file + AST) AND expanded-Block
-      //                    overlays. Pixi Graphics renders draw calls
-      //                    in order, so the overlay pass — which runs
-      //                    AFTER the main scene — naturally lands on
-      //                    top of it without needing a separate
-      //                    Graphics layer. (Hit priority for overlays
-      //                    is handled by a separate HitRect list, not
-      //                    by Graphics z-order.)
-      //   labelLayer     — Pixi Text labels (on top of rects so they're legible)
-      //   semanticEdgeGfx — semantic edges + arrowheads (on top of labels so
-      //                     no call/extends arrow can be hidden by a label or rect)
+      // Scene graph layering, bottom-up (Pixi child order = z-order):
+      //   worldGfx          — main-scene rects (file circles, AST cells,
+      //                       file outlines). Drawn first so labels can
+      //                       sit on top of them.
+      //   labelLayer        — Pixi Text labels for the main scene.
+      //   overlayGfx        — Expanded-Block overlay backgrounds, their
+      //                       interior rects, and the collapse handle.
+      //                       Sitting ABOVE labelLayer means the overlay
+      //                       fully obscures every main-scene label that
+      //                       falls behind it.
+      //   overlayLabelLayer — Pixi Text labels emitted while the overlay
+      //                       pass renders. Above overlay rects so the
+      //                       overlay's own labels stay legible.
+      //   semanticEdgeGfx   — Semantic edges + arrowheads, on top of
+      //                       everything so no call/extends arrow gets
+      //                       hidden behind a label, a rect, or an overlay.
+      //
+      // Hit-test priority is independent of Graphics z: a separate
+      // `overlayHitRects` list is consulted before `hitRects` so an
+      // overlay always wins clicks within its bounds.
       const worldGfx = new Graphics();
       world.addChild(worldGfx);
 
       const labelLayer = new Container();
       world.addChild(labelLayer);
+
+      const overlayGfx = new Graphics();
+      world.addChild(overlayGfx);
+
+      const overlayLabelLayer = new Container();
+      world.addChild(overlayLabelLayer);
 
       const semanticEdgeGfx = new Graphics();
       world.addChild(semanticEdgeGfx);
@@ -506,8 +520,21 @@ export function PixiCanvas({ project }: CanvasProps) {
       const visibleSemanticPairs = new Set<string>();
 
       // Pool of Pixi Text objects re-used across frames. `visible` is toggled
-      // for unused entries, avoiding GC churn.
+      // for unused entries, avoiding GC churn. Two pools: one per label
+      // layer — the renderer flips `currentLabelPool` for the overlay
+      // pass so labels drawn under drawAstNode land on the right tier.
       const labelPool = new LabelPool(labelLayer);
+      const overlayLabelPool = new LabelPool(overlayLabelLayer);
+
+      // Active per-pass targets for the SHARED drawing helpers
+      // (drawAstNode, drawAstContainer, drawOverlay). The main scene
+      // draws to `worldGfx` + `labelPool`; the overlay pass flips to
+      // `overlayGfx` + `overlayLabelPool` so every primitive the
+      // recursion emits lands ABOVE the main labelLayer in the scene
+      // graph. Main-only draw functions (drawFile, drawEdges,
+      // drawSemanticEdges) keep using their absolute references.
+      let currentGfx: Graphics = worldGfx;
+      let currentLabelPool: LabelPool = labelPool;
 
       // Camera (mirrors world.scale.x; held in a ref so handlers can read
       // and write without a closure stale-read.)
@@ -708,13 +735,17 @@ export function PixiCanvas({ project }: CanvasProps) {
         const selection = state.selection;
 
         worldGfx.clear();
+        overlayGfx.clear();
         semanticEdgeGfx.clear();
         hitRects.length = 0;
         overlayHitRects.length = 0;
         currentHitTarget = hitRects;
+        currentGfx = worldGfx;
+        currentLabelPool = labelPool;
         visibleById.clear();
         blockCellsThisFrame.clear();
         labelPool.beginFrame();
+        overlayLabelPool.beginFrame();
 
         // 1. Import edges (under rects). Now anchored to the specific
         //    `import` AST node on the source side when that file is
@@ -740,6 +771,8 @@ export function PixiCanvas({ project }: CanvasProps) {
         //    can render after their parent has registered the cell
         //    they anchor to. Stops once no new overlay drew this pass.
         currentHitTarget = overlayHitRects;
+        currentGfx = overlayGfx;
+        currentLabelPool = overlayLabelPool;
         const renderedOverlays = new Set<string>();
         const overlaysToDraw = new Set<string>(state.expandedAstNodes);
         // Include any block in a currently-animating shrink, even if
@@ -760,9 +793,15 @@ export function PixiCanvas({ project }: CanvasProps) {
           }
         }
         currentHitTarget = hitRects;
+        currentGfx = worldGfx;
+        currentLabelPool = labelPool;
 
-        // 4. Labels (above rects + overlays).
+        // 4. Hide unused entries in both label pools (the scene-graph
+        //    order already lays main labels under the overlay rects
+        //    and overlay labels above them — see the world.addChild
+        //    sequence above).
         labelPool.endFrame();
+        overlayLabelPool.endFrame();
 
         // 5. Semantic edges, drawn last on a dedicated graphics layered above
         //    labels. Border-clipped + arrowheaded so they're always visible.
@@ -973,6 +1012,14 @@ export function PixiCanvas({ project }: CanvasProps) {
         const strokeWidth = (isSelected ? FILE_RIM / 2 : 1) / cameraScale;
         const strokeAlpha = 1;
 
+        // Per-pass shadowing: when drawAstContainer runs from the overlay
+        // pass, `currentGfx`/`currentLabelPool` point at the overlay
+        // layer; for the main pass they point at the main layer. Local
+        // shadowing keeps every primitive/label call inside this function
+        // routed automatically without per-site edits.
+        const worldGfx = currentGfx;
+        const labelPool = currentLabelPool;
+
         // Circle fill: same translucent dark as the file circle, so a
         // class reads as a "smaller file" of related members.
         worldGfx.circle(cx, cy, radius).fill({ color: COLORS.fileExpanded, alpha: 0.55 });
@@ -1068,6 +1115,15 @@ export function PixiCanvas({ project }: CanvasProps) {
         const blockNode = overlayTree.byId.get(blockId);
         if (!blockNode) return;
         const fileId = fileIdOfAstId(blockId);
+
+        // Shadow the closure-scoped graphics with the active per-pass
+        // target. During the overlay pass this points at overlayGfx,
+        // so the overlay's background + handle land above the main
+        // scene's labelLayer — main labels behind the overlay stay
+        // hidden. (Labels inside the overlay come from the recursive
+        // drawAstNode below, which shadows labelPool to overlayLabelPool
+        // by the same mechanism.)
+        const worldGfx = currentGfx;
 
         // Overlay sizing. The full overlay rect anchors at the cell's
         // top-left and extends right/down by the block layout's
@@ -1169,6 +1225,13 @@ export function PixiCanvas({ project }: CanvasProps) {
         tree: TreemapLayout,
         selection: string | null,
       ): void {
+        // Per-pass target shadowing — see drawAstContainer / drawOverlay
+        // for the rationale. Every `worldGfx.*` / `labelPool.put` below
+        // routes to the active layer (main during main pass, overlay
+        // during overlay pass) automatically.
+        const worldGfx = currentGfx;
+        const labelPool = currentLabelPool;
+
         const x = baseX + node.rect.x;
         const y = baseY + node.rect.y;
         const wOnScreen = node.rect.w * cameraScale;
@@ -1915,6 +1978,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         layout.simulation.stop();
         detachCamera();
         labelPool.destroy();
+        overlayLabelPool.destroy();
         app.ticker.remove(tickerCb);
         app.destroy(true, { children: true, texture: true });
       };

@@ -157,13 +157,20 @@ function synthesizeCallLabel(node: Node, inlined: Set<Node>): string | null {
   return null;
 }
 
-// True when the node is an import binding for a type, i.e. either
-//   * an ImportSpecifier with its own `isTypeOnly` (`import { type Foo }`), or
-//   * any descendant of an ImportClause whose `isTypeOnly` is set
-//     (`import type { Foo }`, `import type Default from ...`).
-// The latter covers both the default-import Identifier (which reparents to
-// ImportDeclaration after ImportClause elision in visit()) AND the named
-// ImportSpecifier children — both should render in the type colour.
+// True when the node is an import binding for a type — covers three
+// independent signals:
+//   1. `import type { Foo }` / `import type Default from ...`: the
+//      enclosing ImportClause's isTypeOnly is set.
+//   2. `import { type Foo }`: the ImportSpecifier itself has isTypeOnly.
+//   3. `import { Foo } from './types'` where the imported symbol's
+//      declarations are exclusively type-level (interface / type
+//      alias). The user didn't write `type` but the binding is
+//      semantically a type, and the editor highlights it as one.
+//
+// All three apply to the same set of nodes: ImportSpecifier (named
+// imports), or Identifier inside an ImportClause (default imports —
+// the Identifier reparents to ImportDeclaration after the elision in
+// visit(), so we still recognise it via the ancestry check).
 function isTypeImportBinding(node: Node): boolean {
   const k = node.getKind();
   if (
@@ -172,42 +179,70 @@ function isTypeImportBinding(node: Node): boolean {
   ) {
     return false;
   }
+
+  // Confirm we're in an import position by finding the closest
+  // ImportClause (bounded by ImportDeclaration / SourceFile). If we
+  // don't see one, this is an Identifier somewhere else in the code
+  // — bail out so we don't paint every type-named variable green.
+  let importClause: Node | null = null;
+  let cur: Node | undefined = node.getParent();
+  while (cur) {
+    const ck = cur.getKind();
+    if (ck === ts.SyntaxKind.ImportClause) {
+      importClause = cur;
+      break;
+    }
+    if (
+      ck === ts.SyntaxKind.SourceFile ||
+      ck === ts.SyntaxKind.ImportDeclaration
+    ) {
+      break;
+    }
+    cur = cur.getParent();
+  }
+  if (!importClause) return false;
+
+  // 1. & 2. Syntactic `type` markers — check the ImportSpecifier
+  //    itself and the enclosing ImportClause.
   if (k === ts.SyntaxKind.ImportSpecifier) {
     const spec = node as unknown as { isTypeOnly?: () => boolean };
     if (typeof spec.isTypeOnly === 'function') {
       try {
         if (spec.isTypeOnly()) return true;
       } catch {
-        /* defensive — fall through to the ancestry check */
+        /* defensive — fall through */
       }
     }
   }
-  // Walk up to the closest ImportClause (bounded by the enclosing
-  // ImportDeclaration). If we pass an ImportDeclaration without seeing an
-  // ImportClause we're not in an import position at all — bail out.
-  let cur: Node | undefined = node.getParent();
-  while (cur) {
-    const ck = cur.getKind();
-    if (ck === ts.SyntaxKind.ImportClause) {
-      const clause = cur as unknown as { isTypeOnly?: () => boolean };
-      if (typeof clause.isTypeOnly === 'function') {
-        try {
-          return !!clause.isTypeOnly();
-        } catch {
-          return false;
-        }
-      }
-      return false;
+  const clauseTyped = importClause as unknown as {
+    isTypeOnly?: () => boolean;
+  };
+  if (typeof clauseTyped.isTypeOnly === 'function') {
+    try {
+      if (clauseTyped.isTypeOnly()) return true;
+    } catch {
+      /* defensive — fall through */
     }
-    if (
-      ck === ts.SyntaxKind.SourceFile ||
-      ck === ts.SyntaxKind.ImportDeclaration
-    ) {
-      return false;
-    }
-    cur = cur.getParent();
   }
-  return false;
+
+  // 3. Semantic check: resolve the binding's aliased symbol and look
+  //    at its declarations. If they're exclusively type-level kinds
+  //    (Interface / TypeAlias), the import is a type. A class is
+  //    deliberately NOT included — it's both a type and a value, and
+  //    the editor highlights it as a class, not a type.
+  let symbol = node.getSymbol();
+  if (!symbol) return false;
+  const aliased = symbol.getAliasedSymbol?.();
+  if (aliased) symbol = aliased;
+  const decls = symbol.getDeclarations();
+  if (decls.length === 0) return false;
+  return decls.every((d) => {
+    const dk = d.getKind();
+    return (
+      dk === ts.SyntaxKind.InterfaceDeclaration ||
+      dk === ts.SyntaxKind.TypeAliasDeclaration
+    );
+  });
 }
 
 // A TypeReference renders as a single labelled rect carrying the type's

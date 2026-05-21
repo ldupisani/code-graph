@@ -703,13 +703,21 @@ export function PixiCanvas({ project }: CanvasProps) {
           : st.focusId;
         const visited = new Set<string>([seedFile]);
         let frontier: string[] = [seedFile];
+        // Direction picks WHICH side of the bidirectional adjacency
+        // to traverse: 'in' follows edges that POINT AT each node (so
+        // we walk toward the file's callers / importers — 'who calls
+        // this'); 'out' follows OUTGOING edges; 'both' traverses both.
+        const dir = st.focusDirection;
         for (let hop = 0; hop < st.focusHops; hop++) {
           const next: string[] = [];
           for (const node of frontier) {
             for (const kind of ['imports', 'calls', 'extends'] as const) {
               if (!st.edgeFilter[kind]) continue;
               const b = fileEdgesByKind[kind];
-              for (const set of [b.in.get(node), b.out.get(node)]) {
+              const buckets: (Set<string> | undefined)[] = [];
+              if (dir === 'both' || dir === 'in') buckets.push(b.in.get(node));
+              if (dir === 'both' || dir === 'out') buckets.push(b.out.get(node));
+              for (const set of buckets) {
                 if (!set) continue;
                 for (const n of set) {
                   if (!visited.has(n)) {
@@ -727,7 +735,7 @@ export function PixiCanvas({ project }: CanvasProps) {
       };
       const maybeRecomputeLiveFiles = (): void => {
         const st = useGraphStore.getState();
-        const key = `${st.focusId}|${st.focusHops}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}`;
+        const key = `${st.focusId}|${st.focusHops}|${st.focusDirection}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}`;
         if (key === liveFilesKey) return;
         liveFilesKey = key;
         liveFiles = computeLiveFiles();

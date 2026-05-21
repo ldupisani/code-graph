@@ -43,6 +43,15 @@ export interface GraphStore {
   // can drive it independently.
   focusId: string | null;
   focusHops: number;
+  // BFS direction for focus mode:
+  //   'both' — undirected (treat every edge both ways).
+  //   'in'   — only follow edges INTO the focused node ('who calls
+  //            this' / 'who imports this'). Answers the reverse-call
+  //            question without the user needing to know the
+  //            terminology — they just press R.
+  //   'out'  — only follow edges OUT of the focused node ('what does
+  //            this call / import').
+  focusDirection: 'both' | 'in' | 'out';
   setProject: (p: ProjectResponse | null) => void;
   refreshProject: (p: ProjectResponse) => void;
   setSelection: (id: string | null) => void;
@@ -56,6 +65,7 @@ export interface GraphStore {
     screenRect: { x: number; y: number; w: number; h: number } | null,
   ) => void;
   setFocus: (id: string | null, hops?: number) => void;
+  setFocusDirection: (d: 'both' | 'in' | 'out') => void;
 }
 
 const ALL_EDGES_ON: EdgeFilter = { imports: true, calls: true, extends: true };
@@ -71,6 +81,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
   hoveredScreenRect: null,
   focusId: null,
   focusHops: 1,
+  focusDirection: 'both',
   setProject: (project) =>
     set({
       project,
@@ -81,6 +92,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
       edgeFilter: { ...ALL_EDGES_ON },
       focusId: null,
       focusHops: 1,
+      focusDirection: 'both',
     }),
   // Used after a filesystem-driven re-walk: file-level identity is stable so
   // we keep expansion state, but AST node IDs may have shifted (sequential
@@ -133,7 +145,12 @@ export const useGraphStore = create<GraphStore>((set) => ({
       // hops only updates when explicitly passed; clears to 1 on
       // focus-clear so the next focus starts from the default.
       focusHops: hops != null ? hops : focusId ? s.focusHops : 1,
+      // Direction resets to 'both' when focus clears, so the next
+      // click doesn't inherit a confusing direction setting from
+      // before.
+      focusDirection: focusId ? s.focusDirection : 'both',
     })),
+  setFocusDirection: (focusDirection) => set({ focusDirection }),
 }));
 
 // Dev-only escape hatch: lets the chrome-devtools-mcp / browser console drive

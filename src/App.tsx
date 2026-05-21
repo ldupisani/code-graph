@@ -84,6 +84,38 @@ export function App() {
         st.setFocus(st.focusId, Math.max(1, st.focusHops - 1));
         return;
       }
+      // Direction toggles for the reverse-call query. 'R' is the
+      // VS Code 'find references' instinct (incoming edges). The
+      // arrow-like '[' / ']' cycle through both → out → in → both.
+      if (st.focusId != null) {
+        if (e.key === 'r' || e.key === 'R') {
+          e.preventDefault();
+          st.setFocusDirection(st.focusDirection === 'in' ? 'both' : 'in');
+          return;
+        }
+        if (e.key === ']') {
+          e.preventDefault();
+          const next: 'both' | 'in' | 'out' =
+            st.focusDirection === 'both'
+              ? 'out'
+              : st.focusDirection === 'out'
+                ? 'in'
+                : 'both';
+          st.setFocusDirection(next);
+          return;
+        }
+        if (e.key === '[') {
+          e.preventDefault();
+          const next: 'both' | 'in' | 'out' =
+            st.focusDirection === 'both'
+              ? 'in'
+              : st.focusDirection === 'in'
+                ? 'out'
+                : 'both';
+          st.setFocusDirection(next);
+          return;
+        }
+      }
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);

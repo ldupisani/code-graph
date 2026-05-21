@@ -60,13 +60,42 @@ export function EdgeFilterPills() {
             color: '#cfcfd6',
             paddingLeft: '0.4rem',
             borderLeft: '1px solid rgba(120, 120, 130, 0.35)',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '0.45rem',
           }}
         >
-          focus {focusHops} hop{focusHops === 1 ? '' : 's'} ·{' '}
-          <Kbd>+</Kbd>/<Kbd>-</Kbd> · <Kbd>Esc</Kbd>
+          <span>
+            focus {focusHops} hop{focusHops === 1 ? '' : 's'}
+          </span>
+          <DirectionGlyph />
+          <span>
+            <Kbd>+</Kbd>/<Kbd>-</Kbd> · <Kbd>R</Kbd> · <Kbd>Esc</Kbd>
+          </span>
         </span>
       )}
     </div>
+  );
+}
+
+function DirectionGlyph() {
+  const dir = useGraphStore((s) => s.focusDirection);
+  if (dir === 'both') return null;
+  // 'in' = arrow pointing AT the focused node (so '→ X').
+  // 'out' = arrow leaving the focused node ('X →').
+  const text = dir === 'in' ? '← in' : 'out →';
+  return (
+    <span
+      style={{
+        padding: '0.05rem 0.4rem',
+        borderRadius: 3,
+        background: 'rgba(60, 60, 70, 0.6)',
+        color: '#dcdcaa',
+        fontSize: '0.7rem',
+      }}
+    >
+      {text}
+    </span>
   );
 }
 

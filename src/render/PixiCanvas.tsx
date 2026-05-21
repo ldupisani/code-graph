@@ -82,6 +82,15 @@ const OUTLINE_BELOW = 0.5;
 // file must be expanded), so they can come back early too — otherwise
 // they're invisible until an expanded node fills the whole viewport.
 const CALLS_BELOW = 0.5;
+// Below this camera zoom every expanded file SWAPS to a "collapsed" AST
+// layout — function/method bodies that contain no named descendants are
+// laid out as a single small kind-outlined cell instead of their full
+// deeply-nested treemap. The class circle shrinks to a tight cluster of
+// "name + outlined block" methods, dramatically reducing wasted space at
+// zoomed-out detail (e.g. lightspeed's `Game`). Zoom past this threshold
+// and the file re-layouts back to full detail. Sits below SIMPLIFY_BELOW
+// so kind labels drop first (existing behaviour), then bodies collapse.
+const COLLAPSE_BELOW = 1.0;
 // Labels appear only while their container is at least the label's own box
 // (text + insets) on screen — see labelScreenBox / the gate in drawAstNode.
 
@@ -180,6 +189,41 @@ function isSignificant(node: { name: string | null; syntaxKind: string }): boole
     // badge), so it must never collapse as a single-child pass-through.
     node.syntaxKind === 'Constructor'
   );
+}
+
+// AST kinds whose direct child `Block` is the body of a function-like.
+// The "collapsed" layout (cameraScale < COLLAPSE_BELOW) replaces that
+// body's interior with a single kind-outlined cell when nothing inside
+// it carries a name — gives Game-style classes a useful overview at low
+// zoom without losing the methods themselves.
+const FUNCTION_LIKE_KINDS = new Set([
+  'FunctionDeclaration',
+  'FunctionExpression',
+  'ArrowFunction',
+  'MethodDeclaration',
+  'Constructor',
+  'GetAccessor',
+  'SetAccessor',
+]);
+
+// Predicate handed to `layoutAst` when building the "collapsed" tree:
+// any Block whose parent is a function-like (method / function /
+// constructor / arrow / accessor) is collapsed to a single
+// kind-outlined cell. We tried gating on "no named descendants" first,
+// but the AST extractor synthesises a `name` for every CallExpression
+// (e.g. `call this.players.delete`) so almost every method body has
+// "named" descendants — the rule collapsed almost nothing. The
+// unconditional version is also closer to what the user asked for:
+// at coarse zoom every function body shows as a placeholder; zoom in
+// past COLLAPSE_BELOW to read individual statements.
+function makeCollapseChildren(
+  _ast: FileAstResponse,
+): (
+  n: { name: string | null; syntaxKind: string; id: string },
+  parentKind: string,
+) => boolean {
+  return (n, parentKind) =>
+    n.syntaxKind === 'Block' && FUNCTION_LIKE_KINDS.has(parentKind);
 }
 
 // Label text colored like the code editor (Monaco `vs-dark` / Dark+ family,
@@ -356,7 +400,12 @@ export function PixiCanvas({ project }: CanvasProps) {
             const n = layout.byId.get(id);
             return n ? { w: n.width, h: n.height, x: n.x, y: n.y } : null;
           },
-          getAstForce: (id: string) => astForceByFileId.get(id),
+          // Active-mode lookups (layouts now live keyed by fileId in
+          // `layoutsByFileId`; activeForce/activeTree pick the entry
+          // matching the current `astDetailLevel`).
+          getAstForce: (id: string) => activeForce(id),
+          getAstTree: (id: string) => activeTree(id),
+          getDetailLevel: () => astDetailLevel,
           ensureExpandedLayout,
           applyExpansionToSim: () => applyExpansionToSim(),
           getCameraScale: () => world.scale.x,
@@ -390,8 +439,10 @@ export function PixiCanvas({ project }: CanvasProps) {
       // drawn outside (above) the boundary, not inside it.
       const FILE_RIM = 10;
 
-      // Per-file AST treemap layouts, populated when a file is expanded.
-      const subtreeByFileId = new Map<string, TreemapLayout>();
+      // Per-file AST layouts now live in `layoutsByFileId` (declared
+      // below) — keyed by fileId and holding BOTH the `full` and
+      // `collapsed` modes. Use `activeTree(fileId)` / `activeForce(fileId)`
+      // to read the entry for the currently active LOD mode.
       // In-flight AST fetches we track to avoid double-firing on rapid clicks.
       const fetching = new Set<string>();
 
@@ -426,45 +477,33 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       // ----- expansion handling -----
 
-      // Per-file fractal force-graph layout for the AST's top-level
-      // statements (see astForce.ts). Settled once per (file, AST); built
-      // lazily by ensureExpandedLayout and consumed by drawSubtree.
-      const astForceByFileId = new Map<string, AstForceLayout>();
-      // Exact-fit sizing is a few treemap passes — memoize per (file, AST)
-      // so expand/collapse toggles don't recompute. Keyed on the AST object
-      // identity so a file-watcher AST update invalidates it.
-      const expandedSizeCache = new Map<
-        string,
-        { ast: FileAstResponse; size: { w: number; h: number } }
-      >();
-
-      // Idempotent builder: produces (and caches) the TreemapLayout AND the
-      // per-file fractal force layout, plus the squared file-box size that
-      // both inform. Returns null if the AST isn't loaded yet (file just
-      // expanded and we're awaiting the fetch).
-      //
-      // The treemap is laid out at origin (0, 0) — its absolute rect
-      // coordinates only matter for *relative* descendant offsets within
-      // each top-level subtree. drawSubtree translates each subtree to its
-      // force-decided position.
-      function ensureExpandedLayout(fileId: string): {
+      // Each expanded file owns TWO layouts — `full` (no collapse) and
+      // `collapsed` (function bodies without named descendants reduced
+      // to a single kind-outlined cell; see makeCollapseChildren above).
+      // Both are built eagerly on first cache miss; the active one is
+      // chosen at draw time by `astDetailLevel`, which the ticker flips
+      // when cameraScale crosses COLLAPSE_BELOW.
+      type LodMode = 'full' | 'collapsed';
+      interface PerModeLayout {
         tree: TreemapLayout;
         force: AstForceLayout;
         size: { w: number; h: number };
-      } | null {
-        const ast = useGraphStore.getState().asts.get(fileId);
-        if (!ast) return null;
-        const cachedSize = expandedSizeCache.get(fileId);
-        const cachedTree = subtreeByFileId.get(fileId);
-        const cachedForce = astForceByFileId.get(fileId);
-        if (
-          cachedSize &&
-          cachedSize.ast === ast &&
-          cachedTree &&
-          cachedForce
-        ) {
-          return { tree: cachedTree, force: cachedForce, size: cachedSize.size };
-        }
+      }
+      const layoutsByFileId = new Map<
+        string,
+        { ast: FileAstResponse; full: PerModeLayout; collapsed: PerModeLayout }
+      >();
+
+      // Tracks which mode is currently being rendered. Default for the
+      // very first frame derives from `world.scale.x`; the ticker keeps
+      // it in sync with the camera afterwards.
+      let astDetailLevel: LodMode =
+        world.scale.x < COLLAPSE_BELOW ? 'collapsed' : 'full';
+
+      function buildPerModeLayout(
+        ast: FileAstResponse,
+        mode: LodMode,
+      ): PerModeLayout {
         const tree = layoutAst(ast, {
           originX: 0,
           originY: 0,
@@ -477,24 +516,26 @@ export function PixiCanvas({ project }: CanvasProps) {
           reserveBand: (n) => n.syntaxKind === 'Constructor',
           rowGroup: (n) =>
             n.syntaxKind === 'HeritageClause' ? 'extends' : 'n',
-          // Exactly the box the renderer's LOD gate checks below, so a cell
-          // sized here shows its label at 1:1 and nothing larger.
+          // Exactly the box the renderer's LOD gate checks below, so a
+          // cell sized here shows its label at 1:1 and nothing larger.
           measure: labelScreenBox,
+          // Only the COLLAPSED tree uses the body-collapse predicate.
+          // The FULL tree behaves exactly as before (no collapse).
+          collapseChildren:
+            mode === 'collapsed' ? makeCollapseChildren(ast) : undefined,
         });
-        subtreeByFileId.set(fileId, tree);
         const force = buildAstForceLayout({
-          fileId,
+          fileId: ast.fileId,
           ast,
           tree,
           semanticEdges: project.semanticEdges,
         });
-        astForceByFileId.set(fileId, force);
         // File is drawn as a circle of (cluster-radius + FILE_RIM). Its
-        // SimFileNode footprint is the bounding *square* of that circle so
-        // the existing edge-port logic — which probes top/bottom/left/right
-        // midpoints of the hit rect — naturally lands on the circle
-        // boundary. Width === height ⇒ collisionRadius in layout.ts uses
-        // r = w/2 + pad (see the expanded branch there).
+        // SimFileNode footprint is the bounding *square* of that circle
+        // so the existing edge-port logic — which probes top/bottom/
+        // left/right midpoints of the hit rect — naturally lands on the
+        // circle boundary. Width === height ⇒ collisionRadius in
+        // layout.ts uses r = w/2 + pad (see the expanded branch there).
         const minSide = Math.max(EXPANDED_MIN.w, EXPANDED_MIN.h);
         const maxSide = Math.min(EXPANDED_MAX.w, EXPANDED_MAX.h);
         const diameter = Math.min(
@@ -502,12 +543,39 @@ export function PixiCanvas({ project }: CanvasProps) {
           Math.max(minSide, Math.ceil(2 * (force.bounds.radius + FILE_RIM))),
         );
         const size = { w: diameter, h: diameter };
-        expandedSizeCache.set(fileId, { ast, size });
         return { tree, force, size };
+      }
+
+      // Idempotent builder for the per-file layouts. Returns the entry
+      // for the currently active mode, or null when the file's AST
+      // hasn't been fetched yet.
+      function ensureExpandedLayout(fileId: string): PerModeLayout | null {
+        const ast = useGraphStore.getState().asts.get(fileId);
+        if (!ast) return null;
+        const cached = layoutsByFileId.get(fileId);
+        if (cached && cached.ast === ast) {
+          return cached[astDetailLevel];
+        }
+        // First build (or AST-identity changed via file watcher) — build
+        // BOTH modes up front so a subsequent zoom transition just looks
+        // up the other entry rather than recomputing the layout.
+        const full = buildPerModeLayout(ast, 'full');
+        const collapsed = buildPerModeLayout(ast, 'collapsed');
+        layoutsByFileId.set(fileId, { ast, full, collapsed });
+        return astDetailLevel === 'full' ? full : collapsed;
       }
 
       function expandedSizeFor(fileId: string): { w: number; h: number } | null {
         return ensureExpandedLayout(fileId)?.size ?? null;
+      }
+
+      // Shorthand active-mode accessors used throughout draw + edge
+      // anchoring code.
+      function activeTree(fileId: string): TreemapLayout | undefined {
+        return layoutsByFileId.get(fileId)?.[astDetailLevel].tree;
+      }
+      function activeForce(fileId: string): AstForceLayout | undefined {
+        return layoutsByFileId.get(fileId)?.[astDetailLevel].force;
       }
 
       function applyExpansionToSim() {
@@ -523,9 +591,7 @@ export function PixiCanvas({ project }: CanvasProps) {
       }
 
       function dropSubtreeLayout(fileId: string): void {
-        subtreeByFileId.delete(fileId);
-        astForceByFileId.delete(fileId);
-        expandedSizeCache.delete(fileId);
+        layoutsByFileId.delete(fileId);
       }
 
       // ----- per-frame draw -----
@@ -547,7 +613,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         drawEdges(
           layout,
           project.edges,
-          astForceByFileId,
+          activeForce,
           worldGfx,
           cameraScale,
           visibleSemanticPairs,
@@ -568,7 +634,7 @@ export function PixiCanvas({ project }: CanvasProps) {
           project.semanticEdges,
           semanticEdgeGfx,
           visibleById,
-          subtreeByFileId,
+          activeTree,
           cameraScale,
           selection,
           state.expandedFiles,
@@ -684,10 +750,10 @@ export function PixiCanvas({ project }: CanvasProps) {
         putName(y);
 
         if (expanded) {
-          let tree = subtreeByFileId.get(sim.id);
+          let tree = activeTree(sim.id);
           if (!tree) {
             buildSubtreeLayout(sim.id);
-            tree = subtreeByFileId.get(sim.id);
+            tree = activeTree(sim.id);
           }
           if (tree) drawSubtree(tree, x, y, sim.id, selection);
         }
@@ -706,7 +772,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         // because drawAstNode uses (baseX + node.rect.x, baseY + node.rect.y)
         // and we adjust baseX/baseY per top-level by the delta from its
         // treemap position to its sim-decided position.
-        const force = astForceByFileId.get(fileId);
+        const force = activeForce(fileId);
         if (!force) return;
         const sim = layout.byId.get(fileId);
         if (!sim) return;
@@ -865,10 +931,39 @@ export function PixiCanvas({ project }: CanvasProps) {
         // circle (like a file label), and recurse into each member with
         // a per-member baseX/baseY adjustment so it draws at its
         // force-decided spot relative to the circle's centre.
-        const force = astForceByFileId.get(fileId);
+        const force = activeForce(fileId);
         const container = force?.containers.get(node.id);
         if (container) {
           drawAstContainer(node, x, y, container, fileId, tree, selection);
+          return;
+        }
+
+        // Collapsed-leaf path: layoutAst's `collapseChildren` predicate
+        // fired on this node (so its children were dropped at layout
+        // time). Paint just the parent kind's outline — no label band,
+        // no fill, no recursion. The cell stays selectable and the
+        // user reads "this is a function body, source-code panel for
+        // detail" from the magenta outline (Block).
+        if (node.collapsed) {
+          const stroke = KIND_OUTLINE[node.syntaxKind] ?? COLORS.astBorder;
+          const isSelectedLeaf = selection === node.id;
+          worldGfx
+            .rect(x, y, node.rect.w, node.rect.h)
+            .stroke({
+              color: isSelectedLeaf ? COLORS.astSelected : stroke,
+              width: 1 / cameraScale,
+              alpha: 1,
+            });
+          pushRect({
+            id: node.id,
+            fileId,
+            kind: 'ast',
+            x,
+            y,
+            w: node.rect.w,
+            h: node.rect.h,
+            area: node.rect.w * node.rect.h,
+          });
           return;
         }
 
@@ -1288,7 +1383,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         } else {
           const r =
             visibleById.get(followId) ??
-            findVisibleAnchor(followId, visibleById, subtreeByFileId);
+            findVisibleAnchor(followId, visibleById, activeTree);
           if (!r) return; // not resolvable yet — try again next frame
           cx = r.x + r.w / 2;
           cy = r.y + r.h / 2;
@@ -1308,6 +1403,18 @@ export function PixiCanvas({ project }: CanvasProps) {
       }
 
       const tickerCb = () => {
+        // Zoom-driven LOD swap: when cameraScale crosses COLLAPSE_BELOW
+        // we flip the active layout mode for every expanded file and
+        // reheat the file-level sim (so SimFileNode.width/height
+        // updates ripple through collide + link). The actual TreemapLayout
+        // / AstForceLayout entries are already cached in `layoutsByFileId`
+        // — we just toggle which one drawSubtree etc. read from.
+        const desired: LodMode =
+          world.scale.x < COLLAPSE_BELOW ? 'collapsed' : 'full';
+        if (desired !== astDetailLevel) {
+          astDetailLevel = desired;
+          applyExpansionToSim();
+        }
         draw();
         updateFollow();
       };
@@ -1512,7 +1619,7 @@ function cubicPath(
 function drawEdges(
   layout: FileLayoutResult,
   edges: readonly ImportEdge[],
-  astForceByFileId: Map<string, AstForceLayout>,
+  forceLookup: (fileId: string) => AstForceLayout | undefined,
   gfx: Graphics,
   cameraScale: number,
   visibleSemanticPairs: ReadonlySet<string>,
@@ -1539,7 +1646,7 @@ function drawEdges(
     let sx = s.x;
     let sy = s.y;
     if (s.expanded && edge.fromAstNodeId) {
-      const force = astForceByFileId.get(edge.fromId);
+      const force = forceLookup(edge.fromId);
       const sn = force?.byId.get(edge.fromAstNodeId);
       if (force && sn) {
         sx = s.x - force.bounds.cx + sn.x;
@@ -1736,7 +1843,7 @@ function drawSemanticEdges(
   edges: readonly SemanticEdge[],
   gfx: Graphics,
   visibleById: Map<string, HitRect>,
-  subtreeByFileId: Map<string, TreemapLayout>,
+  treeLookup: (fileId: string) => TreemapLayout | undefined,
   cameraScale: number,
   selection: string | null,
   expandedFiles: ReadonlySet<string>,
@@ -1780,8 +1887,8 @@ function drawSemanticEdges(
     ) {
       continue;
     }
-    const from = findVisibleAnchor(edge.fromId, visibleById, subtreeByFileId);
-    const to = findVisibleAnchor(edge.toId, visibleById, subtreeByFileId);
+    const from = findVisibleAnchor(edge.fromId, visibleById, treeLookup);
+    const to = findVisibleAnchor(edge.toId, visibleById, treeLookup);
     if (!from || !to || from.id === to.id) continue;
     // Call links are dimmed to 50% until you select one of their ends, then
     // shown at full strength. Match the raw endpoints and the resolved
@@ -1849,7 +1956,7 @@ function drawSemanticEdges(
         const v = findVisibleAnchor(
           edge.viaImportNodeId,
           visibleById,
-          subtreeByFileId,
+          treeLookup,
         );
         // Only honor the via-binding when it resolves to something INSIDE
         // the source file's AST (not the fallback file rect). If LOD has
@@ -2010,7 +2117,7 @@ function drawSemanticEdges(
 function findVisibleAnchor(
   id: string,
   visibleById: Map<string, HitRect>,
-  subtreeByFileId: Map<string, TreemapLayout>,
+  treeLookup: (fileId: string) => TreemapLayout | undefined,
 ): HitRect | null {
   const direct = visibleById.get(id);
   if (direct) return direct;
@@ -2020,7 +2127,7 @@ function findVisibleAnchor(
     return visibleById.get(id) ?? null;
   }
   const fileId = id.slice(0, hashIdx);
-  const tree = subtreeByFileId.get(fileId);
+  const tree = treeLookup(fileId);
   if (tree) {
     let cur: string | null = id;
     // Walk the AST parent chain looking for a visible (LOD-survived) ancestor.

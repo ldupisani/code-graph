@@ -29,6 +29,13 @@ export interface TreemapNode {
   op?: string;
   opAnchor?: { x: number; y: number };
   labelChip?: Rect;
+  // True when this node was forced to a placeholder leaf by the layout
+  // (children dropped from the tree). The renderer paints just the
+  // kind outline — no label, no recursion. Today this is set only for
+  // function/method bodies that meet `collapseChildren`'s predicate
+  // (see `AstLayoutOpts.collapseChildren`), used to give a coarse-zoom
+  // overview that omits the body's interior detail.
+  collapsed?: boolean;
 }
 
 export interface TreemapLayout {
@@ -53,6 +60,11 @@ const GAP = 4;
 // this content width. A single child wider than this still gets its own row
 // (a node is never split). Tune for wider/narrower expanded files.
 const DEFAULT_WRAP_WIDTH = 480;
+// Footprint of a `collapsed` placeholder leaf (see TreemapNode.collapsed):
+// a small kind-outlined cell with no label, used to represent a function
+// body whose interior detail was dropped at layout time.
+const COLLAPSED_LEAF_W = 24;
+const COLLAPSED_LEAF_H = 16;
 
 export interface AstLayoutOpts {
   originX: number;
@@ -83,6 +95,22 @@ export interface AstLayoutOpts {
   // LOD gate checks, so a node is exactly big enough for its own label.
   measure: (text: string) => { w: number; h: number };
   wrapWidth?: number;
+  // Optional predicate: when truthy for a node, the node's children are
+  // DROPPED from the layout entirely and the node itself is sized as a
+  // small kind-outlined placeholder leaf (TreemapNode.collapsed = true).
+  // The renderer then paints just the outline so the parent stays
+  // identifiable but the interior detail is omitted.
+  //
+  // Used by the zoom-driven detail switch: a "collapsed" layout is built
+  // with `collapseChildren = (n, parentKind) => isFunctionBody(n,
+  // parentKind) && !hasNamedDescendant(n)` so function bodies without
+  // any nested named entities reduce to a single magenta block,
+  // dramatically shrinking the file circle at low zoom. The "full"
+  // layout uses no `collapseChildren` and so behaves exactly as before.
+  collapseChildren?: (
+    n: { name: string | null; syntaxKind: string; id: string },
+    parentKind: string,
+  ) => boolean;
 }
 
 interface Sized {
@@ -98,6 +126,10 @@ interface Sized {
   op?: string;
   opRel?: { x: number; y: number };
   labelChip?: Rect;
+  // Set when `opts.collapseChildren(node)` fired. The node was sized as
+  // a small kind-outlined leaf and its actual children are not in
+  // `kids`. Flag flows to TreemapNode.collapsed during assign.
+  collapsed?: boolean;
 }
 
 // Lay every AstNode out as a nested box sized bottom-up to its own label and
@@ -136,6 +168,7 @@ export function layoutAst(
   const pruneEmpty = opts.pruneEmpty ?? (() => false);
   const prune = opts.prune ?? (() => false);
   const reserveBand = opts.reserveBand ?? (() => false);
+  const collapseChildren = opts.collapseChildren;
   const isPruned = (n: AstNode): boolean =>
     prune(n) || (pruneEmpty(n) && (kidsOf.get(n.id)?.length ?? 0) === 0);
   const collapse = (n: AstNode): AstNode => {
@@ -215,7 +248,7 @@ export function layoutAst(
       };
     }
 
-    const sizedKids = kids.map(size);
+    const sizedKids = kids.map((k) => sizeOrCollapse(k, node.syntaxKind));
     // Wrapped-row packing, source order preserved.
     const placed: { sized: Sized; x: number; y: number }[] = [];
     let rowX = 0;
@@ -252,6 +285,31 @@ export function layoutAst(
     };
   };
 
+  // Wrapper consulted by `size`'s wrapped-row pass before recursing into
+  // each child. When `opts.collapseChildren(node, parentKind)` fires the
+  // child sizes as a small kind-outlined leaf (no recursion, kids
+  // dropped from the layout entirely). Used by the zoom-driven detail
+  // switch to shrink function bodies that contain no named descendants.
+  const sizeOrCollapse = (n: AstNode, parentKind: string): Sized => {
+    if (
+      collapseChildren &&
+      collapseChildren(
+        { name: n.name, syntaxKind: n.syntaxKind, id: n.id },
+        parentKind,
+      )
+    ) {
+      return {
+        node: n,
+        labelH: 0,
+        w: COLLAPSED_LEAF_W,
+        h: COLLAPSED_LEAF_H,
+        kids: [],
+        collapsed: true,
+      };
+    }
+    return size(n);
+  };
+
   const rootSized = size(rootAst);
 
   // ---- Phase 2: translate the sized tree to absolute rects --------------
@@ -272,6 +330,7 @@ export function layoutAst(
       extendsName: s.node.extendsName,
       rect: { x, y, w: s.w, h: s.h },
       depth,
+      collapsed: s.collapsed,
     };
     if (s.op && s.opRel) {
       tn.op = s.op;

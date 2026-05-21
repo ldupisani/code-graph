@@ -642,16 +642,6 @@ export function PixiCanvas({ project }: CanvasProps) {
       const worldGfx = new Graphics();
       world.addChild(worldGfx);
 
-      // Focus-mode dimming overlay. Sits BETWEEN worldGfx and
-      // labelLayer so it darkens directory hulls + file icons +
-      // edges, but NOT the labels above it. Keeping labels bright
-      // means file names and directory names stay readable across
-      // the whole scene even when their underlying content is
-      // dimmed — exactly the 'always know where you are' affordance
-      // a code map needs, even in focus mode.
-      const dimGfx = new Graphics();
-      world.addChild(dimGfx);
-
       const labelLayer = new Container();
       world.addChild(labelLayer);
 
@@ -1393,7 +1383,6 @@ export function PixiCanvas({ project }: CanvasProps) {
 
         worldGfx.clear();
         directoryGfx.clear();
-        dimGfx.clear();
         semanticEdgeGfx.clear();
         semanticEdgeOverlayGfx.clear();
         hitRects.length = 0;
@@ -1483,37 +1472,19 @@ export function PixiCanvas({ project }: CanvasProps) {
         //    precise anchors. Support files (.test / .stories /
         //    .spec / __tests__ / __mocks__) are skipped when
         //    state.showSupportFiles is off.
+        // Per-file dim factor for focus mode. Non-live files (outside
+        // the user's focus neighbourhood) draw their icon / circle /
+        // border at 0.22 alpha — quiet, but still visibly present.
+        // Path-traced files override and stay bright. Labels are
+        // drawn through labelPool on a layer that ignores this
+        // multiplier, so file + directory names stay readable.
         for (const sim of layout.nodes) {
           if (hideSupport && supportFileIds.has(sim.id)) continue;
-          drawFile(sim, selection);
-        }
-
-        // 2b. Focus-mode dimming.
-        if (liveFiles) {
-          for (const sim of layout.nodes) {
-            if (liveFiles.has(sim.id)) continue;
-            if (pathFileSet.has(sim.id)) continue;
-            if (sim.expanded) {
-              // Expanded file is drawn as a CIRCLE (drawFile); match
-              // that shape so the dim overlay doesn't extend past the
-              // file's actual boundary into the bg. A bounding-box
-              // rect would leave four dark corner triangles outside
-              // the circle that read as "extra box".
-              dimGfx
-                .circle(sim.x, sim.y, sim.width / 2)
-                .fill({ color: COLORS.bg, alpha: 0.78 });
-            } else {
-              // Collapsed file: the visible content is the 16×20
-              // screen-constant page icon (see drawFile). Mirror the
-              // same /cameraScale conversion so the dim rect tracks
-              // the icon at any zoom.
-              const w = 16 / cameraScale;
-              const h = 20 / cameraScale;
-              dimGfx
-                .rect(sim.x - w / 2, sim.y - h / 2, w, h)
-                .fill({ color: COLORS.bg, alpha: 0.78 });
-            }
-          }
+          const dimmed =
+            liveFiles != null &&
+            !liveFiles.has(sim.id) &&
+            !pathFileSet.has(sim.id);
+          drawFile(sim, selection, dimmed ? 0.22 : 1);
         }
         // 2c. Path overlay: thin yellow outline around every file
         //     in the traced path.
@@ -1629,7 +1600,16 @@ export function PixiCanvas({ project }: CanvasProps) {
         );
       }
 
-      function drawFile(sim: SimFileNode, selection: string | null): void {
+      function drawFile(
+        sim: SimFileNode,
+        selection: string | null,
+        // Alpha multiplier applied to every fill/stroke emitted by
+        // this function. Used by focus-mode dimming — non-live
+        // files draw at ~0.22, everything else at 1. Labels are NOT
+        // multiplied here; they go through labelPool with their own
+        // colour and stay readable.
+        dimAlpha: number,
+      ): void {
         const x = sim.x - sim.width / 2;
         const y = sim.y - sim.height / 2;
         const expanded = useGraphStore.getState().expandedFiles.has(sim.id);
@@ -1694,8 +1674,8 @@ export function PixiCanvas({ project }: CanvasProps) {
               ix + iw, iy + ih,
               ix, iy + ih,
             ])
-            .fill({ color: body })
-            .stroke({ color: line, width: 1 / cameraScale });
+            .fill({ color: body, alpha: 1 * dimAlpha })
+            .stroke({ color: line, width: 1 / cameraScale, alpha: 1 * dimAlpha });
           // The folded corner, slightly distinct so it reads as a page.
           worldGfx
             .poly([
@@ -1703,7 +1683,7 @@ export function PixiCanvas({ project }: CanvasProps) {
               ix + iw, iy + fold,
               ix + iw - fold, iy + fold,
             ])
-            .fill({ color: line, alpha: 0.6 });
+            .fill({ color: line, alpha: 0.6 * dimAlpha });
           // Anchor to the ICON's bounds, not the (invisible) sim footprint —
           // otherwise connectors terminate in empty space far from the icon,
           // and the click target wouldn't match what's drawn.
@@ -1727,11 +1707,15 @@ export function PixiCanvas({ project }: CanvasProps) {
         const fileRadius = sim.width / 2;
         worldGfx
           .circle(sim.x, sim.y, fileRadius)
-          .fill({ color: COLORS.fileExpanded, alpha: 0.7 });
+          .fill({ color: COLORS.fileExpanded, alpha: 0.7 * dimAlpha });
         if (isSelected) {
           worldGfx
             .circle(sim.x, sim.y, fileRadius)
-            .stroke({ color: COLORS.fileSelected, width: FILE_RIM / 2 });
+            .stroke({
+              color: COLORS.fileSelected,
+              width: FILE_RIM / 2,
+              alpha: 1 * dimAlpha,
+            });
         }
 
         // Hit rect is the bounding square of the circle. Two reasons:

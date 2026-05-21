@@ -184,6 +184,13 @@ function clusterDirAt(relativePath: string, depth: number): string {
 //
 // Sized by sqrt(|a| * |b|): larger subsystems push harder, so a
 // 100-file directory carves more space than a 5-file one.
+// Softening: at distances closer than SUBSYSTEM_SOFTEN the force
+// stops growing (inverse-square would diverge). Without this, the
+// initial-seeded ring of files (d ≈ 80) experiences impulses that
+// fling everything to far coordinates during the 50-tick warm-up.
+const SUBSYSTEM_SOFTEN = 60;
+const SUBSYSTEM_SOFTEN_SQ = SUBSYSTEM_SOFTEN * SUBSYSTEM_SOFTEN;
+
 function directorySubsystemRepulsion(strength: number, depth: number) {
     let members = new Map<string, SimFileNode[]>();
     function force(alpha: number): void {
@@ -204,16 +211,30 @@ function directorySubsystemRepulsion(strength: number, depth: number) {
                 const b = groups[j];
                 const dx = b.cx - a.cx;
                 const dy = b.cy - a.cy;
-                // +1 floor prevents singularities when two centroids
-                // momentarily coincide; we want a finite "push apart"
-                // even from zero distance.
-                const d2 = dx * dx + dy * dy + 1;
+                const rawD2 = dx * dx + dy * dy;
+                // Floor the squared distance to SUBSYSTEM_SOFTEN² so
+                // the inverse-square stays bounded at close range.
+                const d2 = Math.max(SUBSYSTEM_SOFTEN_SQ, rawD2);
                 const d = Math.sqrt(d2);
                 const weight = Math.sqrt(a.mems.length * b.mems.length);
-                // Inverse-square magnitude.
                 const f = (strength * alpha * weight) / d2;
-                const fx = (dx / d) * f;
-                const fy = (dy / d) * f;
+                // Direction: away from a → b. When the two centroids
+                // coincide, use an arbitrary unit vector so we still
+                // push them apart (rather than 0/0 stall).
+                let nx: number;
+                let ny: number;
+                if (d > 0.001) {
+                    nx = dx / d;
+                    ny = dy / d;
+                } else {
+                    // Use the pair-index as a deterministic
+                    // tie-breaker so the same coincidence always
+                    // resolves in the same direction.
+                    nx = ((i + j) & 1) === 0 ? 1 : -1;
+                    ny = 0;
+                }
+                const fx = nx * f;
+                const fy = ny * f;
                 for (const m of a.mems) {
                     m.vx = (m.vx ?? 0) - fx;
                     m.vy = (m.vy ?? 0) - fy;
@@ -406,10 +427,14 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
         // Inter-subsystem repulsion at depth 2 ('src/components' vs
         // 'src/partials' vs 'src/libs', etc.). Inverse-square so
         // dense regions where many subsystems crowd together push
-        // apart harder than already-spread ones. Held in check by
-        // forceCollide / link / charge so it spreads things without
-        // letting individual files fly off.
-        .force("directorySubsystemRepulsion", directorySubsystemRepulsion(8000, 2))
+        // apart harder than already-spread ones. Strength tuned to
+        // be in the same ballpark as forceManyBody's per-pair
+        // contribution — multiplied by the cluster-weight factor,
+        // it ends up giving recognisable inter-subsystem spread
+        // without flinging files off the canvas during the warm-up.
+        // (Softening cap inside directorySubsystemRepulsion stops
+        //  close-range forces from diverging at startup.)
+        .force("directorySubsystemRepulsion", directorySubsystemRepulsion(150, 2))
         .force("clearance", linkClearanceForce(links, LINK_CLEARANCE_STRENGTH))
         .alpha(1)
         .alphaDecay(0.035);

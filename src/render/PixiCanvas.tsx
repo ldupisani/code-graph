@@ -375,6 +375,32 @@ export function PixiCanvas({ project }: CanvasProps) {
           ensureExpandedLayout,
           applyExpansionToSim: () => applyExpansionToSim(),
           getCameraScale: () => world.scale.x,
+          // Headless helper: drive a click via the production
+          // `handleClick` path (including the animation hook in the
+          // Block-toggle branch) without having to dispatch synthetic
+          // canvas pointer events. Pass an AST node id; if found in
+          // the active layout, builds the HitRect handleClick expects.
+          simulateClick: (astNodeId: string) => {
+            const fileId = astNodeId.includes('#')
+              ? astNodeId.slice(0, astNodeId.lastIndexOf('#'))
+              : astNodeId;
+            const tree = activeTree(fileId);
+            const tn = tree?.byId.get(astNodeId);
+            if (!tn) return false;
+            handleClick({
+              id: astNodeId,
+              fileId,
+              kind: 'ast',
+              x: tn.rect.x,
+              y: tn.rect.y,
+              w: tn.rect.w,
+              h: tn.rect.h,
+              area: tn.rect.w * tn.rect.h,
+            });
+            return true;
+          },
+          // Read the per-file circle-grow animation state for tests.
+          getFileAnim: (fileId: string) => fileAnims.get(fileId),
         };
       }
       // Restore camera if we're rebuilding the same project (filesystem
@@ -592,6 +618,44 @@ export function PixiCanvas({ project }: CanvasProps) {
       const fileAnims = new Map<string, FileAnim>();
       const FILE_ANIM_DURATION = 250;
 
+      // Per-Block rect animation. When the user toggles a Block, we
+      // snapshot its WORLD rect (the magenta cell on screen) BEFORE
+      // the toggle. After the toggle, the layout rebuilds and the
+      // Block lands at a new rect — either a small collapsed cell or
+      // a larger expanded body region. We render the Block at a rect
+      // LERPED from prev to current over `duration` ms, suppressing
+      // its own normal rendering AND its children during the lerp.
+      // At duration end the entry is dropped and the regular drawing
+      // takes over, so children pop into the now-grown rect.
+      interface BlockAnim {
+        startedAt: number;
+        duration: number;
+        // World-coord rect snapshot from before the toggle.
+        prevX: number;
+        prevY: number;
+        prevW: number;
+        prevH: number;
+      }
+      const blockAnims = new Map<string, BlockAnim>();
+      const BLOCK_ANIM_DURATION = 250;
+
+      function startBlockAnim(
+        astId: string,
+        prevX: number,
+        prevY: number,
+        prevW: number,
+        prevH: number,
+      ) {
+        blockAnims.set(astId, {
+          startedAt: performance.now(),
+          duration: BLOCK_ANIM_DURATION,
+          prevX,
+          prevY,
+          prevW,
+          prevH,
+        });
+      }
+
       function startFileAnim(fileId: string, prevSize: number, targetSize: number) {
         if (prevSize === targetSize) return;
         fileAnims.set(fileId, {
@@ -617,6 +681,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         const eased = 1 - Math.pow(1 - t, 3);
         return a.prevSize + (actualSize - a.prevSize) * eased;
       }
+
 
       function buildSubtreeLayout(fileId: string): void {
         ensureExpandedLayout(fileId);
@@ -960,6 +1025,48 @@ export function PixiCanvas({ project }: CanvasProps) {
         const hOnScreen = node.rect.h * cameraScale;
         const minScreen = Math.min(wOnScreen, hOnScreen);
         if (minScreen < CULL_PX) return;
+
+        // Block animation: when the user just toggled this Block,
+        // render a kind-outlined rect that lerps from the pre-toggle
+        // world rect to its current target rect over ~250 ms — and
+        // skip the normal rendering (rect/label/children) until the
+        // lerp completes. This is what makes the user see a block
+        // GROWING or SHRINKING rather than popping. Once the duration
+        // is up the entry is dropped and the regular drawing kicks in,
+        // so children appear inside the now-final-sized cell.
+        const bAnim = blockAnims.get(node.id);
+        if (bAnim) {
+          const elapsed = performance.now() - bAnim.startedAt;
+          if (elapsed < bAnim.duration) {
+            const t = elapsed / bAnim.duration;
+            const eased = 1 - Math.pow(1 - t, 3);
+            const lx = bAnim.prevX + (x - bAnim.prevX) * eased;
+            const ly = bAnim.prevY + (y - bAnim.prevY) * eased;
+            const lw = bAnim.prevW + (node.rect.w - bAnim.prevW) * eased;
+            const lh = bAnim.prevH + (node.rect.h - bAnim.prevH) * eased;
+            const stroke = KIND_OUTLINE[node.syntaxKind] ?? COLORS.astBorder;
+            worldGfx
+              .rect(lx, ly, lw, lh)
+              .fill({ color: stroke, alpha: 0.08 })
+              .stroke({
+                color: stroke,
+                width: 1 / cameraScale,
+                alpha: 1,
+              });
+            pushRect({
+              id: node.id,
+              fileId,
+              kind: 'ast',
+              x: lx,
+              y: ly,
+              w: lw,
+              h: lh,
+              area: lw * lh,
+            });
+            return;
+          }
+          blockAnims.delete(node.id);
+        }
 
         // Member-container path: classes / interfaces whose members were
         // arranged by their own fractal force layout (see astForce.ts's
@@ -1553,12 +1660,22 @@ export function PixiCanvas({ project }: CanvasProps) {
         const tree = activeTree(target.fileId);
         const tn = tree?.byId.get(target.id);
         if (tn && tn.syntaxKind === 'Block') {
+          // Snapshot the Block's CURRENT world rect (the magenta cell
+          // the user just clicked) before the toggle — drawAstNode then
+          // lerps from this snapshot toward the post-toggle rect over
+          // ~250 ms, so the user sees the Block visibly grow/shrink
+          // instead of popping into its new shape.
+          const prevX = target.x;
+          const prevY = target.y;
+          const prevW = target.w;
+          const prevH = target.h;
           const fileSim = layout.byId.get(target.fileId);
           const prevSize = fileSim?.width ?? 0;
           state.toggleAstNode(target.id);
           applyExpansionToSim();
           const targetSize = fileSim?.width ?? prevSize;
           startFileAnim(target.fileId, prevSize, targetSize);
+          startBlockAnim(target.id, prevX, prevY, prevW, prevH);
         }
       }
 

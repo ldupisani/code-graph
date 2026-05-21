@@ -453,10 +453,19 @@ export function PixiCanvas({ project }: CanvasProps) {
         visibleById.set(r.id, r);
       };
 
-      // When a node is selected the camera eases to keep it screen-centered
-      // (tracking it through any expand re-layout), until it's centered or
-      // the user takes manual camera control. null = not following.
+      // When a node is selected the camera eases toward a fixed world
+      // point so it lands centered on what the user just clicked, even
+      // if the sim is still settling. `followStartAt` defers the start
+      // (used for Block toggles: we wait until the Block-grow
+      // animation completes before panning, otherwise the camera
+      // chases a target whose own rect is being lerped). null = not
+      // following. `followAt` is captured on the first frame the
+      // follow becomes active, so the camera eases toward a STILL
+      // point instead of bouncing as the d3-force sim continues to
+      // settle in the background.
       let followId: string | null = null;
+      let followStartAt = 0;
+      let followAt: { x: number; y: number } | null = null;
 
       // Directional `${fromFileId} ${toFileId}` keys for semantic edges
       // (calls/extends/implements) actually drawn this frame. drawSemanticEdges
@@ -1570,29 +1579,39 @@ export function PixiCanvas({ project }: CanvasProps) {
       }
 
       // Ease the camera so the followed node sits at screen center. Runs
-      // after draw() so visibleById reflects this frame. Re-reads the node's
-      // live position each tick, so it tracks the node through an expand
-      // re-layout and releases once centered.
+      // after draw() so visibleById reflects this frame. Snapshots the
+      // node's position on the FIRST tick after `followStartAt` (so a
+      // Block-toggle's delay lets the rect-grow animation finish first),
+      // then eases toward that fixed point. The snapshot means the
+      // camera doesn't chase the node if the d3-force sim is still
+      // ticking in the background — it lands smoothly even when the
+      // target's "true" position is still drifting by a few pixels per
+      // frame.
       function updateFollow(): void {
         if (followId === null) return;
-        let cx: number;
-        let cy: number;
-        const simNode = layout.byId.get(followId);
-        if (simNode) {
-          cx = simNode.x;
-          cy = simNode.y;
-        } else {
-          const r =
-            visibleById.get(followId) ??
-            findVisibleAnchor(followId, visibleById, activeTree);
-          if (!r) return; // not resolvable yet — try again next frame
-          cx = r.x + r.w / 2;
-          cy = r.y + r.h / 2;
+        if (performance.now() < followStartAt) return;
+        if (followAt === null) {
+          // First active frame — capture the current world position of
+          // the target as the camera's fixed destination.
+          const simNode = layout.byId.get(followId);
+          if (simNode) {
+            followAt = { x: simNode.x, y: simNode.y };
+          } else {
+            const r =
+              visibleById.get(followId) ??
+              findVisibleAnchor(followId, visibleById, activeTree);
+            if (!r) return; // not resolvable yet — try again next frame
+            followAt = { x: r.x + r.w / 2, y: r.y + r.h / 2 };
+          }
         }
-        const targetX = app.screen.width / 2 - cx * cameraScale;
-        const targetY = app.screen.height / 2 - cy * cameraScale;
-        world.x += (targetX - world.x) * 0.18;
-        world.y += (targetY - world.y) * 0.18;
+        const targetX = app.screen.width / 2 - followAt.x * cameraScale;
+        const targetY = app.screen.height / 2 - followAt.y * cameraScale;
+        // Slightly gentler ease than before (was 0.18) so the post-
+        // animation pan reads as a separate, deliberate motion rather
+        // than an extension of the grow animation. easeOut shape:
+        // bigger steps early, smaller as we approach.
+        world.x += (targetX - world.x) * 0.12;
+        world.y += (targetY - world.y) * 0.12;
         if (
           Math.abs(targetX - world.x) < 0.5 &&
           Math.abs(targetY - world.y) < 0.5
@@ -1600,6 +1619,7 @@ export function PixiCanvas({ project }: CanvasProps) {
           world.x = targetX;
           world.y = targetY;
           followId = null; // centered & settled — release the camera
+          followAt = null;
         }
       }
 
@@ -1687,6 +1707,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         },
         onUserCameraMove: () => {
           followId = null;
+          followAt = null;
         },
       });
 
@@ -1694,10 +1715,16 @@ export function PixiCanvas({ project }: CanvasProps) {
         if (!target) {
           useGraphStore.getState().setSelection(null);
           followId = null;
+          followAt = null;
           return;
         }
-        // Center the selected node on screen (the ticker eases toward it).
+        // Default: follow this node immediately. Block-toggle path
+        // below overrides `followStartAt` so the pan waits until the
+        // grow/shrink animation completes — otherwise the camera
+        // chases a target whose rect is being lerped.
         followId = target.id;
+        followStartAt = 0;
+        followAt = null;
         if (target.kind === 'file') {
           void onFileClick(target.fileId);
           return;
@@ -1738,6 +1765,12 @@ export function PixiCanvas({ project }: CanvasProps) {
           const targetSize = fileSim?.width ?? prevSize;
           startFileAnim(target.fileId, prevSize, targetSize);
           startBlockAnim(target.id, prevX, prevY, prevW, prevH);
+          // Defer the camera pan until the Block-grow animation is
+          // done. updateFollow honours this AND snapshots the target's
+          // position on its first active frame so the camera eases
+          // toward a fixed point rather than chasing the sim, which
+          // is what produced the "bouncing around" perception.
+          followStartAt = performance.now() + BLOCK_ANIM_DURATION;
         }
       }
 

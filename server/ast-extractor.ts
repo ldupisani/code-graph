@@ -648,7 +648,37 @@ const REFERENCE_KINDS_TO_SKIP = new Set<ts.SyntaxKind>([
   ts.SyntaxKind.NewExpression,
 ]);
 
+// Public entry point. Suppresses the Decorator wrapper itself and
+// rewrites its expression's label with an `@` prefix — turning the
+// previously redundant `[Decorator(name=Component)] > [▷ Component(...)]`
+// nesting into a single rect labelled `@Component(...)`. The prefix
+// rewrite applies to every label-source (synthesizeCallLabel,
+// Identifier, synthesizeAccessLabel, getName fallback) by sitting at
+// the wrapper level rather than inside each branch.
 function friendlyName(node: Node, inlined: Set<Node>): string | null {
+  if (node.getKind() === ts.SyntaxKind.Decorator) {
+    // The Decorator wrapper has no label; its child (the call /
+    // identifier / member access) becomes the rect via the single-
+    // child non-significant collapse, with the `@` prefix attached
+    // there.
+    return null;
+  }
+  const raw = rawFriendlyName(node, inlined);
+  // If THIS node is the immediate expression of a Decorator, prefix
+  // with `@` (matching the source syntax). Strip our common label
+  // prefixes so we don't end up with `@▷ Foo`.
+  const parent = node.getParent();
+  if (parent && parent.getKind() === ts.SyntaxKind.Decorator) {
+    if (!raw) return null;
+    let stripped = raw;
+    if (stripped.startsWith('▷ ')) stripped = stripped.slice(2);
+    else if (stripped.startsWith('new ')) stripped = stripped.slice(4);
+    return '@' + stripped;
+  }
+  return raw;
+}
+
+function rawFriendlyName(node: Node, inlined: Set<Node>): string | null {
   const kind = node.getKind();
 
   // Synthesised "new Foo" / "call bar" / "call a.b.c" labels for Call/New.

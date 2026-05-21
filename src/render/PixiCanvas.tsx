@@ -4200,8 +4200,14 @@ class LabelPool {
         const victim = this.cache.get(oldest);
         if (!victim || this.active.has(victim)) break;
         this.cache.delete(oldest);
+        // removeChild detaches the Text from the scene; we DON'T
+        // explicitly call victim.destroy() because Pixi v8 has a
+        // bug in Text → returnTexture where pool[width] can be
+        // undefined. The orphaned Text instance gets GC'd by JS
+        // once we drop the reference (which we do by deleting the
+        // cache entry above), without going through the buggy
+        // texture-pool path.
         this.parent.removeChild(victim);
-        victim.destroy();
       }
     } else {
       // Refresh LRU position by re-inserting at the end of the Map.
@@ -4226,7 +4232,12 @@ class LabelPool {
   }
 
   destroy(): void {
-    for (const t of this.cache.values()) t.destroy();
+    // Same workaround as the eviction path: don't call Text.destroy
+    // explicitly. The caller is always tearing down the whole Pixi
+    // app right after this (app.destroy(true, { children: true,
+    // texture: true })), which recursively destroys our parent
+    // container and every Text in it through a different code path
+    // that doesn't trip the v8 returnTexture pool bug.
     this.cache.clear();
     this.active.clear();
   }

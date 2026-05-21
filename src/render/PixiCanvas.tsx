@@ -1089,6 +1089,13 @@ export function PixiCanvas({ project }: CanvasProps) {
         // 2. Super-nodes themselves: one fat coloured circle per
         //    directory. Hit-rect pushed so handleClick can route
         //    'dir:*' clicks to zoom-to-bbox.
+        // Counter-scale clamped: at very low cameraScale the raw
+        // 1/cameraScale ratio would blow text up to many times the
+        // super-node circle itself, leaving the labels dominating
+        // the scene. Cap at 6× so labels stay proportionate; below
+        // that zoom the user is at "global overview" anyway and
+        // doesn't need the names large.
+        const labelScale = Math.min(6, 1 / cameraScale);
         for (const a of aggs) {
           const colour = colourForDirectory(a.dir);
           worldGfx
@@ -1099,27 +1106,28 @@ export function PixiCanvas({ project }: CanvasProps) {
               width: 2 / cameraScale,
               alpha: 0.95,
             });
-          // Name centred, file count below it. Counter-scaled so
-          // they read at constant on-screen size regardless of zoom.
+          // Name centred, file count below it. Counter-scaled
+          // (clamped) so they read at near-constant on-screen size
+          // without exploding to dominate the view at extreme zoom-out.
           labelPool.put({
             text: a.dir,
             worldX: a.cx,
-            worldY: a.cy - 6 / cameraScale,
+            worldY: a.cy - 6 * labelScale,
             color: COLORS.text,
             size: 14,
             anchorX: 0.5,
             anchorY: 1,
-            scale: 1 / cameraScale,
+            scale: labelScale,
           });
           labelPool.put({
             text: `${a.fileCount} file${a.fileCount === 1 ? '' : 's'}`,
             worldX: a.cx,
-            worldY: a.cy + 6 / cameraScale,
+            worldY: a.cy + 6 * labelScale,
             color: COLORS.textDim,
             size: 11,
             anchorX: 0.5,
             anchorY: 0,
-            scale: 1 / cameraScale,
+            scale: labelScale,
           });
           // HitRect for click-to-zoom-in. Bounding square of the
           // circle; 'dir:' prefix on the id so handleClick can
@@ -4059,21 +4067,42 @@ interface LabelRequest {
   scale?: number;
 }
 
+// Content-keyed Text cache (replaces the previous position-indexed
+// pool that mutated Text.text in place between frames). Pixi v8 has
+// a bug where mutating a Text's content causes its underlying canvas
+// texture to resize, and on a subsequent change the OLD texture's
+// width may not have a slot in TexturePool — the next render then
+// crashes at TexturePoolClass.returnTexture with "Cannot read
+// properties of undefined (reading 'push')". Keying by text content
+// means each unique string owns ONE stable Text instance with a
+// stable texture, so the buggy code path is never taken.
+//
+// Style mutations (fontSize, fill) are still applied in place because
+// they don't resize the canvas (Pixi keeps the same canvas + repaints).
+// Position / scale / visibility are also safe to mutate per frame.
+//
+// LRU eviction caps the cache so projects with very dynamic label
+// content (lots of unique strings over time) don't grow unbounded.
 class LabelPool {
   private parent: Container;
-  private labels: Text[] = [];
-  private cursor = 0;
+  // Text → its instance. Insertion order is iteration order; we
+  // re-set on use to refresh recency (Map.set bumps the key to end).
+  private cache: Map<string, Text> = new Map();
+  // Texts used THIS frame, in put-order. endFrame() hides every Text
+  // not in this set.
+  private active: Set<Text> = new Set();
+  private static readonly MAX_LABELS = 2000;
 
   constructor(parent: Container) {
     this.parent = parent;
   }
 
   beginFrame(): void {
-    this.cursor = 0;
+    this.active.clear();
   }
 
   put(req: LabelRequest): void {
-    let label = this.labels[this.cursor];
+    let label = this.cache.get(req.text);
     if (!label) {
       label = new Text({
         text: req.text,
@@ -4085,11 +4114,24 @@ class LabelPool {
       });
       label.eventMode = 'none';
       this.parent.addChild(label);
-      this.labels.push(label);
+      this.cache.set(req.text, label);
+      // Evict the LEAST-RECENTLY-USED label when the cache gets too
+      // big. We only evict labels that aren't active this frame so
+      // we don't yank something out of the current render.
+      while (this.cache.size > LabelPool.MAX_LABELS) {
+        const oldest = this.cache.keys().next().value;
+        if (oldest === undefined) break;
+        const victim = this.cache.get(oldest);
+        if (!victim || this.active.has(victim)) break;
+        this.cache.delete(oldest);
+        this.parent.removeChild(victim);
+        victim.destroy();
+      }
     } else {
-      // Only update text/style when changed; Pixi's Text is dirty-checked
-      // internally but setting equal strings is still cheap.
-      if (label.text !== req.text) label.text = req.text;
+      // Refresh LRU position by re-inserting at the end of the Map.
+      this.cache.delete(req.text);
+      this.cache.set(req.text, label);
+      // Style mutations are safe — same canvas, just a re-paint.
       if (label.style.fontSize !== req.size) label.style.fontSize = req.size;
       if (label.style.fill !== req.color) label.style.fill = req.color;
     }
@@ -4098,17 +4140,18 @@ class LabelPool {
     const s = req.scale ?? 1;
     label.scale.set(s);
     label.visible = true;
-    this.cursor++;
+    this.active.add(label);
   }
 
   endFrame(): void {
-    for (let i = this.cursor; i < this.labels.length; i++) {
-      this.labels[i].visible = false;
+    for (const t of this.cache.values()) {
+      if (!this.active.has(t)) t.visible = false;
     }
   }
 
   destroy(): void {
-    for (const l of this.labels) l.destroy();
-    this.labels = [];
+    for (const t of this.cache.values()) t.destroy();
+    this.cache.clear();
+    this.active.clear();
   }
 }

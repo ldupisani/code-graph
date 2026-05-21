@@ -862,6 +862,28 @@ export function PixiCanvas({ project }: CanvasProps) {
         addAdjacency(kind, fromFile, toFile);
       }
 
+      // Popularity score per file: how many DISTINCT other files
+      // reference it. Combines incoming imports + incoming semantic
+      // edges (calls / extends / implements). A file imported by 50
+      // others is a "hub" in the architecture and should look
+      // proportionally bigger than a leaf utility imported once.
+      // Sqrt scaling keeps the visual range bounded — a 100-incoming
+      // file is ~3x a 10-incoming one, not 10x.
+      const filePopularity = new Map<string, number>();
+      {
+        const seen = new Set<string>();
+        const bumpInbound = (from: string, to: string): void => {
+          const key = `${from}|${to}`;
+          if (seen.has(key)) return;
+          seen.add(key);
+          filePopularity.set(to, (filePopularity.get(to) ?? 0) + 1);
+        };
+        for (const e of project.edges) bumpInbound(e.fromId, e.toId);
+        for (const e of project.semanticEdges) {
+          bumpInbound(fileIdOfAstId(e.fromId), fileIdOfAstId(e.toId));
+        }
+      }
+
       // Shift-key tracking for path tracing. wireCamera's onClick
       // doesn't pass modifier state, so we mirror it via window key
       // listeners. Captured on the click, consulted in handleClick.
@@ -1614,6 +1636,17 @@ export function PixiCanvas({ project }: CanvasProps) {
         const y = sim.y - sim.height / 2;
         const expanded = useGraphStore.getState().expandedFiles.has(sim.id);
         const isSelected = selection === sim.id;
+        // Hover reveals the file name even when the LOD gate would
+        // otherwise hide it — `hoveredHit` is set by the camera's
+        // hit-test pipeline; we just consult it here.
+        const isHovered =
+          hoveredHit?.kind === 'file' && hoveredHit.id === sim.id;
+        // Popularity-based scale factor. A file referenced by N
+        // OTHER files gets an icon ~(1 + sqrt(N)/8)x its base size.
+        // sqrt keeps the range bounded: 0 refs → 1x; 16 refs →
+        // 1.5x; 64 refs → 2x; 144 refs → 2.5x.
+        const popularity = filePopularity.get(sim.id) ?? 0;
+        const popFactor = 1 + Math.sqrt(popularity) / 8;
 
         // The filename is ALWAYS drawn above the node (centered, counter-
         // scaled to constant size) — never inside it — so it can't overlap
@@ -1622,10 +1655,13 @@ export function PixiCanvas({ project }: CanvasProps) {
         const aboveGap = 8 / cameraScale; // screen-constant gap above the node
         const putName = (topY: number): void => {
           // LOD gate: hide individual file names at low zoom so the
-          // directory-hull labels carry the spatial story. Selected
-          // / focused files keep their name regardless — they're the
-          // user's anchor and shouldn't fade out under them.
-          if (cameraScale < FILE_LABEL_BELOW && !isSelected) return;
+          // directory-hull labels carry the spatial story. The
+          // SELECTED file AND any currently HOVERED file are
+          // exceptions — they're the user's anchor and the user's
+          // current point of attention; both must stay readable.
+          if (cameraScale < FILE_LABEL_BELOW && !isSelected && !isHovered) {
+            return;
+          }
           labelPool.put({
             text: fileLabel(sim.relativePath),
             worldX: sim.x,
@@ -1642,21 +1678,25 @@ export function PixiCanvas({ project }: CanvasProps) {
         // icon (a dog-eared page) at every zoom level — never a sized box or
         // a dot. The filename floats above it.
         if (!expanded) {
-          // World-fixed icon size with a screen cap. Icons shrink
-          // with the world as you zoom OUT (so dense clusters stop
-          // overlapping themselves), but never grow past 16×20
-          // screen-px when you zoom IN — that's the size the user
-          // chose as comfortable, and "icons get bigger and bigger
-          // as you zoom in" is rarely useful.
+          // World-fixed icon size with a screen cap, multiplied by
+          // popularity. Icons shrink with the world as you zoom
+          // OUT (so dense clusters stop overlapping themselves),
+          // but never grow past popFactor × 16×20 screen-px when
+          // you zoom IN. Popular files (many incoming references)
+          // get a proportionally larger cap, so architectural hubs
+          // stand out at every zoom level.
           //
           // The min(WORLD, SCREEN/cameraScale) formulation:
-          //   * cameraScale ≤ 1 → world_iw = 16 (fixed world), so
-          //     on_screen = 16 × cameraScale (shrinks).
-          //   * cameraScale > 1 → world_iw = 16/cameraScale, so
-          //     on_screen = 16 (capped).
-          const iw = Math.min(16, 16 / cameraScale);
-          const ih = Math.min(20, 20 / cameraScale);
-          const fold = Math.min(6, 6 / cameraScale);
+          //   * cameraScale ≤ 1 → world_iw = 16×popFactor (fixed
+          //     world), so on_screen = 16 × popFactor × cameraScale.
+          //   * cameraScale > 1 → world_iw = 16×popFactor /
+          //     cameraScale, so on_screen = 16 × popFactor (capped).
+          const baseW = 16 * popFactor;
+          const baseH = 20 * popFactor;
+          const baseFold = 6 * popFactor;
+          const iw = Math.min(baseW, baseW / cameraScale);
+          const ih = Math.min(baseH, baseH / cameraScale);
+          const fold = Math.min(baseFold, baseFold / cameraScale);
           const ix = sim.x - iw / 2;
           const iy = sim.y - ih / 2;
           // Colour the page body by the file's current cluster

@@ -906,16 +906,27 @@ export function PixiCanvas({ project }: CanvasProps) {
       // also keeps file icons + labels comfortably INSIDE the hull
       // rather than clipping its boundary.
       const BOUNDARY_PAD = 48;
-      const colourForDirectory = (dir: string): number => {
+      // Stable hue per directory path — both `colourForDirectory`
+      // (muted, for hulls) and `colourForDirectoryStrong` (saturated,
+      // for file icons) share the same hash so a file icon and its
+      // hull are visibly the same colour family, just different
+      // intensities. The strong variant is what makes file icons
+      // 'belong to a subsystem' visually.
+      const hueForDirectory = (dir: string): number => {
         let h = 0;
         for (let i = 0; i < dir.length; i++) {
           h = (h * 31 + dir.charCodeAt(i)) | 0;
         }
-        const hue = ((h % 360) + 360) % 360;
-        // Muted saturation / mid lightness so boundaries don't compete
-        // with file content for attention.
-        return hslToHex(hue, 38, 52);
+        return ((h % 360) + 360) % 360;
       };
+      const colourForDirectory = (dir: string): number =>
+        hslToHex(hueForDirectory(dir), 38, 52);
+      const colourForDirectoryStrong = (dir: string): number =>
+        // Higher saturation + slightly higher lightness so the
+        // icon body is unambiguously the directory's signature
+        // colour, not a muted variant readable only against the
+        // hull behind it.
+        hslToHex(hueForDirectory(dir), 65, 58);
       // Take the first `depth` components of a relative path. Used to
       // group deeply-nested files into a smaller number of meaningful
       // architectural clusters. `src/components/data-display/list/item.tsx`
@@ -1656,10 +1667,25 @@ export function PixiCanvas({ project }: CanvasProps) {
           const fold = 6 / cameraScale; // folded top-right corner
           const ix = sim.x - iw / 2;
           const iy = sim.y - ih / 2;
-          const body = isSelected ? COLORS.fileSelected : COLORS.file;
+          // Colour the page body by the file's current cluster
+          // (zoom-adaptive — same map the hulls and intra-cluster
+          // edge gate use). The 'strong' variant of the directory
+          // hash colour is used so the icon reads as a vivid
+          // signature of its subsystem instead of fading into the
+          // muted hull palette behind it. Selected file keeps its
+          // blue override so the click target stays unambiguously
+          // distinct.
+          const cluster = fileToActiveCluster.get(sim.id);
+          const dirColour = cluster
+            ? colourForDirectoryStrong(cluster)
+            : COLORS.file;
+          const body = isSelected ? COLORS.fileSelected : dirColour;
+          // Border in the same hue but darker (muted variant) for a
+          // subtle outline; selected file gets the standard white
+          // override.
           const line = isSelected
             ? COLORS.fileBorderSelected
-            : COLORS.fileBorder;
+            : (cluster ? colourForDirectory(cluster) : COLORS.fileBorder);
           worldGfx
             .poly([
               ix, iy,

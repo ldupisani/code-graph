@@ -423,14 +423,19 @@ export function PixiCanvas({ project }: CanvasProps) {
       //                       file outlines). Drawn first so labels can
       //                       sit on top of them.
       //   labelLayer        — Pixi Text labels for the main scene.
-      //   overlayGfx        — Expanded-Block overlay backgrounds, their
-      //                       interior rects, and the collapse handle.
-      //                       Sitting ABOVE labelLayer means the overlay
-      //                       fully obscures every main-scene label that
-      //                       falls behind it.
-      //   overlayLabelLayer — Pixi Text labels emitted while the overlay
-      //                       pass renders. Above overlay rects so the
-      //                       overlay's own labels stay legible.
+      //   overlayPane[0..N) — One *pane* per active expanded-Block overlay.
+      //                       Each pane is a Container with TWO ordered
+      //                       children: its own Graphics (rects) and its
+      //                       own labels-Container (Pixi Text). Stacking
+      //                       in world means pane[i+1] (a nested overlay
+      //                       on top of pane[i]) fully obscures pane[i]'s
+      //                       rects AND labels — which a single shared
+      //                       overlayGfx/overlayLabelLayer could not, since
+      //                       a parent overlay's labels would otherwise
+      //                       always render above the child overlay's rect.
+      //                       Unused panes are kept around with .visible
+      //                       = false so we don't churn Containers per
+      //                       frame.
       //   semanticEdgeGfx   — Semantic edges + arrowheads, on top of
       //                       everything so no call/extends arrow gets
       //                       hidden behind a label, a rect, or an overlay.
@@ -444,11 +449,31 @@ export function PixiCanvas({ project }: CanvasProps) {
       const labelLayer = new Container();
       world.addChild(labelLayer);
 
-      const overlayGfx = new Graphics();
-      world.addChild(overlayGfx);
-
-      const overlayLabelLayer = new Container();
-      world.addChild(overlayLabelLayer);
+      // Bounded — same cap as the multi-pass loop's `safety` counter
+      // below, so the pool can serve every overlay the loop is willing
+      // to draw. Each pane is created up-front and toggled via
+      // .visible per frame.
+      const MAX_OVERLAY_PANES = 8;
+      interface OverlayPane {
+        container: Container;
+        gfx: Graphics;
+        labels: LabelPool;
+      }
+      const overlayPanes: OverlayPane[] = [];
+      for (let i = 0; i < MAX_OVERLAY_PANES; i++) {
+        const container = new Container();
+        const gfx = new Graphics();
+        const labelsContainer = new Container();
+        container.addChild(gfx);
+        container.addChild(labelsContainer);
+        container.visible = false;
+        world.addChild(container);
+        overlayPanes.push({
+          container,
+          gfx,
+          labels: new LabelPool(labelsContainer),
+        });
+      }
 
       const semanticEdgeGfx = new Graphics();
       world.addChild(semanticEdgeGfx);
@@ -519,20 +544,20 @@ export function PixiCanvas({ project }: CanvasProps) {
       // 1-frame lag that's imperceptible at 60fps.
       const visibleSemanticPairs = new Set<string>();
 
-      // Pool of Pixi Text objects re-used across frames. `visible` is toggled
-      // for unused entries, avoiding GC churn. Two pools: one per label
-      // layer — the renderer flips `currentLabelPool` for the overlay
-      // pass so labels drawn under drawAstNode land on the right tier.
+      // Pool of Pixi Text objects re-used across frames for the main
+      // scene. `visible` is toggled for unused entries, avoiding GC
+      // churn. Each overlay pane has its OWN LabelPool — see the pane
+      // pool above and the multi-pass loop in `draw()`.
       const labelPool = new LabelPool(labelLayer);
-      const overlayLabelPool = new LabelPool(overlayLabelLayer);
 
       // Active per-pass targets for the SHARED drawing helpers
       // (drawAstNode, drawAstContainer, drawOverlay). The main scene
-      // draws to `worldGfx` + `labelPool`; the overlay pass flips to
-      // `overlayGfx` + `overlayLabelPool` so every primitive the
-      // recursion emits lands ABOVE the main labelLayer in the scene
-      // graph. Main-only draw functions (drawFile, drawEdges,
-      // drawSemanticEdges) keep using their absolute references.
+      // draws to `worldGfx` + `labelPool`; during the overlay pass
+      // these are repointed to the active pane's `gfx`/`labels` so
+      // every primitive the recursion emits lands in THAT pane (and
+      // therefore at THAT z-order in `world`'s child list). Main-only
+      // draw functions (drawFile, drawEdges, drawSemanticEdges) keep
+      // using their absolute references.
       let currentGfx: Graphics = worldGfx;
       let currentLabelPool: LabelPool = labelPool;
 
@@ -735,7 +760,6 @@ export function PixiCanvas({ project }: CanvasProps) {
         const selection = state.selection;
 
         worldGfx.clear();
-        overlayGfx.clear();
         semanticEdgeGfx.clear();
         hitRects.length = 0;
         overlayHitRects.length = 0;
@@ -745,7 +769,6 @@ export function PixiCanvas({ project }: CanvasProps) {
         visibleById.clear();
         blockCellsThisFrame.clear();
         labelPool.beginFrame();
-        overlayLabelPool.beginFrame();
 
         // 1. Import edges (under rects). Now anchored to the specific
         //    `import` AST node on the source side when that file is
@@ -770,38 +793,63 @@ export function PixiCanvas({ project }: CanvasProps) {
         //    nested overlays (Block expanded inside another overlay)
         //    can render after their parent has registered the cell
         //    they anchor to. Stops once no new overlay drew this pass.
+        //
+        //    Each overlay gets its OWN pane (Container + Graphics +
+        //    LabelPool) from `overlayPanes`. Because the panes are
+        //    stacked in `world` in fixed order, pane[i+1] renders
+        //    above EVERYTHING in pane[i] — both its rects AND its
+        //    labels — which is what nested overlays need: a child
+        //    overlay's rect must fully obscure its parent's labels
+        //    where they overlap. A single shared overlay-rect /
+        //    overlay-label tier (the prior design) couldn't do that
+        //    because all overlay labels rendered above all overlay
+        //    rects regardless of which overlay they belonged to.
         currentHitTarget = overlayHitRects;
-        currentGfx = overlayGfx;
-        currentLabelPool = overlayLabelPool;
         const renderedOverlays = new Set<string>();
         const overlaysToDraw = new Set<string>(state.expandedAstNodes);
         // Include any block in a currently-animating shrink, even if
         // it's no longer in expandedAstNodes (the user just toggled
         // it off but the rect is still lerping back to cell size).
         for (const id of blockAnims.keys()) overlaysToDraw.add(id);
+        let paneCursor = 0;
         let progress = true;
-        let safety = 8; // bound nesting depth — degenerate cases bail out
+        let safety = MAX_OVERLAY_PANES;
         while (progress && safety-- > 0) {
           progress = false;
           for (const blockId of overlaysToDraw) {
             if (renderedOverlays.has(blockId)) continue;
             const cell = blockCellsThisFrame.get(blockId);
             if (!cell) continue; // anchor not on this frame yet — wait
+            if (paneCursor >= overlayPanes.length) break; // out of panes
+            const pane = overlayPanes[paneCursor];
+            pane.container.visible = true;
+            pane.gfx.clear();
+            pane.labels.beginFrame();
+            currentGfx = pane.gfx;
+            currentLabelPool = pane.labels;
             drawOverlay(blockId, cell, selection);
+            pane.labels.endFrame();
             renderedOverlays.add(blockId);
+            paneCursor++;
             progress = true;
           }
+        }
+        // Hide any panes the frame didn't use, so old rects/labels
+        // from a previous frame don't linger.
+        for (let i = paneCursor; i < overlayPanes.length; i++) {
+          overlayPanes[i].container.visible = false;
+          overlayPanes[i].gfx.clear();
+          overlayPanes[i].labels.beginFrame();
+          overlayPanes[i].labels.endFrame();
         }
         currentHitTarget = hitRects;
         currentGfx = worldGfx;
         currentLabelPool = labelPool;
 
-        // 4. Hide unused entries in both label pools (the scene-graph
-        //    order already lays main labels under the overlay rects
-        //    and overlay labels above them — see the world.addChild
-        //    sequence above).
+        // 4. Hide unused entries in the main-scene label pool. Each
+        //    overlay pane's pool was already begin/end-framed per
+        //    overlay above.
         labelPool.endFrame();
-        overlayLabelPool.endFrame();
 
         // 5. Semantic edges, drawn last on a dedicated graphics layered above
         //    labels. Border-clipped + arrowheaded so they're always visible.
@@ -1117,12 +1165,14 @@ export function PixiCanvas({ project }: CanvasProps) {
         const fileId = fileIdOfAstId(blockId);
 
         // Shadow the closure-scoped graphics with the active per-pass
-        // target. During the overlay pass this points at overlayGfx,
-        // so the overlay's background + handle land above the main
-        // scene's labelLayer — main labels behind the overlay stay
-        // hidden. (Labels inside the overlay come from the recursive
-        // drawAstNode below, which shadows labelPool to overlayLabelPool
-        // by the same mechanism.)
+        // target. The multi-pass loop in draw() points `currentGfx` at
+        // THIS overlay's pane Graphics before invoking us, so the
+        // background and handle rects land in the right pane — which
+        // sits ABOVE every earlier pane in `world`'s child list and
+        // therefore obscures any earlier overlay's rects and labels in
+        // its bounds. (Labels inside this overlay come from the
+        // recursive drawAstNode below, which shadows labelPool the
+        // same way.)
         const worldGfx = currentGfx;
 
         // Overlay sizing. The full overlay rect anchors at the cell's
@@ -1981,7 +2031,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         layout.simulation.stop();
         detachCamera();
         labelPool.destroy();
-        overlayLabelPool.destroy();
+        for (const pane of overlayPanes) pane.labels.destroy();
         app.ticker.remove(tickerCb);
         app.destroy(true, { children: true, texture: true });
       };

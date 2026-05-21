@@ -420,9 +420,20 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       // Scene graph layering, bottom-up (Pixi child order = z-order):
       //   worldGfx          — main-scene rects (file circles, AST cells,
-      //                       file outlines). Drawn first so labels can
-      //                       sit on top of them.
+      //                       file outlines).
       //   labelLayer        — Pixi Text labels for the main scene.
+      //   semanticEdgeGfx   — Semantic edges + arrowheads + selection-
+      //                       gated caller/callee outlines. Above
+      //                       main labels (so a thin connector isn't
+      //                       hidden by a label sitting on its path),
+      //                       BUT below the overlay panes — overlays
+      //                       are panels on top of the main scene and
+      //                       must obscure connector lines AND any
+      //                       caller/callee outlines that fall within
+      //                       their bounds. (drawSemanticEdges draws
+      //                       a rect outline around the selected
+      //                       caller/callee in the edge color; that
+      //                       outline lives on this layer too.)
       //   overlayPane[0..N) — One *pane* per active expanded-Block overlay.
       //                       Each pane is a Container with TWO ordered
       //                       children: its own Graphics (rects) and its
@@ -436,9 +447,6 @@ export function PixiCanvas({ project }: CanvasProps) {
       //                       Unused panes are kept around with .visible
       //                       = false so we don't churn Containers per
       //                       frame.
-      //   semanticEdgeGfx   — Semantic edges + arrowheads, on top of
-      //                       everything so no call/extends arrow gets
-      //                       hidden behind a label, a rect, or an overlay.
       //
       // Hit-test priority is independent of Graphics z: a separate
       // `overlayHitRects` list is consulted before `hitRects` so an
@@ -448,6 +456,9 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       const labelLayer = new Container();
       world.addChild(labelLayer);
+
+      const semanticEdgeGfx = new Graphics();
+      world.addChild(semanticEdgeGfx);
 
       // Bounded — same cap as the multi-pass loop's `safety` counter
       // below, so the pool can serve every overlay the loop is willing
@@ -474,9 +485,6 @@ export function PixiCanvas({ project }: CanvasProps) {
           labels: new LabelPool(labelsContainer),
         });
       }
-
-      const semanticEdgeGfx = new Graphics();
-      world.addChild(semanticEdgeGfx);
 
       // Visual rim between the cluster's bounding-circle radius and the file
       // boundary actually drawn. Pure breathing room — the file's name is
@@ -851,8 +859,14 @@ export function PixiCanvas({ project }: CanvasProps) {
         //    overlay above.
         labelPool.endFrame();
 
-        // 5. Semantic edges, drawn last on a dedicated graphics layered above
-        //    labels. Border-clipped + arrowheaded so they're always visible.
+        // 5. Semantic edges (calls / extends / implements) on the
+        //    dedicated semanticEdgeGfx layer. Scene-graph z puts that
+        //    layer ABOVE main labels but BELOW the overlay panes, so a
+        //    connector and its selection-gated caller/callee outline
+        //    are obscured by any overlay whose bounds they cross. The
+        //    draw call's position in this function doesn't matter for
+        //    z (Graphics retain their draws across frames until cleared;
+        //    z is decided by addChild order in world).
         drawSemanticEdges(
           project.semanticEdges,
           semanticEdgeGfx,

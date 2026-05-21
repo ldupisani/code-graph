@@ -1226,22 +1226,36 @@ export function PixiCanvas({ project }: CanvasProps) {
 
         // 2b. Focus-mode dimming. For each file outside the live set,
         //     paint a translucent bg-coloured rect on dimGfx (one
-        //     layer above worldGfx + labelLayer) so the file rect AND
-        //     its label are uniformly darkened. Live files (and the
-        //     entire scene when focus mode is off) get no overlay.
-        //     Path-traced files (when set) override dimming — they
-        //     ARE the user's current question and must stay bright.
+        //     layer above worldGfx + labelLayer) so the file rect is
+        //     visibly darkened. Match the rect to the VISIBLE content
+        //     — the screen-constant 16×20 icon for collapsed files,
+        //     the file circle's bounding box for expanded ones —
+        //     not sim.width/sim.height (which is the d3-force
+        //     collision footprint based on label length; rendering
+        //     that as a dim box draws a standalone dark rectangle
+        //     bigger than the icon and disconnected from it visually).
+        //     Path-traced files (when set) override dimming.
         if (liveFiles) {
           for (const sim of layout.nodes) {
             if (liveFiles.has(sim.id)) continue;
             if (pathFileSet.has(sim.id)) continue;
+            let w: number;
+            let h: number;
+            if (sim.expanded) {
+              // Expanded file: width === height === diameter; the
+              // bounding box of the circle is the right cover.
+              w = sim.width;
+              h = sim.height;
+            } else {
+              // Collapsed file: the visible content is the 16×20
+              // screen-constant page icon (see drawFile). Mirror the
+              // same /cameraScale conversion so the dim rect tracks
+              // the icon at any zoom.
+              w = 16 / cameraScale;
+              h = 20 / cameraScale;
+            }
             dimGfx
-              .rect(
-                sim.x - sim.width / 2,
-                sim.y - sim.height / 2,
-                sim.width,
-                sim.height,
-              )
+              .rect(sim.x - w / 2, sim.y - h / 2, w, h)
               .fill({ color: COLORS.bg, alpha: 0.78 });
           }
         }

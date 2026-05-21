@@ -311,7 +311,13 @@ interface CanvasProps {
 interface HitRect {
   id: string;
   fileId: string;
-  kind: 'file' | 'ast';
+  // 'ast-toggle' marks the small top-right handle drawn on every
+  // expanded Block. It's a reliable click target for COLLAPSING the
+  // Block — children inside the Block can otherwise fill the body
+  // and steal every click. handleClick treats 'ast-toggle' the same
+  // as clicking an empty Block area (toggles), and the cursor flips
+  // to 'pointer' over it.
+  kind: 'file' | 'ast' | 'ast-toggle';
   x: number;
   y: number;
   w: number;
@@ -1091,7 +1097,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         if (node.collapsed) {
           const stroke = KIND_OUTLINE[node.syntaxKind] ?? COLORS.astBorder;
           const isSelectedLeaf = selection === node.id;
-          const isHovered = hoveredId === node.id;
+          const isHovered = hoveredHit?.id === node.id;
           worldGfx
             .rect(x, y, node.rect.w, node.rect.h)
             .fill({
@@ -1517,6 +1523,50 @@ export function PixiCanvas({ project }: CanvasProps) {
         for (const k of kids) {
           drawAstNode(k, baseX, baseY, fileId, tree, selection);
         }
+
+        // Top-right collapse handle for expanded Blocks. Drawn AFTER
+        // children so it sits on top, with its own (smaller-area)
+        // 'ast-toggle' HitRect that wins hit-test for clicks in its
+        // region — children below in the same area are clicked
+        // through. The handle is screen-constant so it stays clickable
+        // at any zoom, faint until hovered, brighter on hover.
+        if (
+          node.syntaxKind === 'Block' &&
+          !node.collapsed &&
+          kids.length > 0 &&
+          cameraScale >= OUTLINE_BELOW
+        ) {
+          const handleSize = 12 / cameraScale;
+          const handleInset = 4 / cameraScale;
+          // Top-right corner inside the Block. handleInset keeps the
+          // glyph off the outline so the two visually separate.
+          const hx = x + node.rect.w - handleSize - handleInset;
+          const hy = y + handleInset;
+          const stroke = KIND_OUTLINE[node.syntaxKind] ?? COLORS.astBorder;
+          const isHandleHovered =
+            hoveredHit?.kind === 'ast-toggle' && hoveredHit.id === node.id;
+          const lineW = (isHandleHovered ? 1.6 : 1) / cameraScale;
+          worldGfx
+            .rect(hx, hy, handleSize, handleSize)
+            .fill({ color: stroke, alpha: isHandleHovered ? 0.5 : 0.25 })
+            .stroke({ color: stroke, width: lineW, alpha: 1 });
+          // Minus glyph — a horizontal bar centred in the box, evoking
+          // "remove detail" / "collapse this back to a single cell".
+          worldGfx
+            .moveTo(hx + handleSize * 0.25, hy + handleSize / 2)
+            .lineTo(hx + handleSize * 0.75, hy + handleSize / 2)
+            .stroke({ color: stroke, width: lineW * 1.2, alpha: 1 });
+          pushRect({
+            id: node.id,
+            fileId,
+            kind: 'ast-toggle',
+            x: hx,
+            y: hy,
+            w: handleSize,
+            h: handleSize,
+            area: handleSize * handleSize,
+          });
+        }
       }
 
       // Ease the camera so the followed node sits at screen center. Runs
@@ -1598,12 +1648,14 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       // Camera & input
 
-      // Hover state: the AST node currently under the cursor when the
-      // user isn't dragging. Read by drawAstNode's collapsed-Block
-      // branch to render the cell with a brightened outline, and used
-      // to flip the canvas cursor between 'grab' and 'pointer' as a
-      // clickability cue.
-      let hoveredId: string | null = null;
+      // Hover state: the HitRect currently under the cursor when the
+      // user isn't dragging. drawAstNode uses it for:
+      //   * brightening the outline of a hovered collapsed Block, and
+      //   * brightening the top-right handle on a hovered expanded Block.
+      // Stored as the full HitRect (not just id) so we can distinguish
+      // an 'ast-toggle' handle hit from an 'ast' body hit — both carry
+      // the same id (the Block's) but signal different intent.
+      let hoveredHit: HitRect | null = null;
 
       const detachCamera = wireCamera({
         app,
@@ -1616,16 +1668,20 @@ export function PixiCanvas({ project }: CanvasProps) {
         hitTest: (worldX: number, worldY: number) => smallestContaining(hitRects, worldX, worldY),
         onClick: handleClick,
         onHover: (target) => {
-          hoveredId = target?.id ?? null;
-          // Set the cursor only when the hovered node is a Block —
-          // that's where a click does something extra (toggles
-          // expansion). Other AST cells get the default grab cursor;
-          // the user can still click them to select.
+          hoveredHit = target;
+          // Pointer cursor when the click would TOGGLE a Block — that's
+          // a collapsed Block (its rect IS the toggle target) or an
+          // expanded Block's top-right handle ('ast-toggle' kind).
+          // Clicking the empty body of an expanded Block also toggles,
+          // but the body is mostly covered by children, so we don't
+          // promise toggleability there with the cursor.
           let isToggleable = false;
-          if (target && target.kind === 'ast') {
+          if (target?.kind === 'ast-toggle') {
+            isToggleable = true;
+          } else if (target?.kind === 'ast') {
             const tree = activeTree(target.fileId);
             const tn = tree?.byId.get(target.id);
-            if (tn?.syntaxKind === 'Block') isToggleable = true;
+            if (tn?.syntaxKind === 'Block' && tn.collapsed) isToggleable = true;
           }
           container.style.cursor = isToggleable ? 'pointer' : 'grab';
         },
@@ -1647,7 +1703,13 @@ export function PixiCanvas({ project }: CanvasProps) {
           return;
         }
         const state = useGraphStore.getState();
-        state.setSelection(target.id);
+        // Don't reset selection when the click was on a Block's
+        // top-right handle — the user is collapsing the block, not
+        // selecting it; preserving the existing selection means an
+        // accidental handle click doesn't jump the editor pane.
+        if (target.kind !== 'ast-toggle') {
+          state.setSelection(target.id);
+        }
         // Block toggle: clicking the magenta sequential-code cell flips
         // its entry in the store's expandedAstNodes. The layout cache
         // for this file invalidates (its expandedSnapshot no longer

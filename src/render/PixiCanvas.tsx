@@ -571,6 +571,19 @@ export function PixiCanvas({ project }: CanvasProps) {
         });
       }
 
+      // Top-layer semantic edges, above ALL overlay panes. Used only
+      // for connectors that touch an overlay (either endpoint resolves
+      // to a rect that the overlay just rendered). Edges that don't
+      // touch any overlay use the regular semanticEdgeGfx below the
+      // panes — that's still the right z so overlays correctly
+      // obscure pass-through connectors. Splitting the two cases
+      // keeps both invariants: (1) a connector originating INSIDE
+      // an overlay is visible end-to-end so the user can see where
+      // it comes from, and (2) an unrelated connector passing
+      // through an overlay's bounds is still obscured by it.
+      const semanticEdgeOverlayGfx = new Graphics();
+      world.addChild(semanticEdgeOverlayGfx);
+
       // Visual rim between the cluster's bounding-circle radius and the file
       // boundary actually drawn. Pure breathing room — the file's name is
       // drawn outside (above) the boundary, not inside it.
@@ -1160,6 +1173,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         directoryGfx.clear();
         dimGfx.clear();
         semanticEdgeGfx.clear();
+        semanticEdgeOverlayGfx.clear();
         hitRects.length = 0;
         overlayHitRects.length = 0;
         currentHitTarget = hitRects;
@@ -1348,9 +1362,19 @@ export function PixiCanvas({ project }: CanvasProps) {
         //    draw call's position in this function doesn't matter for
         //    z (Graphics retain their draws across frames until cleared;
         //    z is decided by addChild order in world).
+        // AST ids that the overlay pass actually rendered this frame.
+        // Connectors with either endpoint in this set get routed to
+        // the top-layer semanticEdgeOverlayGfx so their origin /
+        // destination inside an overlay is visible. Everything else
+        // stays on the below-overlays semanticEdgeGfx.
+        const overlayAstSet = new Set<string>();
+        for (const r of overlayHitRects) overlayAstSet.add(r.id);
+
         drawSemanticEdges(
           project.semanticEdges,
           semanticEdgeGfx,
+          semanticEdgeOverlayGfx,
+          overlayAstSet,
           visibleById,
           activeTree,
           cameraScale,
@@ -3007,7 +3031,19 @@ function inheritanceBezierControls(
 
 function drawSemanticEdges(
   edges: readonly SemanticEdge[],
-  gfx: Graphics,
+  // Bottom-layer gfx (below the overlay panes). Pass-through edges
+  // that don't touch any overlay land here so overlays correctly
+  // obscure them where they cross.
+  gfxBelow: Graphics,
+  // Top-layer gfx (above all overlay panes). Connectors whose
+  // source or target rect was rendered by an overlay this frame
+  // land here so the user can see the connector originating from
+  // (or terminating at) its overlay-resident node, instead of the
+  // overlay swallowing one end of it.
+  gfxAbove: Graphics,
+  // AST ids the overlay pass actually rendered. Used to decide
+  // which gfx layer each edge belongs on.
+  overlayAstSet: ReadonlySet<string>,
   visibleById: Map<string, HitRect>,
   treeLookup: (fileId: string) => TreemapLayout | undefined,
   cameraScale: number,
@@ -3065,6 +3101,14 @@ function drawSemanticEdges(
     ) {
       continue;
     }
+    // Per-edge layer choice: above the overlay panes if either
+    // endpoint resolves to an overlay-rendered rect; else below
+    // (so an overlay still obscures pass-through connectors that
+    // don't relate to it).
+    const gfx =
+      overlayAstSet.has(edge.fromId) || overlayAstSet.has(edge.toId)
+        ? gfxAbove
+        : gfxBelow;
     // Call links come back early (CALLS_BELOW), well before full detail —
     // otherwise they'd be invisible until an expanded node fills the screen.
     // They're still only meaningful when you can see who's calling: if the

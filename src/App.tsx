@@ -5,6 +5,7 @@ import { useGraphStore } from './graph/store';
 import { PixiCanvas } from './render/PixiCanvas';
 import { EdgeFilterPills } from './ui/EdgeFilterPills';
 import { HoverTooltip } from './ui/HoverTooltip';
+import { SearchPalette } from './ui/SearchPalette';
 import { EditorPane } from './ui/EditorPane';
 import { FolderPicker } from './ui/FolderPicker';
 import type { AstNode, FileNode, ProjectResponse } from './api/types';
@@ -51,11 +52,19 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Global keyboard shortcuts for the focus / navigation HUD.
+  // Cmd-K / Ctrl-K opens the symbol search palette. Kept in App
+  // state so we can flip it from anywhere (keybinding here +
+  // optional close from inside the palette).
+  const [searchOpen, setSearchOpen] = useState(false);
+
+  // Global keyboard shortcuts for the focus / navigation HUD + the
+  // search palette.
+  //   Cmd/Ctrl-K   — open symbol search.
   //   Esc          — clear selection AND focus (return to overview).
   //   +/= / -      — widen / narrow the focus neighbourhood (hops).
   //                  '=' is included so it works without holding shift
   //                  on a US keyboard (where shift+= produces '+').
+  //   R / [ / ]    — focus-direction shortcuts (reverse-call query).
   // Ignored while the user is typing in an input / textarea (so we
   // don't hijack typing in the FolderPicker or the search palette).
   useEffect(() => {
@@ -65,6 +74,14 @@ export function App() {
       return tag === 'INPUT' || tag === 'TEXTAREA' || t.isContentEditable;
     }
     function onKey(e: KeyboardEvent) {
+      // Cmd-K is the ONE binding that's allowed to interrupt typing —
+      // standard 'jump to' affordance, users expect it even from
+      // inside another text field.
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault();
+        setSearchOpen((v) => !v);
+        return;
+      }
       if (isTypingTarget(e.target)) return;
       const st = useGraphStore.getState();
       if (e.key === 'Escape') {
@@ -186,6 +203,10 @@ export function App() {
                 <SelectionPanel />
                 <EdgeFilterPills />
                 <HoverTooltip />
+                <SearchPalette
+                  open={searchOpen}
+                  onClose={() => setSearchOpen(false)}
+                />
                 <Hints />
               </div>
             </Panel>

@@ -406,7 +406,7 @@ export function PixiCanvas({ project }: CanvasProps) {
             return true;
           },
           // Read the per-file circle-grow animation state for tests.
-          getFileAnim: (fileId: string) => fileAnims.get(fileId),
+          getBlockAnim: (id: string) => blockAnims.get(id),
         };
       }
       // Restore camera if we're rebuilding the same project (filesystem
@@ -420,11 +420,16 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       // Scene graph layering, bottom-up:
       //   worldGfx       — rects (file + AST) + file-level import edges
+      //   overlayGfx     — expanded-Block overlays, drawn ON TOP of the
+      //                    main scene so they read as a separate layer
       //   labelLayer     — Pixi Text labels (on top of rects so they're legible)
       //   semanticEdgeGfx — semantic edges + arrowheads (on top of labels so
       //                     no call/extends arrow can be hidden by a label or rect)
       const worldGfx = new Graphics();
       world.addChild(worldGfx);
+
+      const overlayGfx = new Graphics();
+      world.addChild(overlayGfx);
 
       const labelLayer = new Container();
       world.addChild(labelLayer);
@@ -444,14 +449,38 @@ export function PixiCanvas({ project }: CanvasProps) {
       // In-flight AST fetches we track to avoid double-firing on rapid clicks.
       const fetching = new Set<string>();
 
-      // Hit-rects list rebuilt every frame in world coords; smallest area wins.
+      // Hit rects rebuilt every frame in world coords. Two layers:
+      // overlay rects (expanded-Block overlays + their interior) take
+      // priority during hit-test, then the main scene below. Without
+      // the priority split a click on an overlay child would fall
+      // through to the underlying main-layout cell because the cell
+      // has the smallest area there.
       const hitRects: HitRect[] = [];
+      const overlayHitRects: HitRect[] = [];
       // Same data keyed by id for O(1) anchor lookup during edge rendering.
       const visibleById = new Map<string, HitRect>();
+      // Renderer flips this to `overlayHitRects` while drawing an
+      // overlay so `pushRect` routes hits to the right layer
+      // automatically.
+      let currentHitTarget: HitRect[] = hitRects;
       const pushRect = (r: HitRect): void => {
-        hitRects.push(r);
-        visibleById.set(r.id, r);
+        currentHitTarget.push(r);
+        // The handle is a click router only — don't let it overwrite
+        // the visibleById entry for the Block id, otherwise camera
+        // follow / edge anchoring would resolve to the small 12px
+        // handle rect instead of the full overlay or cell.
+        if (r.kind !== 'ast-toggle') {
+          visibleById.set(r.id, r);
+        }
       };
+
+      // Track each Block cell's WORLD rect as it's rendered in the
+      // main scene. Overlays read this to anchor their top-left to
+      // the cell the user clicked.
+      const blockCellsThisFrame = new Map<
+        string,
+        { x: number; y: number; w: number; h: number }
+      >();
 
       // When a node is selected the camera eases toward a fixed world
       // point so it lands centered on what the user just clicked, even
@@ -499,40 +528,11 @@ export function PixiCanvas({ project }: CanvasProps) {
         string,
         {
           ast: FileAstResponse;
-          // Per-file slice of the global expandedAstNodes set at the
-          // time this layout was built. The cache invalidates when the
-          // FILE'S slice changes — toggling a Block in another file
-          // doesn't force this one to rebuild.
-          expandedSnapshot: ReadonlySet<string>;
           layout: PerFileLayout;
         }
       >();
 
-      function fileSliceOfExpanded(
-        fileId: string,
-        all: ReadonlySet<string>,
-      ): Set<string> {
-        const out = new Set<string>();
-        const prefix = `${fileId}#`;
-        for (const id of all) {
-          if (id.startsWith(prefix)) out.add(id);
-        }
-        return out;
-      }
-
-      function setsEqual(
-        a: ReadonlySet<string>,
-        b: ReadonlySet<string>,
-      ): boolean {
-        if (a.size !== b.size) return false;
-        for (const v of a) if (!b.has(v)) return false;
-        return true;
-      }
-
-      function buildPerFileLayout(
-        ast: FileAstResponse,
-        expandedInThisFile: ReadonlySet<string>,
-      ): PerFileLayout {
+      function buildPerFileLayout(ast: FileAstResponse): PerFileLayout {
         const tree = layoutAst(ast, {
           originX: 0,
           originY: 0,
@@ -548,10 +548,12 @@ export function PixiCanvas({ project }: CanvasProps) {
           // Exactly the box the renderer's LOD gate checks below, so a
           // cell sized here shows its label at 1:1 and nothing larger.
           measure: labelScreenBox,
-          // Every Block is a candidate for collapse; expanded ones
-          // come back from the store.
-          collapseChildren: (n) =>
-            n.syntaxKind === 'Block' && !expandedInThisFile.has(n.id),
+          // Every Block is ALWAYS collapsed in the main layout — the
+          // file's footprint never grows when a user expands a Block.
+          // Expanded Blocks are rendered as OVERLAYS on top of the
+          // main scene (anchored at the cell's world position), so
+          // the main layout dimensions stay stable across toggles.
+          collapseChildren: (n) => n.syntaxKind === 'Block',
         });
         const force = buildAstForceLayout({
           fileId: ast.fileId,
@@ -575,24 +577,64 @@ export function PixiCanvas({ project }: CanvasProps) {
         return { tree, force, size };
       }
 
-      // Idempotent builder. Rebuilds whenever the file's AST changes
-      // OR the user has toggled a Block belonging to this file since
-      // the last build.
+      // Overlay layouts — one TreemapLayout per expanded Block, with
+      // the Block itself as the root and its descendants laid out
+      // normally (other nested Blocks stay collapsed within the
+      // overlay). Built lazily the first time the user toggles a
+      // Block, cached keyed by `${fileId}:${blockId}` and invalidated
+      // when the file's AST identity changes.
+      const overlayLayouts = new Map<
+        string,
+        { ast: FileAstResponse; layout: TreemapLayout }
+      >();
+
+      function fileIdOfAstId(astId: string): string {
+        const i = astId.lastIndexOf('#');
+        return i > 0 ? astId.slice(0, i) : astId;
+      }
+
+      function getOverlayLayout(blockId: string): TreemapLayout | null {
+        const fileId = fileIdOfAstId(blockId);
+        const state = useGraphStore.getState();
+        const ast = state.asts.get(fileId);
+        if (!ast) return null;
+        const cached = overlayLayouts.get(blockId);
+        if (cached && cached.ast === ast) return cached.layout;
+        // Build a layout where the Block is the synthetic root. Other
+        // nested Blocks stay collapsed (clicking them would create
+        // their own overlays — same cell-anchored model).
+        const layout = layoutAst(
+          { fileId, rootId: blockId, nodes: ast.nodes },
+          {
+            originX: 0,
+            originY: 0,
+            labelOf: labelFor,
+            significant: isSignificant,
+            pruneEmpty: (n) => n.syntaxKind === 'Block',
+            prune: (n) => n.syntaxKind === 'HeritageClause',
+            reserveBand: (n) => n.syntaxKind === 'Constructor',
+            rowGroup: (n) =>
+              n.syntaxKind === 'HeritageClause' ? 'extends' : 'n',
+            measure: labelScreenBox,
+            collapseChildren: (n) =>
+              n.syntaxKind === 'Block' && n.id !== blockId,
+          },
+        );
+        overlayLayouts.set(blockId, { ast, layout });
+        return layout;
+      }
+
+      // Idempotent builder. Rebuilds only when the file's AST identity
+      // changes (file-watcher driven re-walk) — Block expansions don't
+      // affect the main layout anymore; they spawn separate overlays.
       function ensureExpandedLayout(fileId: string): PerFileLayout | null {
         const state = useGraphStore.getState();
         const ast = state.asts.get(fileId);
         if (!ast) return null;
-        const slice = fileSliceOfExpanded(fileId, state.expandedAstNodes);
         const cached = layoutsByFileId.get(fileId);
-        if (
-          cached &&
-          cached.ast === ast &&
-          setsEqual(cached.expandedSnapshot, slice)
-        ) {
-          return cached.layout;
-        }
-        const layout = buildPerFileLayout(ast, slice);
-        layoutsByFileId.set(fileId, { ast, expandedSnapshot: slice, layout });
+        if (cached && cached.ast === ast) return cached.layout;
+        const layout = buildPerFileLayout(ast);
+        layoutsByFileId.set(fileId, { ast, layout });
         return layout;
       }
 
@@ -616,85 +658,29 @@ export function PixiCanvas({ project }: CanvasProps) {
         );
       }
 
-      // Per-file circle-grow animation, started when a Block toggle
-      // changes the file's size. sim.width is set to the TARGET
-      // immediately by applyExpansionToSim (so collide + the file
-      // sim's link distances are correct from frame 0 — neighbours
-      // start moving toward their final positions right away). The
-      // animation only smooths the DRAWN circle radius from `prev`
-      // to `target` over `duration` ms, giving the user the visual
-      // of the file growing rather than jumping. Brief AST overflow
-      // during the ~250 ms is acceptable.
-      interface FileAnim {
-        startedAt: number;
-        duration: number;
-        prevSize: number;
-      }
-      const fileAnims = new Map<string, FileAnim>();
-      const FILE_ANIM_DURATION = 250;
-
-      // Per-Block rect animation. When the user toggles a Block, we
-      // snapshot its WORLD rect (the magenta cell on screen) BEFORE
-      // the toggle. After the toggle, the layout rebuilds and the
-      // Block lands at a new rect — either a small collapsed cell or
-      // a larger expanded body region. We render the Block at a rect
-      // LERPED from prev to current over `duration` ms, suppressing
-      // its own normal rendering AND its children during the lerp.
-      // At duration end the entry is dropped and the regular drawing
-      // takes over, so children pop into the now-grown rect.
+      // Per-Block overlay-rect animation. When the user toggles a
+      // Block, the OVERLAY's rendered width/height lerps from `prev`
+      // (the cell's footprint on expand; the current overlay size on
+      // collapse) toward the target on each frame for `duration` ms.
+      // The overlay's TOP-LEFT is always anchored at the underlying
+      // cell — only width and height animate, so the overlay
+      // visibly grows out of / shrinks back to the cell.
       interface BlockAnim {
         startedAt: number;
         duration: number;
-        // World-coord rect snapshot from before the toggle.
-        prevX: number;
-        prevY: number;
         prevW: number;
         prevH: number;
       }
       const blockAnims = new Map<string, BlockAnim>();
       const BLOCK_ANIM_DURATION = 250;
 
-      function startBlockAnim(
-        astId: string,
-        prevX: number,
-        prevY: number,
-        prevW: number,
-        prevH: number,
-      ) {
+      function startBlockAnim(astId: string, prevW: number, prevH: number) {
         blockAnims.set(astId, {
           startedAt: performance.now(),
           duration: BLOCK_ANIM_DURATION,
-          prevX,
-          prevY,
           prevW,
           prevH,
         });
-      }
-
-      function startFileAnim(fileId: string, prevSize: number, targetSize: number) {
-        if (prevSize === targetSize) return;
-        fileAnims.set(fileId, {
-          startedAt: performance.now(),
-          duration: FILE_ANIM_DURATION,
-          prevSize,
-        });
-      }
-
-      // Returns the size (sim.width-equivalent) the drawn circle should
-      // use this frame. `actualSize` is the sim's current width (the
-      // target). Returns the actual size when no animation is active.
-      function animatedSize(fileId: string, actualSize: number): number {
-        const a = fileAnims.get(fileId);
-        if (!a) return actualSize;
-        const elapsed = performance.now() - a.startedAt;
-        if (elapsed >= a.duration) {
-          fileAnims.delete(fileId);
-          return actualSize;
-        }
-        const t = elapsed / a.duration;
-        // easeOutCubic — fast start, gentle settle.
-        const eased = 1 - Math.pow(1 - t, 3);
-        return a.prevSize + (actualSize - a.prevSize) * eased;
       }
 
 
@@ -704,6 +690,13 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       function dropSubtreeLayout(fileId: string): void {
         layoutsByFileId.delete(fileId);
+        // Drop any cached overlay layouts that belong to this file —
+        // when the file collapses or its AST is re-walked the overlay
+        // ids may no longer exist.
+        const prefix = `${fileId}#`;
+        for (const id of [...overlayLayouts.keys()]) {
+          if (id.startsWith(prefix)) overlayLayouts.delete(id);
+        }
       }
 
       // ----- per-frame draw -----
@@ -713,9 +706,13 @@ export function PixiCanvas({ project }: CanvasProps) {
         const selection = state.selection;
 
         worldGfx.clear();
+        overlayGfx.clear();
         semanticEdgeGfx.clear();
         hitRects.length = 0;
+        overlayHitRects.length = 0;
+        currentHitTarget = hitRects;
         visibleById.clear();
+        blockCellsThisFrame.clear();
         labelPool.beginFrame();
 
         // 1. Import edges (under rects). Now anchored to the specific
@@ -737,10 +734,36 @@ export function PixiCanvas({ project }: CanvasProps) {
           drawFile(sim, selection);
         }
 
-        // 3. Labels (above rects).
+        // 3. Overlays for expanded Blocks. Iterate multiple passes so
+        //    nested overlays (Block expanded inside another overlay)
+        //    can render after their parent has registered the cell
+        //    they anchor to. Stops once no new overlay drew this pass.
+        currentHitTarget = overlayHitRects;
+        const renderedOverlays = new Set<string>();
+        const overlaysToDraw = new Set<string>(state.expandedAstNodes);
+        // Include any block in a currently-animating shrink, even if
+        // it's no longer in expandedAstNodes (the user just toggled
+        // it off but the rect is still lerping back to cell size).
+        for (const id of blockAnims.keys()) overlaysToDraw.add(id);
+        let progress = true;
+        let safety = 8; // bound nesting depth — degenerate cases bail out
+        while (progress && safety-- > 0) {
+          progress = false;
+          for (const blockId of overlaysToDraw) {
+            if (renderedOverlays.has(blockId)) continue;
+            const cell = blockCellsThisFrame.get(blockId);
+            if (!cell) continue; // anchor not on this frame yet — wait
+            drawOverlay(blockId, cell, selection);
+            renderedOverlays.add(blockId);
+            progress = true;
+          }
+        }
+        currentHitTarget = hitRects;
+
+        // 4. Labels (above rects + overlays).
         labelPool.endFrame();
 
-        // 4. Semantic edges, drawn last on a dedicated graphics layered above
+        // 5. Semantic edges, drawn last on a dedicated graphics layered above
         //    labels. Border-clipped + arrowheaded so they're always visible.
         drawSemanticEdges(
           project.semanticEdges,
@@ -829,12 +852,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         // Expanded files: a translucent CIRCLE encompassing the cluster.
         // sim.width === sim.height by construction (see ensureExpandedLayout)
         // so radius = half the footprint. Selection thickens the stroke.
-        // The DRAWN radius is animated by `animatedSize` after a Block
-        // toggle — the circle grows from prev to target over ~250 ms.
-        // The hit-rect below uses the TARGET size so clicks land on the
-        // file's final footprint immediately (no ambiguity if the user
-        // clicks the about-to-grow-into region).
-        const fileRadius = animatedSize(sim.id, sim.width) / 2;
+        const fileRadius = sim.width / 2;
         worldGfx
           .circle(sim.x, sim.y, fileRadius)
           .fill({ color: COLORS.fileExpanded, alpha: 0.7 });
@@ -1026,6 +1044,122 @@ export function PixiCanvas({ project }: CanvasProps) {
         }
       }
 
+      // Render the expanded-Block overlay for `blockId`, anchored at
+      // the world position of its underlying collapsed cell. The
+      // overlay reads from a dedicated TreemapLayout in `getOverlayLayout`
+      // whose synthetic root IS the Block; that layout's interior
+      // mirrors the file's normal AST below the Block, with any deeper
+      // nested Blocks staying collapsed (clicking one creates its own
+      // overlay).
+      //
+      // While drawing, `currentHitTarget` is `overlayHitRects` (set by
+      // the caller) so all rects pushed by the recursive drawAstNode
+      // calls land in the priority hit list. The collapse handle in
+      // the top-left lives on this list too — re-clicking it (or
+      // anywhere in the overlay's chrome) toggles the block off.
+      function drawOverlay(
+        blockId: string,
+        cell: { x: number; y: number; w: number; h: number },
+        selection: string | null,
+      ): void {
+        const overlayTree = getOverlayLayout(blockId);
+        if (!overlayTree) return;
+        const blockNode = overlayTree.byId.get(blockId);
+        if (!blockNode) return;
+        const fileId = fileIdOfAstId(blockId);
+
+        // Overlay sizing. The full overlay rect anchors at the cell's
+        // top-left and extends right/down by the block layout's
+        // intrinsic dimensions. Block-anim (if active) lerps from the
+        // cell's footprint toward this full size so the overlay
+        // visibly grows out of the underlying cell — see the
+        // animation tracking near startBlockAnim above.
+        const targetW = blockNode.rect.w;
+        const targetH = blockNode.rect.h;
+        const anim = blockAnims.get(blockId);
+        let w = targetW;
+        let h = targetH;
+        if (anim) {
+          const elapsed = performance.now() - anim.startedAt;
+          if (elapsed < anim.duration) {
+            const t = elapsed / anim.duration;
+            const eased = 1 - Math.pow(1 - t, 3);
+            w = anim.prevW + (targetW - anim.prevW) * eased;
+            h = anim.prevH + (targetH - anim.prevH) * eased;
+          } else {
+            blockAnims.delete(blockId);
+          }
+        }
+
+        const x = cell.x;
+        const y = cell.y;
+
+        // Overlay background + outline. Slightly darker fill than
+        // file-expanded so the overlay reads as a layer above the
+        // file's content; same kind colour for the outline so the
+        // user keeps the "this is a Block" association.
+        const stroke = KIND_OUTLINE['Block'] ?? COLORS.astBorder;
+        overlayGfx
+          .rect(x, y, w, h)
+          .fill({ color: COLORS.fileExpanded, alpha: 0.95 })
+          .stroke({ color: stroke, width: 1.5 / cameraScale, alpha: 1 });
+
+        pushRect({
+          id: blockId,
+          fileId,
+          kind: 'ast',
+          x,
+          y,
+          w,
+          h,
+          area: w * h,
+        });
+
+        // Only render the overlay's children once the lerp has
+        // finished — during the grow they'd be drawn at full layout
+        // positions inside a smaller rect and would visually spill.
+        if (!anim) {
+          const kids = overlayTree.childrenByParent.get(blockId);
+          if (kids) {
+            for (const k of kids) {
+              drawAstNode(k, x, y, fileId, overlayTree, selection);
+            }
+          }
+        }
+
+        // Collapse handle: top-LEFT of the overlay (per the user's
+        // request to move it). Smaller-area HitRect with kind
+        // 'ast-toggle' takes priority over the overlay body for
+        // clicks in this region.
+        if (!anim && cameraScale >= OUTLINE_BELOW) {
+          const handleSize = 12 / cameraScale;
+          const handleInset = 4 / cameraScale;
+          const hx = x + handleInset;
+          const hy = y + handleInset;
+          const isHandleHovered =
+            hoveredHit?.kind === 'ast-toggle' && hoveredHit.id === blockId;
+          const lineW = (isHandleHovered ? 1.6 : 1) / cameraScale;
+          overlayGfx
+            .rect(hx, hy, handleSize, handleSize)
+            .fill({ color: stroke, alpha: isHandleHovered ? 0.5 : 0.25 })
+            .stroke({ color: stroke, width: lineW, alpha: 1 });
+          overlayGfx
+            .moveTo(hx + handleSize * 0.25, hy + handleSize / 2)
+            .lineTo(hx + handleSize * 0.75, hy + handleSize / 2)
+            .stroke({ color: stroke, width: lineW * 1.2, alpha: 1 });
+          pushRect({
+            id: blockId,
+            fileId,
+            kind: 'ast-toggle',
+            x: hx,
+            y: hy,
+            w: handleSize,
+            h: handleSize,
+            area: handleSize * handleSize,
+          });
+        }
+      }
+
       function drawAstNode(
         node: TreemapNode,
         baseX: number,
@@ -1041,47 +1175,9 @@ export function PixiCanvas({ project }: CanvasProps) {
         const minScreen = Math.min(wOnScreen, hOnScreen);
         if (minScreen < CULL_PX) return;
 
-        // Block animation: when the user just toggled this Block,
-        // render a kind-outlined rect that lerps from the pre-toggle
-        // world rect to its current target rect over ~250 ms — and
-        // skip the normal rendering (rect/label/children) until the
-        // lerp completes. This is what makes the user see a block
-        // GROWING or SHRINKING rather than popping. Once the duration
-        // is up the entry is dropped and the regular drawing kicks in,
-        // so children appear inside the now-final-sized cell.
-        const bAnim = blockAnims.get(node.id);
-        if (bAnim) {
-          const elapsed = performance.now() - bAnim.startedAt;
-          if (elapsed < bAnim.duration) {
-            const t = elapsed / bAnim.duration;
-            const eased = 1 - Math.pow(1 - t, 3);
-            const lx = bAnim.prevX + (x - bAnim.prevX) * eased;
-            const ly = bAnim.prevY + (y - bAnim.prevY) * eased;
-            const lw = bAnim.prevW + (node.rect.w - bAnim.prevW) * eased;
-            const lh = bAnim.prevH + (node.rect.h - bAnim.prevH) * eased;
-            const stroke = KIND_OUTLINE[node.syntaxKind] ?? COLORS.astBorder;
-            worldGfx
-              .rect(lx, ly, lw, lh)
-              .fill({ color: stroke, alpha: 0.08 })
-              .stroke({
-                color: stroke,
-                width: 1 / cameraScale,
-                alpha: 1,
-              });
-            pushRect({
-              id: node.id,
-              fileId,
-              kind: 'ast',
-              x: lx,
-              y: ly,
-              w: lw,
-              h: lh,
-              area: lw * lh,
-            });
-            return;
-          }
-          blockAnims.delete(node.id);
-        }
+        // (The Block grow/shrink animation now lives in drawOverlay —
+        // the underlying main-scene cell stays at its layout size and
+        // the overlay animates above it.)
 
         // Member-container path: classes / interfaces whose members were
         // arranged by their own fractal force layout (see astForce.ts's
@@ -1130,6 +1226,17 @@ export function PixiCanvas({ project }: CanvasProps) {
             h: node.rect.h,
             area: node.rect.w * node.rect.h,
           });
+          // Record the cell's world rect so any overlay built for this
+          // Block can anchor its top-left here. Only Block kinds: other
+          // collapsed leaves don't get overlays.
+          if (node.syntaxKind === 'Block') {
+            blockCellsThisFrame.set(node.id, {
+              x,
+              y,
+              w: node.rect.w,
+              h: node.rect.h,
+            });
+          }
           return;
         }
 
@@ -1532,50 +1639,9 @@ export function PixiCanvas({ project }: CanvasProps) {
         for (const k of kids) {
           drawAstNode(k, baseX, baseY, fileId, tree, selection);
         }
-
-        // Top-right collapse handle for expanded Blocks. Drawn AFTER
-        // children so it sits on top, with its own (smaller-area)
-        // 'ast-toggle' HitRect that wins hit-test for clicks in its
-        // region — children below in the same area are clicked
-        // through. The handle is screen-constant so it stays clickable
-        // at any zoom, faint until hovered, brighter on hover.
-        if (
-          node.syntaxKind === 'Block' &&
-          !node.collapsed &&
-          kids.length > 0 &&
-          cameraScale >= OUTLINE_BELOW
-        ) {
-          const handleSize = 12 / cameraScale;
-          const handleInset = 4 / cameraScale;
-          // Top-right corner inside the Block. handleInset keeps the
-          // glyph off the outline so the two visually separate.
-          const hx = x + node.rect.w - handleSize - handleInset;
-          const hy = y + handleInset;
-          const stroke = KIND_OUTLINE[node.syntaxKind] ?? COLORS.astBorder;
-          const isHandleHovered =
-            hoveredHit?.kind === 'ast-toggle' && hoveredHit.id === node.id;
-          const lineW = (isHandleHovered ? 1.6 : 1) / cameraScale;
-          worldGfx
-            .rect(hx, hy, handleSize, handleSize)
-            .fill({ color: stroke, alpha: isHandleHovered ? 0.5 : 0.25 })
-            .stroke({ color: stroke, width: lineW, alpha: 1 });
-          // Minus glyph — a horizontal bar centred in the box, evoking
-          // "remove detail" / "collapse this back to a single cell".
-          worldGfx
-            .moveTo(hx + handleSize * 0.25, hy + handleSize / 2)
-            .lineTo(hx + handleSize * 0.75, hy + handleSize / 2)
-            .stroke({ color: stroke, width: lineW * 1.2, alpha: 1 });
-          pushRect({
-            id: node.id,
-            fileId,
-            kind: 'ast-toggle',
-            x: hx,
-            y: hy,
-            w: handleSize,
-            h: handleSize,
-            area: handleSize * handleSize,
-          });
-        }
+        // (Expanded-Block collapse handle now lives on the overlay,
+        // top-left — see drawOverlay above. Main-scene Block cells
+        // are always rendered as the small collapsed magenta square.)
       }
 
       // Ease the camera so the followed node sits at screen center. Runs
@@ -1685,7 +1751,20 @@ export function PixiCanvas({ project }: CanvasProps) {
         setCameraScale: (s: number) => {
           cameraScale = s;
         },
-        hitTest: (worldX: number, worldY: number) => smallestContaining(hitRects, worldX, worldY),
+        hitTest: (worldX: number, worldY: number) => {
+          // Overlays first: an expanded Block's overlay sits on top of
+          // the main scene, so its contents (and the underlying cell)
+          // should win clicks within their bounds. Fall through to
+          // the main scene's rects only when no overlay contains the
+          // point.
+          const overlay = smallestContaining(
+            overlayHitRects,
+            worldX,
+            worldY,
+          );
+          if (overlay) return overlay;
+          return smallestContaining(hitRects, worldX, worldY);
+        },
         onClick: handleClick,
         onHover: (target) => {
           hoveredHit = target;
@@ -1718,13 +1797,21 @@ export function PixiCanvas({ project }: CanvasProps) {
           followAt = null;
           return;
         }
-        // Default: follow this node immediately. Block-toggle path
+        // Default: follow this node immediately. The Block-toggle path
         // below overrides `followStartAt` so the pan waits until the
         // grow/shrink animation completes — otherwise the camera
-        // chases a target whose rect is being lerped.
-        followId = target.id;
-        followStartAt = 0;
-        followAt = null;
+        // chases a target whose rect is being lerped. Handle clicks
+        // (kind 'ast-toggle') are COLLAPSE actions: leave the camera
+        // alone so the user's current view doesn't drift just because
+        // they tucked away a block.
+        if (target.kind === 'ast-toggle') {
+          followId = null;
+          followAt = null;
+        } else {
+          followId = target.id;
+          followStartAt = 0;
+          followAt = null;
+        }
         if (target.kind === 'file') {
           void onFileClick(target.fileId);
           return;
@@ -1737,35 +1824,38 @@ export function PixiCanvas({ project }: CanvasProps) {
         if (target.kind !== 'ast-toggle') {
           state.setSelection(target.id);
         }
-        // Block toggle: clicking the magenta sequential-code cell flips
-        // its entry in the store's expandedAstNodes. The layout cache
-        // for this file invalidates (its expandedSnapshot no longer
-        // matches); applyExpansionToSim pushes the new size into the
-        // file-level sim (so collide + link forces are correct and
-        // neighbours start moving right away). We also snapshot the
-        // prev/target sizes for the per-file circle-grow animation,
-        // which lerps the DRAWN radius over ~250 ms — keeps the
-        // transition smooth instead of jumping.
-        const tree = activeTree(target.fileId);
-        const tn = tree?.byId.get(target.id);
-        if (tn && tn.syntaxKind === 'Block') {
-          // Snapshot the Block's CURRENT world rect (the magenta cell
-          // the user just clicked) before the toggle — drawAstNode then
-          // lerps from this snapshot toward the post-toggle rect over
-          // ~250 ms, so the user sees the Block visibly grow/shrink
-          // instead of popping into its new shape.
-          const prevX = target.x;
-          const prevY = target.y;
-          const prevW = target.w;
-          const prevH = target.h;
-          const fileSim = layout.byId.get(target.fileId);
-          const prevSize = fileSim?.width ?? 0;
+        // Block toggle: clicking the magenta cell (in the main scene)
+        // or an overlay's handle (kind 'ast-toggle') flips this Block
+        // in expandedAstNodes. The MAIN layout doesn't change — the
+        // file's footprint is stable across toggles — so we don't
+        // call applyExpansionToSim. drawOverlay reads the new
+        // expandedAstNodes set on the next frame and renders the
+        // overlay; startBlockAnim primes the rect-grow animation.
+        const mainTree = activeTree(target.fileId);
+        const tn = mainTree?.byId.get(target.id);
+        const isBlock =
+          tn?.syntaxKind === 'Block' || target.kind === 'ast-toggle';
+        if (isBlock) {
+          // Two cases for the prev-rect snapshot:
+          //   * Expanding: target is the cell HitRect (kind 'ast'); its
+          //     w/h are the cell's small size.
+          //   * Collapsing: target is the overlay handle (kind
+          //     'ast-toggle'). prev is the OVERLAY's current rendered
+          //     size — read the overlay layout root's rect for that.
+          let prevW: number;
+          let prevH: number;
+          if (target.kind === 'ast-toggle') {
+            const overlayTree = getOverlayLayout(target.id);
+            const root = overlayTree?.byId.get(target.id);
+            prevW = root?.rect.w ?? target.w;
+            prevH = root?.rect.h ?? target.h;
+          } else {
+            prevW = target.w;
+            prevH = target.h;
+          }
           state.toggleAstNode(target.id);
-          applyExpansionToSim();
-          const targetSize = fileSim?.width ?? prevSize;
-          startFileAnim(target.fileId, prevSize, targetSize);
-          startBlockAnim(target.id, prevX, prevY, prevW, prevH);
-          // Defer the camera pan until the Block-grow animation is
+          startBlockAnim(target.id, prevW, prevH);
+          // Defer the camera pan until the overlay-grow animation is
           // done. updateFollow honours this AND snapshots the target's
           // position on its first active frame so the camera eases
           // toward a fixed point rather than chasing the sim, which

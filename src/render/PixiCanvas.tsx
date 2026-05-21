@@ -925,19 +925,25 @@ export function PixiCanvas({ project }: CanvasProps) {
         return parts.slice(0, take).join('/');
       }
 
-      // Pick the smallest cluster depth where the total distinct
-      // groups falls into a manageable range for the current zoom
-      // level. The target band widens as the user zooms IN — more
-      // detail allowed. At extreme zoom-out we cap at ~10 groups so
-      // the scene reads as 'this many architectural blobs'; near
-      // full zoom we allow finer groupings (close to leaf-parent).
+      // Pick the LARGEST cluster depth whose distinct-group count
+      // still fits the current zoom's target window. The target
+      // widens as the user zooms IN — more detail allowed. At
+      // extreme zoom-out we want ~8 groups (architectural blobs);
+      // near full zoom we want fine groupings close to leaf-parent.
+      //
+      // 'Largest acceptable depth' (rather than first acceptable):
+      // for a project whose files all live under a single top-level
+      // directory like `src/`, depth 1 yields ONE group ('src') with
+      // every file in it — useless. Depth 2 typically resolves to the
+      // real architectural subdirectories, which is what we want.
+      // Stop iterating only when the next depth exceeds the cap.
       function chooseClusterDepth(): number {
         const hideSupport = !useGraphStore.getState().showSupportFiles;
-        // 8 groups at scale 0; up to ~40 by scale 1; linear ramp.
         const targetMax = Math.max(
-          6,
-          Math.min(50, Math.round(8 + cameraScale * 40)),
+          8,
+          Math.min(60, Math.round(10 + cameraScale * 80)),
         );
+        let chosen = 1;
         for (let d = 1; d <= 6; d++) {
           const set = new Set<string>();
           for (const f of layout.nodes) {
@@ -946,9 +952,10 @@ export function PixiCanvas({ project }: CanvasProps) {
             if (c) set.add(c);
           }
           if (set.size === 0) continue;
-          if (set.size <= targetMax) return d;
+          if (set.size > targetMax) break;
+          chosen = d;
         }
-        return 6;
+        return chosen;
       }
       const convexHull = (pts: Pt[]): Pt[] => {
         if (pts.length < 3) return pts.slice();
@@ -1599,6 +1606,18 @@ export function PixiCanvas({ project }: CanvasProps) {
         // and by drawEdges + drawSemanticEdges via per-edge alpha.
         maybeRecomputeLiveFiles();
 
+        // Active cluster grouping for this frame — drives BOTH the
+        // directory hulls / super-nodes AND the intra-cluster edge
+        // gate so they all read consistently. At low zoom this is
+        // coarse ('src/components'); at high zoom it approaches the
+        // leaf parent. Computed once and reused.
+        const activeClusterDepth = chooseClusterDepth();
+        const fileToActiveCluster = new Map<string, string>();
+        for (const sim of layout.nodes) {
+          const c = clusterDirOf(sim.relativePath, activeClusterDepth);
+          if (c) fileToActiveCluster.set(sim.id, c);
+        }
+
         // Path-trace lookup: a set of "${a}|${b}" keys for every
         // CONSECUTIVE pair in state.tracedPath (both directions, so
         // edge-direction independence is automatic). drawEdges /
@@ -1639,7 +1658,11 @@ export function PixiCanvas({ project }: CanvasProps) {
             liveFiles,
             pathEdgeKeys,
             hideSupportForEdges ? supportFileIds : null,
-            fileToDir,
+            // Use the ACTIVE cluster grouping (zoom-adaptive depth)
+            // so the intra-cluster edge gate matches what the hulls
+            // group into. Otherwise edges between same-cluster but
+            // different-leaf-directory files would still draw.
+            fileToActiveCluster,
           );
         } else {
           visibleSemanticPairs.clear();
@@ -1805,7 +1828,8 @@ export function PixiCanvas({ project }: CanvasProps) {
             liveFiles,
             pathEdgeKeys,
             hideSupportForEdges ? supportFileIds : null,
-            fileToDir,
+            // Same active-cluster grouping as drawEdges (above).
+            fileToActiveCluster,
           );
         }
       }

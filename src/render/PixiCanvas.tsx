@@ -123,13 +123,17 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
   ElementAccessExpression: 'index',
   PrefixUnaryExpression: 'unary',
   PostfixUnaryExpression: 'unary',
-  ConditionalExpression: 'ternary',
+  ConditionalExpression: '?:',
   ArrowFunction: '=>',
   FunctionExpression: 'fn',
   AwaitExpression: 'await',
   YieldExpression: 'yield',
-  SpreadElement: 'spread',
-  TemplateExpression: 'template',
+  SpreadElement: '...',
+  TemplateExpression: '`...`',
+  // The braces stand in for the object literal itself; non-empty
+  // objects show their members as kids INSIDE the rect, reading as
+  // `{ a: 1, b: 2 }` with the braces at top-left.
+  ObjectLiteralExpression: '{}',
   // `[]` reads as the array literal itself in both empty and
   // non-empty cases: an empty rect shows '[]', a non-empty rect
   // shows '[]' at top-left with the elements as kids inside it,

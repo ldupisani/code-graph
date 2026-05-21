@@ -1835,21 +1835,33 @@ export function PixiCanvas({ project }: CanvasProps) {
       }
 
       // If a file's expanded footprint doesn't fit at the current zoom,
-      // schedule a smooth zoom-OUT (never zoom in) so it lands inside
-      // the viewport with a small margin. Pivots around the file's
-      // current centre so the file shrinks in place; the existing
-      // followId pan then centres it.
+      // schedule a smooth zoom-OUT (never zoom in) so it lands at
+      // ~75% of the viewport on its constraining axis — i.e. the
+      // file's larger-dimension takes up 75% of the corresponding
+      // screen dimension, leaving 12.5% of breathing room on each
+      // side. Re-engages the follow on the file so the pan and the
+      // zoom converge together; the click handler set followId
+      // earlier against the collapsed-size sim node, but the AST
+      // fetch's async tail completes well after that pan has already
+      // settled and released the camera — so by the time we land
+      // here, no follow is in flight.
       function fitFileInViewport(fileId: string): void {
         const simNode = layout.byId.get(fileId);
         if (!simNode) return;
-        // 10% breathing room on each axis — flush-to-edge reads as
-        // clipped even when geometrically correct.
-        const MARGIN = 0.9;
-        const fitW = (app.screen.width * MARGIN) / simNode.width;
-        const fitH = (app.screen.height * MARGIN) / simNode.height;
+        const TARGET_OCCUPANCY = 0.75; // 75% of the viewport on the tighter axis
+        const fitW = (app.screen.width * TARGET_OCCUPANCY) / simNode.width;
+        const fitH = (app.screen.height * TARGET_OCCUPANCY) / simNode.height;
         const fitScale = Math.min(fitW, fitH);
+        // Re-engage the follow so the camera centres on the file as
+        // it zooms. Reset followAt so it captures the file's CURRENT
+        // sim position (which may have shifted from its collapsed-time
+        // location when applyExpansion restarted the sim).
+        followId = fileId;
+        followAt = null;
+        followStartAt = 0;
         // Only ever zoom OUT to fit. If the file already fits at the
-        // user's current zoom, leave their zoom alone.
+        // user's current zoom, leave their zoom alone — the follow
+        // re-engaged above is enough.
         if (fitScale >= world.scale.x) return;
         zoomFit = {
           targetScale: fitScale,

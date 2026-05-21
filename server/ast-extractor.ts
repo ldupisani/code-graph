@@ -218,7 +218,10 @@ function isTypeImportBinding(node: Node): boolean {
 // inner Identifier so it doesn't render its own rect.
 function synthesizeTypeRefLabel(node: Node, inlined: Set<Node>): string | null {
   if (node.getKind() !== ts.SyntaxKind.TypeReference) return null;
-  node.forEachDescendant((d) => inlined.add(d));
+  // Use the array form so every descendant — type-argument identifiers,
+  // TypeQuery exprNames, qualified-name segments — is unambiguously
+  // included before visit() reaches them via forEachChild.
+  for (const d of node.getDescendants()) inlined.add(d);
   return node.getText();
 }
 
@@ -424,9 +427,14 @@ function syntaxKindName(kind: ts.SyntaxKind): string {
 }
 
 // Operator glyph for "relational" nodes the client renders as
-// [left] op [right]: a BinaryExpression's actual operator (covers `=`, `+`,
-// `===`, `&&`, `+=`, …) or the implicit `=` of an initialized variable
-// declaration (`let i = j`). Undefined for everything else.
+// [left] op [right]:
+//   * a BinaryExpression's actual operator (covers `=`, `+`,
+//     `===`, `&&`, `+=`, …)
+//   * the implicit `=` of an initialized variable declaration
+//     (`let i = j`) or class property (`tickInterval = null`)
+//   * the `|` / `&` between members of a TypeScript Union /
+//     Intersection type (`A | B`, `A & B`).
+// Undefined for everything else.
 function operatorOf(node: Node): string | undefined {
   if (Node.isBinaryExpression(node)) {
     return node.getOperatorToken().getText();
@@ -434,6 +442,12 @@ function operatorOf(node: Node): string | undefined {
   if (Node.isVariableDeclaration(node) && node.getInitializer()) {
     return '=';
   }
+  if (Node.isPropertyDeclaration(node) && node.getInitializer()) {
+    return '=';
+  }
+  const k = node.getKind();
+  if (k === ts.SyntaxKind.UnionType) return '|';
+  if (k === ts.SyntaxKind.IntersectionType) return '&';
   return undefined;
 }
 
@@ -477,6 +491,18 @@ function isTrivialToken(kind: ts.SyntaxKind): boolean {
   // contiguous ranges (FirstPunctuation..LastPunctuation, FirstKeyword..LastKeyword).
   // Skip those plus the "Unknown" / "EndOfFileToken" sentinels.
   if (kind === ts.SyntaxKind.EndOfFileToken) return true;
+  // Value-literal keywords are NOT trivial — their identity (which keyword)
+  // carries real information that the user expects to see. `null`, `true`,
+  // and `false` appear as initializers (`= null`), operands, and union
+  // members (`Foo | null`); collapsing them with other punctuation would
+  // leave those positions visibly empty.
+  if (
+    kind === ts.SyntaxKind.NullKeyword ||
+    kind === ts.SyntaxKind.TrueKeyword ||
+    kind === ts.SyntaxKind.FalseKeyword
+  ) {
+    return false;
+  }
   if (kind >= ts.SyntaxKind.FirstPunctuation && kind <= ts.SyntaxKind.LastPunctuation) return true;
   if (kind >= ts.SyntaxKind.FirstKeyword && kind <= ts.SyntaxKind.LastKeyword) return true;
   return false;
@@ -551,6 +577,17 @@ function friendlyName(node: Node, inlined: Set<Node>): string | null {
   // the name — surface it so the rect shows "x" rather than the generic
   // "identifier" client fallback.
   if (kind === ts.SyntaxKind.Identifier) {
+    return node.getText();
+  }
+
+  // Value keywords used as expressions / initializers / union members:
+  // they aren't Identifiers but their source text is the label the user
+  // expects. `null`, `true`, `false`.
+  if (
+    kind === ts.SyntaxKind.NullKeyword ||
+    kind === ts.SyntaxKind.TrueKeyword ||
+    kind === ts.SyntaxKind.FalseKeyword
+  ) {
     return node.getText();
   }
 

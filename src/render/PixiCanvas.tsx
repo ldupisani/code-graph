@@ -1662,8 +1662,18 @@ export function PixiCanvas({ project }: CanvasProps) {
           if (cameraScale < FILE_LABEL_BELOW && !isSelected && !isHovered) {
             return;
           }
+          // Expanded files AND hovered files show the FULL
+          // relative path (so the user can see WHERE the file lives
+          // in the project). Collapsed, unhovered files show just
+          // the basename — at typical zooms with many file icons
+          // packed close together, basename keeps the canvas
+          // readable while full path would crowd it.
+          const text =
+            expanded || isHovered
+              ? sim.relativePath
+              : fileLabel(sim.relativePath);
           labelPool.put({
-            text: fileLabel(sim.relativePath),
+            text,
             worldX: sim.x,
             worldY: topY - aboveGap,
             color: COLORS.text,

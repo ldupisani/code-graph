@@ -642,17 +642,18 @@ export function PixiCanvas({ project }: CanvasProps) {
       const worldGfx = new Graphics();
       world.addChild(worldGfx);
 
-      const labelLayer = new Container();
-      world.addChild(labelLayer);
-
-      // Focus-mode dimming overlay. Sits ABOVE worldGfx + labelLayer so
-      // it can darken both rects AND labels of files outside the
-      // current neighbourhood, with one translucent rect per dimmed
-      // file. Drawn each frame after the file pass; empty when focus
-      // mode is off. Below semanticEdgeGfx so edges (which dim
-      // themselves via per-edge alpha) stay visible.
+      // Focus-mode dimming overlay. Sits BETWEEN worldGfx and
+      // labelLayer so it darkens directory hulls + file icons +
+      // edges, but NOT the labels above it. Keeping labels bright
+      // means file names and directory names stay readable across
+      // the whole scene even when their underlying content is
+      // dimmed — exactly the 'always know where you are' affordance
+      // a code map needs, even in focus mode.
       const dimGfx = new Graphics();
       world.addChild(dimGfx);
+
+      const labelLayer = new Container();
+      world.addChild(labelLayer);
 
       const semanticEdgeGfx = new Graphics();
       world.addChild(semanticEdgeGfx);
@@ -829,6 +830,16 @@ export function PixiCanvas({ project }: CanvasProps) {
       // files). Used by the intra-directory edge LOD gate so we can
       // ask "are these two files siblings?" in O(1).
       const fileToDir = new Map<string, string>();
+      // Active cluster grouping for the CURRENT frame — rebuilt at
+      // the top of draw() using the zoom-adaptive cluster depth.
+      // Used by:
+      //   * drawDirectoryBoundaries (hull grouping),
+      //   * drawEdges / drawSemanticEdges (intra-cluster edge gate),
+      //   * drawFile (file-icon body color, so icons match their
+      //     hull at the current zoom level).
+      // Lifted to IIFE scope so drawFile — defined at IIFE scope,
+      // not inside draw() — can read it without parameter threading.
+      let fileToActiveCluster = new Map<string, string>();
       for (const f of project.files) {
         if (isSupportFile(f.relativePath)) supportFileIds.add(f.id);
         const i = f.relativePath.lastIndexOf('/');
@@ -1388,13 +1399,14 @@ export function PixiCanvas({ project }: CanvasProps) {
         // and by drawEdges + drawSemanticEdges via per-edge alpha.
         maybeRecomputeLiveFiles();
 
-        // Active cluster grouping for this frame — drives BOTH the
-        // directory hulls / super-nodes AND the intra-cluster edge
-        // gate so they all read consistently. At low zoom this is
-        // coarse ('src/components'); at high zoom it approaches the
-        // leaf parent. Computed once and reused.
+        // Active cluster grouping for this frame — drives hulls,
+        // intra-cluster edge gate, AND file-icon coloring so they
+        // all read consistently. At low zoom this is coarse
+        // ('src/components'); at high zoom it approaches the leaf
+        // parent. The Map is closure-scoped (IIFE level) so drawFile
+        // can read it; rebuilt fresh each frame here.
         const activeClusterDepth = chooseClusterDepth();
-        const fileToActiveCluster = new Map<string, string>();
+        fileToActiveCluster = new Map<string, string>();
         for (const sim of layout.nodes) {
           const c = clusterDirOf(sim.relativePath, activeClusterDepth);
           if (c) fileToActiveCluster.set(sim.id, c);
@@ -3903,6 +3915,12 @@ interface LabelRequest {
   // counteract the world container's zoom and keep the rasterized text
   // constant on screen regardless of how far in/out the user has zoomed.
   scale?: number;
+  // Optional outline color + width (Pixi Text stroke). Lets a label
+  // read against a busy backdrop — e.g. a file-name floating above
+  // a cluster of file icons — by drawing a dark halo around each
+  // glyph. Width is in canvas pixels (not screen px); a value of
+  // ~3 px gives a visible halo at typical font sizes.
+  stroke?: { color: number; width: number };
 }
 
 // Content-keyed Text cache (replaces the previous position-indexed
@@ -3940,14 +3958,18 @@ class LabelPool {
   }
 
   put(req: LabelRequest): void {
-    // Key on text + size + color so any combination of those gets
-    // its OWN stable Text instance. Style mutations (fontSize, fill)
-    // also hit Pixi v8's broken returnTexture path when the canvas
-    // resizes — same bug as in-place text mutation. Treating each
-    // (text, size, color) as a distinct cache entry sidesteps the
-    // mutation entirely; only position / scale / visibility are
-    // touched per frame, none of which resize the canvas.
-    const key = `${req.text}|${req.size}|${req.color.toString(16)}`;
+    // Key on text + size + color + stroke so any combination of
+    // those gets its OWN stable Text instance. Style mutations
+    // (fontSize, fill, stroke) hit Pixi v8's broken returnTexture
+    // path when the canvas resizes — same bug as in-place text
+    // mutation. Treating each style combo as a distinct cache entry
+    // sidesteps the mutation entirely; only position / scale /
+    // visibility are touched per frame, none of which resize the
+    // canvas.
+    const strokeKey = req.stroke
+      ? `${req.stroke.color.toString(16)}/${req.stroke.width}`
+      : '';
+    const key = `${req.text}|${req.size}|${req.color.toString(16)}|${strokeKey}`;
     let label = this.cache.get(key);
     if (!label) {
       label = new Text({
@@ -3956,6 +3978,15 @@ class LabelPool {
           fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
           fontSize: req.size,
           fill: req.color,
+          ...(req.stroke
+            ? {
+                stroke: {
+                  color: req.stroke.color,
+                  width: req.stroke.width,
+                  join: 'round' as const,
+                },
+              }
+            : {}),
         },
       });
       label.eventMode = 'none';

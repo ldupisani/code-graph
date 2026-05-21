@@ -1151,14 +1151,17 @@ export function PixiCanvas({ project }: CanvasProps) {
         const x = cell.x;
         const y = cell.y;
 
-        // Overlay background + outline. Slightly darker fill than
-        // file-expanded so the overlay reads as a layer above the
-        // file's content; same kind colour for the outline so the
-        // user keeps the "this is a Block" association.
+        // Overlay background + outline. FULLY opaque — even a few
+        // percent of transparency lets strokes from the layer below
+        // (e.g. a Parameter rect's light-blue outline) show through as
+        // a faint ghost, which reads as "text peeking through" even
+        // when no actual label is leaking. The kind-coloured stroke
+        // and the alpha-0.55 file circle behind do enough of the
+        // "this is a layer above the file" lift on their own.
         const stroke = KIND_OUTLINE['Block'] ?? COLORS.astBorder;
         worldGfx
           .rect(x, y, w, h)
-          .fill({ color: COLORS.fileExpanded, alpha: 0.95 })
+          .fill({ color: COLORS.fileExpanded, alpha: 1 })
           .stroke({ color: stroke, width: 1.5 / cameraScale, alpha: 1 });
 
         pushRect({

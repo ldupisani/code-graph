@@ -35,6 +35,14 @@ export interface GraphStore {
   // subscribing to per-frame camera updates. Stale if the user pans
   // while hovering — small UX cost, big complexity saving.
   hoveredScreenRect: { x: number; y: number; w: number; h: number } | null;
+  // "Focus mode": when set, the renderer dims every file outside the
+  // N-hop neighbourhood of the focused file (computed over the
+  // currently-visible edges per edgeFilter). null = no focus, full
+  // brightness everywhere. focusId follows selection by default but
+  // is kept separate so future features (path tracing, multi-focus)
+  // can drive it independently.
+  focusId: string | null;
+  focusHops: number;
   setProject: (p: ProjectResponse | null) => void;
   refreshProject: (p: ProjectResponse) => void;
   setSelection: (id: string | null) => void;
@@ -47,6 +55,7 @@ export interface GraphStore {
     id: string | null,
     screenRect: { x: number; y: number; w: number; h: number } | null,
   ) => void;
+  setFocus: (id: string | null, hops?: number) => void;
 }
 
 const ALL_EDGES_ON: EdgeFilter = { imports: true, calls: true, extends: true };
@@ -60,6 +69,8 @@ export const useGraphStore = create<GraphStore>((set) => ({
   edgeFilter: { ...ALL_EDGES_ON },
   hoveredId: null,
   hoveredScreenRect: null,
+  focusId: null,
+  focusHops: 1,
   setProject: (project) =>
     set({
       project,
@@ -68,6 +79,8 @@ export const useGraphStore = create<GraphStore>((set) => ({
       expandedAstNodes: new Set(),
       asts: new Map(),
       edgeFilter: { ...ALL_EDGES_ON },
+      focusId: null,
+      focusHops: 1,
     }),
   // Used after a filesystem-driven re-walk: file-level identity is stable so
   // we keep expansion state, but AST node IDs may have shifted (sequential
@@ -114,6 +127,13 @@ export const useGraphStore = create<GraphStore>((set) => ({
     set((s) => ({ edgeFilter: { ...s.edgeFilter, ...next } })),
   setHover: (hoveredId, hoveredScreenRect) =>
     set({ hoveredId, hoveredScreenRect }),
+  setFocus: (focusId, hops) =>
+    set((s) => ({
+      focusId,
+      // hops only updates when explicitly passed; clears to 1 on
+      // focus-clear so the next focus starts from the default.
+      focusHops: hops != null ? hops : focusId ? s.focusHops : 1,
+    })),
 }));
 
 // Dev-only escape hatch: lets the chrome-devtools-mcp / browser console drive

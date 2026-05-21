@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useGraphStore, type EdgeFilter } from '../graph/store';
 
 // HUD overlay: three pill toggles for the user's edge-type lens.
@@ -23,6 +24,8 @@ export function EdgeFilterPills() {
   const project = useGraphStore((s) => s.project);
   const edgeFilter = useGraphStore((s) => s.edgeFilter);
   const setEdgeFilter = useGraphStore((s) => s.setEdgeFilter);
+  const focusId = useGraphStore((s) => s.focusId);
+  const focusHops = useGraphStore((s) => s.focusHops);
 
   // Hide when no project is open — there are no edges to filter.
   if (!project) return null;
@@ -34,7 +37,8 @@ export function EdgeFilterPills() {
         top: '0.6rem',
         left: '0.8rem',
         display: 'flex',
-        gap: '0.4rem',
+        alignItems: 'center',
+        gap: '0.6rem',
         fontFamily: 'ui-monospace, monospace',
         fontSize: '0.75rem',
         userSelect: 'none',
@@ -49,7 +53,37 @@ export function EdgeFilterPills() {
           onToggle={() => setEdgeFilter({ [kind]: !edgeFilter[kind] })}
         />
       ))}
+      {focusId && (
+        <span
+          style={{
+            opacity: 0.75,
+            color: '#cfcfd6',
+            paddingLeft: '0.4rem',
+            borderLeft: '1px solid rgba(120, 120, 130, 0.35)',
+          }}
+        >
+          focus {focusHops} hop{focusHops === 1 ? '' : 's'} ·{' '}
+          <Kbd>+</Kbd>/<Kbd>-</Kbd> · <Kbd>Esc</Kbd>
+        </span>
+      )}
     </div>
+  );
+}
+
+function Kbd({ children }: { children: React.ReactNode }) {
+  return (
+    <span
+      style={{
+        padding: '0.05rem 0.3rem',
+        border: '1px solid rgba(120,120,130,0.45)',
+        borderRadius: 3,
+        fontSize: '0.7rem',
+        color: '#d4d4d4',
+        background: 'rgba(40,40,46,0.55)',
+      }}
+    >
+      {children}
+    </span>
   );
 }
 

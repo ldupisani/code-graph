@@ -501,6 +501,15 @@ export function PixiCanvas({ project }: CanvasProps) {
       const labelLayer = new Container();
       world.addChild(labelLayer);
 
+      // Focus-mode dimming overlay. Sits ABOVE worldGfx + labelLayer so
+      // it can darken both rects AND labels of files outside the
+      // current neighbourhood, with one translucent rect per dimmed
+      // file. Drawn each frame after the file pass; empty when focus
+      // mode is off. Below semanticEdgeGfx so edges (which dim
+      // themselves via per-edge alpha) stay visible.
+      const dimGfx = new Graphics();
+      world.addChild(dimGfx);
+
       const semanticEdgeGfx = new Graphics();
       world.addChild(semanticEdgeGfx);
 
@@ -630,6 +639,99 @@ export function PixiCanvas({ project }: CanvasProps) {
       // Camera (mirrors world.scale.x; held in a ref so handlers can read
       // and write without a closure stale-read.)
       let cameraScale = world.scale.x;
+
+      // ----- focus-mode adjacency + live set -----
+      //
+      // Per-kind file-to-file adjacency. Built once from project.edges
+      // (imports) + project.semanticEdges (calls / extends / implements;
+      // 'implements' folds into 'extends' to match the UI's pill
+      // grouping). Both directions are stored so phase 6's reverse-call
+      // query can pick the right one.
+      //
+      // Why file-level (not per-AST-node): the user's mental model of
+      // "what relates to this" is dominated by file boundaries — they
+      // click a thing IN a file and want to see other FILES it touches.
+      // AST-level focus could come later if needed.
+      type EdgeBucket = {
+        out: Map<string, Set<string>>;
+        in: Map<string, Set<string>>;
+      };
+      type AdjKind = 'imports' | 'calls' | 'extends';
+      const emptyBucket = (): EdgeBucket => ({ out: new Map(), in: new Map() });
+      const fileEdgesByKind: Record<AdjKind, EdgeBucket> = {
+        imports: emptyBucket(),
+        calls: emptyBucket(),
+        extends: emptyBucket(),
+      };
+      const addAdjacency = (kind: AdjKind, from: string, to: string): void => {
+        if (from === to) return;
+        const b = fileEdgesByKind[kind];
+        let outSet = b.out.get(from);
+        if (!outSet) {
+          outSet = new Set();
+          b.out.set(from, outSet);
+        }
+        outSet.add(to);
+        let inSet = b.in.get(to);
+        if (!inSet) {
+          inSet = new Set();
+          b.in.set(to, inSet);
+        }
+        inSet.add(from);
+      };
+      for (const e of project.edges) {
+        addAdjacency('imports', e.fromId, e.toId);
+      }
+      for (const e of project.semanticEdges) {
+        const fromFile = fileIdOfAstId(e.fromId);
+        const toFile = fileIdOfAstId(e.toId);
+        const kind: AdjKind =
+          e.kind === 'extends' || e.kind === 'implements' ? 'extends' : 'calls';
+        addAdjacency(kind, fromFile, toFile);
+      }
+
+      // Cached live set + the inputs that produced it; recomputed in
+      // the ticker when any of them change. liveFiles === null means
+      // "no focus mode active, render everything at full brightness".
+      let liveFiles: Set<string> | null = null;
+      let liveFilesKey = '';
+      const computeLiveFiles = (): Set<string> | null => {
+        const st = useGraphStore.getState();
+        if (!st.focusId) return null;
+        const seedFile = st.focusId.includes('#')
+          ? fileIdOfAstId(st.focusId)
+          : st.focusId;
+        const visited = new Set<string>([seedFile]);
+        let frontier: string[] = [seedFile];
+        for (let hop = 0; hop < st.focusHops; hop++) {
+          const next: string[] = [];
+          for (const node of frontier) {
+            for (const kind of ['imports', 'calls', 'extends'] as const) {
+              if (!st.edgeFilter[kind]) continue;
+              const b = fileEdgesByKind[kind];
+              for (const set of [b.in.get(node), b.out.get(node)]) {
+                if (!set) continue;
+                for (const n of set) {
+                  if (!visited.has(n)) {
+                    visited.add(n);
+                    next.push(n);
+                  }
+                }
+              }
+            }
+          }
+          frontier = next;
+          if (frontier.length === 0) break;
+        }
+        return visited;
+      };
+      const maybeRecomputeLiveFiles = (): void => {
+        const st = useGraphStore.getState();
+        const key = `${st.focusId}|${st.focusHops}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}`;
+        if (key === liveFilesKey) return;
+        liveFilesKey = key;
+        liveFiles = computeLiveFiles();
+      };
 
       // ----- expansion handling -----
 
@@ -826,6 +928,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         const selection = state.selection;
 
         worldGfx.clear();
+        dimGfx.clear();
         semanticEdgeGfx.clear();
         hitRects.length = 0;
         overlayHitRects.length = 0;
@@ -835,6 +938,11 @@ export function PixiCanvas({ project }: CanvasProps) {
         visibleById.clear();
         blockCellsThisFrame.clear();
         labelPool.beginFrame();
+
+        // Focus-mode live set — recomputed only when focusId, focusHops
+        // or edgeFilter changes. Consumed by the dim overlay below
+        // and by drawEdges + drawSemanticEdges via per-edge alpha.
+        maybeRecomputeLiveFiles();
 
         // 1. Import edges (under rects). Now anchored to the specific
         //    `import` AST node on the source side when that file is
@@ -850,6 +958,7 @@ export function PixiCanvas({ project }: CanvasProps) {
             worldGfx,
             cameraScale,
             visibleSemanticPairs,
+            liveFiles,
           );
         } else {
           visibleSemanticPairs.clear();
@@ -859,6 +968,25 @@ export function PixiCanvas({ project }: CanvasProps) {
         //    in sync so the edge pass below can find precise anchors.
         for (const sim of layout.nodes) {
           drawFile(sim, selection);
+        }
+
+        // 2b. Focus-mode dimming. For each file outside the live set,
+        //     paint a translucent bg-coloured rect on dimGfx (one
+        //     layer above worldGfx + labelLayer) so the file rect AND
+        //     its label are uniformly darkened. Live files (and the
+        //     entire scene when focus mode is off) get no overlay.
+        if (liveFiles) {
+          for (const sim of layout.nodes) {
+            if (liveFiles.has(sim.id)) continue;
+            dimGfx
+              .rect(
+                sim.x - sim.width / 2,
+                sim.y - sim.height / 2,
+                sim.width,
+                sim.height,
+              )
+              .fill({ color: COLORS.bg, alpha: 0.78 });
+          }
         }
 
         // 3. Overlays for expanded Blocks. Iterate multiple passes so
@@ -941,6 +1069,7 @@ export function PixiCanvas({ project }: CanvasProps) {
           state.expandedFiles,
           visibleSemanticPairs,
           state.edgeFilter,
+          liveFiles,
         );
       }
 
@@ -2078,7 +2207,9 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       function handleClick(target: HitRect | null) {
         if (!target) {
-          useGraphStore.getState().setSelection(null);
+          const st = useGraphStore.getState();
+          st.setSelection(null);
+          st.setFocus(null);
           followId = null;
           followAt = null;
           return;
@@ -2109,6 +2240,11 @@ export function PixiCanvas({ project }: CanvasProps) {
         // accidental handle click doesn't jump the editor pane.
         if (target.kind !== 'ast-toggle') {
           state.setSelection(target.id);
+          // Focus mode follows selection: clicking a thing makes
+          // its file's neighbourhood the "live set" and dims the
+          // rest. Hops are preserved across clicks so the user can
+          // settle on a comfortable view depth and then explore.
+          state.setFocus(target.id);
         }
         // Block toggle: clicking the magenta cell (in the main scene
         // or inside an overlay) or an overlay's handle (kind
@@ -2165,6 +2301,11 @@ export function PixiCanvas({ project }: CanvasProps) {
         // this file's source immediately. The AST/expansion work below can
         // run in the background — it doesn't block the editor.
         state.setSelection(fileId);
+        // Focus mode tracks the click target — same pattern as
+        // handleClick above so a file-area click and a node click
+        // both pull the rest of the scene into focus around what
+        // the user just chose.
+        state.setFocus(fileId);
 
         if (state.expandedFiles.has(fileId)) {
           state.collapseFile(fileId);
@@ -2299,6 +2440,10 @@ function drawEdges(
   gfx: Graphics,
   cameraScale: number,
   visibleSemanticPairs: ReadonlySet<string>,
+  // Focus-mode live set: import edges with at least one endpoint
+  // outside it dim down to ~18% so they recede into the background.
+  // null = focus off, render all edges at full strength.
+  liveFiles: ReadonlySet<string> | null,
 ): void {
   // Import links: a quiet subdued background layer. Suppressed when a
   // calls/extends/implements link is already visible between the same two
@@ -2344,13 +2489,17 @@ function drawEdges(
       }
     }
 
+    let edgeAlpha = 0.7;
+    if (liveFiles && (!liveFiles.has(edge.fromId) || !liveFiles.has(edge.toId))) {
+      edgeAlpha *= 0.18;
+    }
     gfx
       .moveTo(sx, sy)
       .lineTo(tx, ty)
       .stroke({
         color: COLORS.edge,
         width: 1.5 / cameraScale, // ~1.5px on screen, zoom-stable
-        alpha: 0.7,
+        alpha: edgeAlpha,
       });
   }
 }
@@ -2532,6 +2681,10 @@ function drawSemanticEdges(
   // imports back ON shouldn't make redundant import lines flicker
   // back in.
   edgeFilter: { calls: boolean; extends: boolean },
+  // Focus-mode live set: files inside the current neighbourhood.
+  // Edges with at least one endpoint NOT in this set are dimmed.
+  // null means focus mode is off (everything renders at full strength).
+  liveFiles: ReadonlySet<string> | null,
 ): void {
   visibleSemanticPairs.clear();
   const fileOf = (id: string): string => {
@@ -2633,6 +2786,16 @@ function drawSemanticEdges(
         selection === edge.fromId || selection === from.id;
       dashed = !srcSelected;
       edgeAlpha = srcSelected || expandedFiles.has(srcFile) ? 1 : 0.5;
+    }
+    // Focus-mode dim: if EITHER endpoint's file is outside the live
+    // neighbourhood, multiply this edge's alpha down so it visually
+    // recedes alongside the dimmed files at its endpoints.
+    if (liveFiles) {
+      const fromFile = fileOf(edge.fromId);
+      const toFile = fileOf(edge.toId);
+      if (!liveFiles.has(fromFile) || !liveFiles.has(toFile)) {
+        edgeAlpha *= 0.18;
+      }
     }
     // Routing the extends/implements line THROUGH the import binding when
     // the source file is expanded: subclass → local imported name → real

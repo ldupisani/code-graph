@@ -51,6 +51,44 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Global keyboard shortcuts for the focus / navigation HUD.
+  //   Esc          — clear selection AND focus (return to overview).
+  //   +/= / -      — widen / narrow the focus neighbourhood (hops).
+  //                  '=' is included so it works without holding shift
+  //                  on a US keyboard (where shift+= produces '+').
+  // Ignored while the user is typing in an input / textarea (so we
+  // don't hijack typing in the FolderPicker or the search palette).
+  useEffect(() => {
+    function isTypingTarget(t: EventTarget | null): boolean {
+      if (!(t instanceof HTMLElement)) return false;
+      const tag = t.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || t.isContentEditable;
+    }
+    function onKey(e: KeyboardEvent) {
+      if (isTypingTarget(e.target)) return;
+      const st = useGraphStore.getState();
+      if (e.key === 'Escape') {
+        st.setSelection(null);
+        st.setFocus(null);
+        return;
+      }
+      if (e.key === '+' || e.key === '=') {
+        if (st.focusId == null) return;
+        e.preventDefault();
+        st.setFocus(st.focusId, Math.min(8, st.focusHops + 1));
+        return;
+      }
+      if (e.key === '-' || e.key === '_') {
+        if (st.focusId == null) return;
+        e.preventDefault();
+        st.setFocus(st.focusId, Math.max(1, st.focusHops - 1));
+        return;
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   // Subscribe to filesystem events for the current project; on any event,
   // re-run openProject (debounced) and update via refreshProject. Camera +
   // expansion state are preserved across the swap (see store + PixiCanvas).

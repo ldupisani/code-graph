@@ -71,7 +71,7 @@ const SEMANTIC_EDGE_STYLE: Record<
 // LOD: rects whose smaller side is below this many screen pixels are not drawn.
 const CULL_PX = 4;
 // Below this camera zoom the view "simplifies": operator glyphs and generic
-// kind labels (type/if/arrow fn…) drop out, leaving only real names. Zoom in
+// kind labels (type/if/=>/…) drop out, leaving only real names. Zoom in
 // past it for full detail.
 const SIMPLIFY_BELOW = 1.5;
 // Block/object kind outlines are cheap structural cues (just a colored
@@ -122,7 +122,7 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
   PrefixUnaryExpression: 'unary',
   PostfixUnaryExpression: 'unary',
   ConditionalExpression: 'ternary',
-  ArrowFunction: 'arrow fn',
+  ArrowFunction: '=>',
   FunctionExpression: 'fn',
   AwaitExpression: 'await',
   YieldExpression: 'yield',
@@ -1625,7 +1625,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         // as one text run in syntaxColor(node).)
         // In the simplified tier only real names (and name-like kinds such
         // as import/return) survive — other generic kind labels (type / if /
-        // arrow fn / call / access …) drop out.
+        // => / call / access …) drop out.
         const nameOk =
           !simplified ||
           node.name != null ||

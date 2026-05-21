@@ -79,31 +79,58 @@ const WEIGHT_CAP = 3;
 const LINK_CLEARANCE_STRENGTH = 0.18;
 const LINK_CLEARANCE_PAD = 24; // world px the line should clear the box edge by
 
-// Zoom-modulated strength curves. Folder forces (cluster +
-// subsystem repulsion) get stronger at low zoom so the overview
-// reads as 'organised by folder.' Link-loosening counter-force
-// also strengthens at low zoom — see linkLooseningForce.
+// Zoom-modulated strength curves. The goal at deep low zoom is
+// "grouping is almost EXCLUSIVELY by folder name" — folder pull
+// and inter-subsystem repulsion both dominate, the link-attraction
+// counter-force exceeds forceLink itself so cross-folder links
+// can't drag files out of their folder cluster, and the
+// directional (calls / inherit) forces fade so they don't bias
+// layout against folder grouping. At cameraScale ≥ 1 every
+// modulation collapses to baseline and the diagram reads by
+// connectivity again.
 //
-// Ceiling lowered from 2.5× to 1.6× after observing it fling
-// outliers and balloon convex hulls when reheat hits low-zoom +
-// strong-mul + alpha=0.25 simultaneously. Modest amplitude is
-// enough to read the difference; bigger amplitude was destabilising.
+// folderMul: applied to directoryClusterForce AND
+// directorySubsystemRepulsion. Steep at low zoom for "almost
+// exclusively folder", linear back through baseline at cam=1,
+// fades to a soft floor at high zoom so folder still has SOME
+// pull when reading details.
 //
-// folderMul:
-//   cameraScale 0.1 → ~1.55  (folder pull noticeably stronger)
-//   cameraScale 0.5 → ~1.25
-//   cameraScale 1.0 → ~0.9 → clamped to 1.0 by `min` (baseline at 1)
-//   cameraScale 2.0 → 0.4    (folder fades, connectivity wins)
+//   cameraScale 0.05 → ~4.8  (heavy folder dominance)
+//   cameraScale 0.1  → ~4.5
+//   cameraScale 0.3  → ~3.5
+//   cameraScale 0.5  → ~2.5
+//   cameraScale 1.0  → 1.0    (baseline)
+//   cameraScale 2.0  → 0.3
 function folderMul(cameraScale: number): number {
-    return Math.max(0.4, Math.min(1.6, 1.6 - cameraScale * 0.6));
+    return Math.max(0.3, Math.min(5, 5 - cameraScale * 4));
 }
-// linkLoosenMul:
-//   cameraScale 0.1 → ~0.6   (mild counter-force)
-//   cameraScale 0.5 → ~0.4
-//   cameraScale 1.0 → 0      (no-op — forceLink unopposed)
-//   cameraScale ≥ 1   → 0
+// linkLoosenMul: applied to linkLooseningForce. To make folder
+// "almost exclusively" win at low zoom, we need this to OVERPOWER
+// forceLink (strength=0.3 with d3-force's symmetric pull). The
+// counter pushes connected pairs apart proportional to (target -
+// d) / target * baseStrength * mul * alpha. At low zoom we let
+// it ramp to ~2.5 so cross-folder pairs that try to settle close
+// get pushed apart fast.
+//
+//   cameraScale 0.05 → ~2.4
+//   cameraScale 0.5  → ~1.4
+//   cameraScale 1.0  → 0       (no-op, forceLink unopposed)
 function linkLoosenMul(cameraScale: number): number {
-    return Math.max(0, Math.min(0.7, 0.7 - cameraScale * 0.7));
+    return Math.max(0, Math.min(2.5, 2.5 - cameraScale * 2.5));
+}
+// directionalMul: applied to callsX / callsY / inheritY. These
+// are connectivity-driven biases — at very low zoom they actively
+// fight folder grouping (a class extends from a different folder
+// → inheritY pulls the subclass DOWN out of its sibling cluster).
+// Fading them to ~0.2 at low zoom lets folder dominate; at
+// cameraScale ≥ 1 they're at baseline so call chains still read
+// L→R as before.
+//
+//   cameraScale 0.05 → ~0.21
+//   cameraScale 0.5  → ~0.6
+//   cameraScale 1.0  → 1.0
+function directionalMul(cameraScale: number): number {
+    return Math.max(0.2, Math.min(1, 0.2 + cameraScale * 0.8));
 }
 
 interface DirectionalEdge {
@@ -147,9 +174,20 @@ function directionalEdges(
 // least `separation` *before* `b` along `axis`, apply equal-and-opposite
 // nudges to push them into order. A no-op once satisfied, so it never fights
 // a layout that already reads correctly — that is the "gentle" behavior.
-function directionalForce(edges: readonly DirectionalEdge[], axis: "x" | "y", strength: number) {
+//
+// getMul (optional) fades the force at low zoom — call/inherit
+// biases are CONNECTIVITY signals that compete with folder
+// grouping, so at the overview we want them quiet.
+function directionalForce(
+    edges: readonly DirectionalEdge[],
+    axis: "x" | "y",
+    strength: number,
+    getMul: () => number = () => 1,
+) {
     let lookup = new Map<string, SimFileNode>();
     function force(alpha: number): void {
+        const mul = getMul();
+        if (mul === 0) return;
         for (const e of edges) {
             const a = lookup.get(e.aId);
             const b = lookup.get(e.bId);
@@ -161,7 +199,7 @@ function directionalForce(edges: readonly DirectionalEdge[], axis: "x" | "y", st
             const deficit = separation - (bPos - aPos);
             if (deficit <= 0) continue; // already ordered with room to spare
             const w = Math.min(Math.sqrt(e.weight), WEIGHT_CAP);
-            const push = strength * alpha * deficit * w * 0.5;
+            const push = strength * mul * alpha * deficit * w * 0.5;
             if (axis === "x") {
                 a.vx = (a.vx ?? 0) - push;
                 b.vx = (b.vx ?? 0) + push;
@@ -507,9 +545,9 @@ export function buildFileLayout(
         .force("charge", forceManyBody<SimFileNode>().strength(-650))
         .force("center", forceCenter(0, 0))
         .force("collide", forceCollide<SimFileNode>().radius(collisionRadius).strength(0.95).iterations(2))
-        .force("callsX", directionalForce(callEdges, "x", CALLS_X_STRENGTH))
-        .force("callsY", directionalForce(callEdges, "y", CALLS_Y_STRENGTH))
-        .force("inheritY", directionalForce(inheritEdges, "y", INHERIT_Y_STRENGTH))
+        .force("callsX", directionalForce(callEdges, "x", CALLS_X_STRENGTH, () => directionalMul(getCameraScale())))
+        .force("callsY", directionalForce(callEdges, "y", CALLS_Y_STRENGTH, () => directionalMul(getCameraScale())))
+        .force("inheritY", directionalForce(inheritEdges, "y", INHERIT_Y_STRENGTH, () => directionalMul(getCameraScale())))
         // Stronger directory pull (was 0.04) so large React-style
         // projects with hundreds of files per directory still settle
         // into visibly distinct clusters rather than interleaving.

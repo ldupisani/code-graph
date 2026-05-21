@@ -59,6 +59,12 @@ export interface GraphStore {
   // through focus-mode dimming, since the path IS the user's
   // current question and should never disappear.
   tracedPath: readonly string[] | null;
+  // When false, files matching the support-file pattern (.test /
+  // .spec / .stories / __tests__/* / __mocks__/*) and edges
+  // touching them aren't rendered. They're typically the majority
+  // by count in a React project and dominate the visual without
+  // adding to the architectural story.
+  showSupportFiles: boolean;
   setProject: (p: ProjectResponse | null) => void;
   refreshProject: (p: ProjectResponse) => void;
   setSelection: (id: string | null) => void;
@@ -74,6 +80,7 @@ export interface GraphStore {
   setFocus: (id: string | null, hops?: number) => void;
   setFocusDirection: (d: 'both' | 'in' | 'out') => void;
   setTracedPath: (ids: readonly string[] | null) => void;
+  setShowSupportFiles: (show: boolean) => void;
 }
 
 const ALL_EDGES_ON: EdgeFilter = { imports: true, calls: true, extends: true };
@@ -91,8 +98,9 @@ export const useGraphStore = create<GraphStore>((set) => ({
   focusHops: 1,
   focusDirection: 'both',
   tracedPath: null,
+  showSupportFiles: false,
   setProject: (project) =>
-    set({
+    set((s) => ({
       project,
       selection: null,
       expandedFiles: new Set(),
@@ -103,7 +111,11 @@ export const useGraphStore = create<GraphStore>((set) => ({
       focusHops: 1,
       focusDirection: 'both',
       tracedPath: null,
-    }),
+      // Keep the user's support-file preference across project
+      // switches — it's a "how I like to look at code" setting,
+      // not a per-project one.
+      showSupportFiles: s.showSupportFiles,
+    })),
   // Used after a filesystem-driven re-walk: file-level identity is stable so
   // we keep expansion state, but AST node IDs may have shifted (sequential
   // walk) so we drop ASTs and selection — they'll be re-fetched on demand.
@@ -162,7 +174,18 @@ export const useGraphStore = create<GraphStore>((set) => ({
     })),
   setFocusDirection: (focusDirection) => set({ focusDirection }),
   setTracedPath: (tracedPath) => set({ tracedPath }),
+  setShowSupportFiles: (showSupportFiles) => set({ showSupportFiles }),
 }));
+
+// Test / story / spec / __tests__ / __mocks__: typically the majority
+// of files by count in a React project, but architecturally peripheral.
+// Hidden by default; the EdgeFilterPills HUD has a toggle to surface
+// them.
+export function isSupportFile(relativePath: string): boolean {
+  if (/\.(test|spec|stories)\.[jt]sx?$/.test(relativePath)) return true;
+  if (/(^|\/)__(tests|mocks)__\//.test(relativePath)) return true;
+  return false;
+}
 
 // Dev-only escape hatch: lets the chrome-devtools-mcp / browser console drive
 // the app (e.g. `useGraphStore.getState().expandFile('src/index.ts')`) when a

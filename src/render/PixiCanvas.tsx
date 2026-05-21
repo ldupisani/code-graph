@@ -15,7 +15,7 @@ import {
   type FileLayoutResult,
 } from '../graph/layout';
 import { AST_LABEL_FONT, fileLabel, labelScreenBox, measureMono } from '../graph/labels';
-import { useGraphStore } from '../graph/store';
+import { isSupportFile, useGraphStore } from '../graph/store';
 import {
   layoutAst,
   type TreemapLayout,
@@ -815,6 +815,14 @@ export function PixiCanvas({ project }: CanvasProps) {
         calls: emptyBucket(),
         extends: emptyBucket(),
       };
+      // Set of file IDs matching the support-file pattern. Filled
+      // once per project; consulted at render time when
+      // `showSupportFiles` is off to skip drawing the file AND
+      // every edge touching it.
+      const supportFileIds = new Set<string>();
+      for (const f of project.files) {
+        if (isSupportFile(f.relativePath)) supportFileIds.add(f.id);
+      }
       const addAdjacency = (kind: AdjKind, from: string, to: string): void => {
         if (from === to) return;
         const b = fileEdgesByKind[kind];
@@ -938,8 +946,10 @@ export function PixiCanvas({ project }: CanvasProps) {
         });
       };
       const drawDirectoryBoundaries = (): void => {
+        const hideSupport = !useGraphStore.getState().showSupportFiles;
         const byDir = new Map<string, SimFileNode[]>();
         for (const sim of layout.nodes) {
+          if (hideSupport && supportFileIds.has(sim.id)) continue;
           const dir = dirnameOfRel(sim.relativePath);
           if (!dir) continue;
           let list = byDir.get(dir);
@@ -1337,6 +1347,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         //    side — see drawEdges for the geometry. Gated by the
         //    user's edge filter; toggling 'imports' off skips this
         //    pass entirely.
+        const hideSupportForEdges = !state.showSupportFiles;
         if (state.edgeFilter.imports) {
           drawEdges(
             layout,
@@ -1347,6 +1358,7 @@ export function PixiCanvas({ project }: CanvasProps) {
             visibleSemanticPairs,
             liveFiles,
             pathEdgeKeys,
+            hideSupportForEdges ? supportFileIds : null,
           );
         } else {
           visibleSemanticPairs.clear();
@@ -1360,7 +1372,13 @@ export function PixiCanvas({ project }: CanvasProps) {
 
         // 2. Files + AST subtrees on `worldGfx`. pushRect keeps visibleById
         //    in sync so the edge pass below can find precise anchors.
+        //    Support files (.test / .stories / .spec / __tests__ /
+        //    __mocks__) are skipped when state.showSupportFiles is off
+        //    — they're architecturally peripheral and dominate the
+        //    visual by count in a typical React project.
+        const hideSupport = !state.showSupportFiles;
         for (const sim of layout.nodes) {
+          if (hideSupport && supportFileIds.has(sim.id)) continue;
           drawFile(sim, selection);
         }
 
@@ -1510,6 +1528,7 @@ export function PixiCanvas({ project }: CanvasProps) {
           state.edgeFilter,
           liveFiles,
           pathEdgeKeys,
+          hideSupportForEdges ? supportFileIds : null,
         );
       }
 
@@ -2939,6 +2958,10 @@ function drawEdges(
   // in the func / yellow colour, so they read as one continuous
   // highlighted run regardless of dimming.
   pathEdgeKeys: ReadonlySet<string>,
+  // Set of file IDs to suppress entirely (because they're hidden
+  // support files). Skips any edge with either endpoint in this
+  // set. null = render everything.
+  hiddenFileIds: ReadonlySet<string> | null,
 ): void {
   // Import links: a quiet subdued background layer. Suppressed when a
   // calls/extends/implements link is already visible between the same two
@@ -2956,6 +2979,12 @@ function drawEdges(
     const s = layout.byId.get(edge.fromId);
     const t = layout.byId.get(edge.toId);
     if (!s || !t) continue;
+    if (
+      hiddenFileIds &&
+      (hiddenFileIds.has(edge.fromId) || hiddenFileIds.has(edge.toId))
+    ) {
+      continue;
+    }
     if (visibleSemanticPairs.has(`${edge.fromId} ${edge.toId}`)) continue;
 
     // Source point: import-block center if available, else file center.
@@ -3220,6 +3249,10 @@ function drawSemanticEdges(
   // for every edge that's part of the user's current path. Path
   // edges skip the focus-dimming multiplier so they stay bright.
   pathEdgeKeys: ReadonlySet<string>,
+  // File IDs to suppress entirely (because they're hidden support
+  // files). Edges whose endpoint resolves to one of these files are
+  // skipped wholesale. null = render everything.
+  hiddenFileIds: ReadonlySet<string> | null,
 ): void {
   visibleSemanticPairs.clear();
   const fileOf = (id: string): string => {
@@ -3254,6 +3287,14 @@ function drawSemanticEdges(
       !edgeFilter.extends
     ) {
       continue;
+    }
+    // Hidden-files filter: same suppression as drawEdges. Endpoint
+    // file id is the part of the AST id before '#'; if either side
+    // resolves to a hidden file, skip the edge entirely.
+    if (hiddenFileIds) {
+      const fromF = fileOf(edge.fromId);
+      const toF = fileOf(edge.toId);
+      if (hiddenFileIds.has(fromF) || hiddenFileIds.has(toF)) continue;
     }
     // Per-edge layer choice: above the overlay panes if either
     // endpoint resolves to an overlay-rendered rect; else below

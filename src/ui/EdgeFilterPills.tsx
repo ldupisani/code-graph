@@ -27,6 +27,8 @@ export function EdgeFilterPills() {
   const focusId = useGraphStore((s) => s.focusId);
   const focusHops = useGraphStore((s) => s.focusHops);
   const tracedPath = useGraphStore((s) => s.tracedPath);
+  const showSupportFiles = useGraphStore((s) => s.showSupportFiles);
+  const setShowSupportFiles = useGraphStore((s) => s.setShowSupportFiles);
 
   // Hide when no project is open — there are no edges to filter.
   if (!project) return null;
@@ -54,6 +56,17 @@ export function EdgeFilterPills() {
           onToggle={() => setEdgeFilter({ [kind]: !edgeFilter[kind] })}
         />
       ))}
+      {/* The support-file toggle lives next to the edge pills but
+          uses a different colour palette so it reads as a separate
+          axis (FILE filter vs EDGE filter). 'tests' is the shortest
+          label that captures the .test / .stories / .spec / __tests__
+          / __mocks__ family without listing them all. */}
+      <Pill
+        label="tests"
+        on={showSupportFiles}
+        color={{ bg: '#9aa3a8', text: '#0e1216' }}
+        onToggle={() => setShowSupportFiles(!showSupportFiles)}
+      />
       {focusId && (
         <span
           style={{

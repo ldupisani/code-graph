@@ -130,7 +130,11 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
   YieldExpression: 'yield',
   SpreadElement: 'spread',
   TemplateExpression: 'template',
-  ArrayLiteralExpression: 'array',
+  // `[]` reads as the array literal itself in both empty and
+  // non-empty cases: an empty rect shows '[]', a non-empty rect
+  // shows '[]' at top-left with the elements as kids inside it,
+  // visually reading as `[a, b, c]`.
+  ArrayLiteralExpression: '[]',
   AsExpression: 'as',
   NonNullExpression: 'non-null',
   // Other
@@ -221,6 +225,7 @@ const SYNTAX_CATEGORY: Record<string, keyof typeof SYNTAX> = {
   EnumMember: 'type',
   TypeAliasDeclaration: 'type',
   TypeReference: 'type',
+  ArrayType: 'type',
   ExpressionWithTypeArguments: 'type',
   FunctionDeclaration: 'func',
   FunctionExpression: 'func',

@@ -249,17 +249,28 @@ function isTypeImportBinding(node: Node): boolean {
   });
 }
 
-// A TypeReference renders as a single labelled rect carrying the type's
-// text (e.g. `Player`, `Map<string, Foo>`, `MyNs.Inner`). The wrapping
-// "type" rect with its identifier child inside was visual noise — the
-// referenced name *is* the type, and the syntaxKind already routes the
-// colour through SYNTAX.type. Inlining every descendant suppresses the
-// inner Identifier so it doesn't render its own rect.
-function synthesizeTypeRefLabel(node: Node, inlined: Set<Node>): string | null {
-  if (node.getKind() !== ts.SyntaxKind.TypeReference) return null;
+// Type-position constructs that render as a single labelled rect
+// carrying their source text. The wrapping "type" / "array" rect with
+// children inside was visual noise — the text IS the type, the
+// syntaxKind routes the colour through SYNTAX.type, and inlining
+// every descendant suppresses the inner Identifier / inner
+// TypeReference / etc. from re-emitting as its own rect.
+//
+// Covers:
+//   * TypeReference: `Player`, `Map<string, Foo>`, `MyNs.Inner`
+//   * ArrayType:     `Pulse[]`, `string[][]`
+// (UnionType / IntersectionType are NOT flattened — the user wants
+//  the members visible with a `|` or `&` between them, which the
+//  treemap's relational layout handles via `op`.)
+function synthesizeFlatTypeLabel(node: Node, inlined: Set<Node>): string | null {
+  const k = node.getKind();
+  if (k !== ts.SyntaxKind.TypeReference && k !== ts.SyntaxKind.ArrayType) {
+    return null;
+  }
   // Use the array form so every descendant — type-argument identifiers,
-  // TypeQuery exprNames, qualified-name segments — is unambiguously
-  // included before visit() reaches them via forEachChild.
+  // TypeQuery exprNames, qualified-name segments, the inner element
+  // type of an ArrayType — is unambiguously included before visit()
+  // reaches them via forEachChild.
   for (const d of node.getDescendants()) inlined.add(d);
   return node.getText();
 }
@@ -576,13 +587,13 @@ function friendlyName(node: Node, inlined: Set<Node>): string | null {
   const synthesised = synthesizeCallLabel(node, inlined);
   if (synthesised !== null) return synthesised;
 
-  // TypeReference: emit the referenced type's text as a single label
-  // (e.g. `Player`, `Map<string, Player>`, `MyNs.Inner`) and inline
-  // every descendant so the identifier inside doesn't render as its
-  // own child rect. The client paints these in SYNTAX.type because
-  // syntaxKind is 'TypeReference'.
-  const typeRefLabel = synthesizeTypeRefLabel(node, inlined);
-  if (typeRefLabel !== null) return typeRefLabel;
+  // Type-position nodes (TypeReference, ArrayType, …) render as a
+  // single labelled rect carrying their source text. Inlines every
+  // descendant so the inner Identifier / element-type doesn't emit
+  // its own rect. The client paints these in SYNTAX.type because
+  // their syntaxKind is type-categorised.
+  const flatTypeLabel = synthesizeFlatTypeLabel(node, inlined);
+  if (flatTypeLabel !== null) return flatTypeLabel;
 
   // Standalone PropertyAccess/ElementAccess (not the callee of a Call/New, or
   // a callee whose surrounding Call couldn't be collapsed). Render the dotted

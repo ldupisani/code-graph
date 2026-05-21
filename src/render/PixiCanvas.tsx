@@ -1825,17 +1825,26 @@ export function PixiCanvas({ project }: CanvasProps) {
         if (target.kind !== 'ast-toggle') {
           state.setSelection(target.id);
         }
-        // Block toggle: clicking the magenta cell (in the main scene)
-        // or an overlay's handle (kind 'ast-toggle') flips this Block
-        // in expandedAstNodes. The MAIN layout doesn't change — the
-        // file's footprint is stable across toggles — so we don't
-        // call applyExpansionToSim. drawOverlay reads the new
-        // expandedAstNodes set on the next frame and renders the
-        // overlay; startBlockAnim primes the rect-grow animation.
-        const mainTree = activeTree(target.fileId);
-        const tn = mainTree?.byId.get(target.id);
-        const isBlock =
-          tn?.syntaxKind === 'Block' || target.kind === 'ast-toggle';
+        // Block toggle: clicking the magenta cell (in the main scene
+        // or inside an overlay) or an overlay's handle (kind
+        // 'ast-toggle') flips this Block in expandedAstNodes. The
+        // MAIN layout doesn't change — the file's footprint is stable
+        // across toggles — so we don't call applyExpansionToSim.
+        // drawOverlay reads the new expandedAstNodes set on the next
+        // frame and renders the overlay; startBlockAnim primes the
+        // rect-grow animation.
+        //
+        // Resolve syntaxKind via the file's flat AST (not via
+        // mainTree.byId): the main layout's `collapseChildren`
+        // predicate stops recursion on EVERY Block, so a Block nested
+        // inside another Block isn't in the main tree at all. The flat
+        // ast.nodes list has every node regardless of any layout's
+        // collapse decisions, so this works at any nesting depth.
+        const astKind = ((): string | undefined => {
+          const ast = state.asts.get(target.fileId);
+          return ast?.nodes.find((n) => n.id === target.id)?.syntaxKind;
+        })();
+        const isBlock = astKind === 'Block' || target.kind === 'ast-toggle';
         if (isBlock) {
           // Two cases for the prev-rect snapshot:
           //   * Expanding: target is the cell HitRect (kind 'ast'); its

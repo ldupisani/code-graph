@@ -1,4 +1,4 @@
-import {forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, type Simulation} from "d3-force";
+import {forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY, type Simulation} from "d3-force";
 import type {ProjectResponse, SemanticEdge} from "../api/types";
 import type {SimFileNode, SimImportLink} from "./types";
 import {fileLabel, measureMono} from "./labels";
@@ -223,18 +223,25 @@ function directionalForce(
 // `server/` form recognisable neighbourhoods without losing the
 // cross-cutting wiring those neighbourhoods participate in.
 //
-// Root-level files (no directory component) are skipped — they have
-// no siblings to cluster with.
+// Root-level files (no directory component) are assigned to a
+// virtual '<root>' cluster so they cluster together rather than
+// being skipped. Without this, root files feel manyBody repulsion
+// from every other file with no restoring force — over many ticks
+// they accumulate outward drift and end up flung far from the
+// rest of the project.
+const ROOT_CLUSTER = "<root>";
 function dirnameOf(relativePath: string): string {
     const i = relativePath.lastIndexOf("/");
-    return i < 0 ? "" : relativePath.slice(0, i);
+    return i < 0 ? ROOT_CLUSTER : relativePath.slice(0, i);
 }
 
 // First `depth` components of a path. 'src/components/data-display/foo.ts'
-// at depth=2 -> 'src/components'. Returns '' for root-level files.
+// at depth=2 -> 'src/components'. Root-level files (no '/') return
+// the '<root>' virtual subsystem so they participate in inter-subsystem
+// repulsion rather than floating free — same reasoning as dirnameOf.
 function clusterDirAt(relativePath: string, depth: number): string {
     const parts = relativePath.split("/");
-    if (parts.length < 2) return "";
+    if (parts.length < 2) return ROOT_CLUSTER;
     const take = Math.min(depth, parts.length - 1);
     return parts.slice(0, take).join("/");
 }
@@ -568,6 +575,18 @@ export function buildFileLayout(
         // the multiplier is 0 → no-op, forceLink dominates.
         .force("linkLoosen", linkLooseningForce(links, 0.6, () => linkLoosenMul(getCameraScale())))
         .force("clearance", linkClearanceForce(links, LINK_CLEARANCE_STRENGTH))
+        // Defensive per-file soft leash toward origin. forceCenter
+        // only constrains the global CENTROID — it can't stop a
+        // single low-connectivity file from accumulating outward
+        // drift while the rest of the cluster slides the other way
+        // to balance. At strength 0.004 this is ~150× weaker than
+        // the low-zoom directoryCluster pull (0.65), so it doesn't
+        // visibly fight folder grouping; but for a file with no
+        // siblings it's the only restoring force keeping it from
+        // sailing off into deep space as manyBody slowly pushes
+        // it outward over thousands of ticks.
+        .force("leashX", forceX<SimFileNode>(0).strength(0.004))
+        .force("leashY", forceY<SimFileNode>(0).strength(0.004))
         .alpha(1)
         .alphaDecay(0.035);
 

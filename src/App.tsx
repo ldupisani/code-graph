@@ -363,8 +363,14 @@ const PANEL_STYLE: React.CSSProperties = {
 };
 
 function FilePanel({ file, project }: { file: FileNode; project: ProjectResponse }) {
-  const inEdges = project.edges.filter((e) => e.toId === file.id);
-  const outEdges = project.edges.filter((e) => e.fromId === file.id);
+  const inCount = project.edges.reduce(
+    (n, e) => (e.toId === file.id ? n + 1 : n),
+    0,
+  );
+  const outCount = project.edges.reduce(
+    (n, e) => (e.fromId === file.id ? n + 1 : n),
+    0,
+  );
   return (
     <aside style={PANEL_STYLE}>
       <div style={{ fontWeight: 600, marginBottom: '0.25rem', wordBreak: 'break-all' }}>
@@ -373,19 +379,13 @@ function FilePanel({ file, project }: { file: FileNode; project: ProjectResponse
       <div style={{ opacity: 0.7, marginBottom: '0.5rem' }}>
         {file.lineCount} lines · {file.sizeBytes} bytes
       </div>
-      <div>
-        <div style={{ opacity: 0.7 }}>imports → ({outEdges.length})</div>
-        <ul style={{ margin: '0.15rem 0 0.4rem 1rem', padding: 0 }}>
-          {outEdges.map((e) => (
-            <li key={e.id}>{e.toId}</li>
-          ))}
-        </ul>
-        <div style={{ opacity: 0.7 }}>imported by ← ({inEdges.length})</div>
-        <ul style={{ margin: '0.15rem 0 0 1rem', padding: 0 }}>
-          {inEdges.map((e) => (
-            <li key={e.id}>{e.fromId}</li>
-          ))}
-        </ul>
+      <div style={{ display: 'flex', gap: '1rem', opacity: 0.8 }}>
+        {/* Counts only — the full lists of imported / importing files
+            crowded the panel without adding navigational value (the
+            files themselves are visible on the canvas; the panel is
+            for at-a-glance metadata). */}
+        <span>imports → {outCount}</span>
+        <span>imported by ← {inCount}</span>
       </div>
     </aside>
   );

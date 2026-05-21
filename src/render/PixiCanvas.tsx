@@ -1239,24 +1239,26 @@ export function PixiCanvas({ project }: CanvasProps) {
           for (const sim of layout.nodes) {
             if (liveFiles.has(sim.id)) continue;
             if (pathFileSet.has(sim.id)) continue;
-            let w: number;
-            let h: number;
             if (sim.expanded) {
-              // Expanded file: width === height === diameter; the
-              // bounding box of the circle is the right cover.
-              w = sim.width;
-              h = sim.height;
+              // Expanded file is drawn as a CIRCLE (drawFile); match
+              // that shape so the dim overlay doesn't extend past the
+              // file's actual boundary into the bg. A bounding-box
+              // rect would leave four dark corner triangles outside
+              // the circle that read as "extra box".
+              dimGfx
+                .circle(sim.x, sim.y, sim.width / 2)
+                .fill({ color: COLORS.bg, alpha: 0.78 });
             } else {
               // Collapsed file: the visible content is the 16×20
               // screen-constant page icon (see drawFile). Mirror the
               // same /cameraScale conversion so the dim rect tracks
               // the icon at any zoom.
-              w = 16 / cameraScale;
-              h = 20 / cameraScale;
+              const w = 16 / cameraScale;
+              const h = 20 / cameraScale;
+              dimGfx
+                .rect(sim.x - w / 2, sim.y - h / 2, w, h)
+                .fill({ color: COLORS.bg, alpha: 0.78 });
             }
-            dimGfx
-              .rect(sim.x - w / 2, sim.y - h / 2, w, h)
-              .fill({ color: COLORS.bg, alpha: 0.78 });
           }
         }
         // 2c. Path overlay: thin yellow outline around every file

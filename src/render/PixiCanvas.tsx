@@ -82,15 +82,14 @@ const OUTLINE_BELOW = 0.5;
 // file must be expanded), so they can come back early too — otherwise
 // they're invisible until an expanded node fills the whole viewport.
 const CALLS_BELOW = 0.5;
-// Below this camera zoom every expanded file SWAPS to a "collapsed" AST
-// layout — function/method bodies that contain no named descendants are
-// laid out as a single small kind-outlined cell instead of their full
-// deeply-nested treemap. The class circle shrinks to a tight cluster of
-// "name + outlined block" methods, dramatically reducing wasted space at
-// zoomed-out detail (e.g. lightspeed's `Game`). Zoom past this threshold
-// and the file re-layouts back to full detail. Sits below SIMPLIFY_BELOW
-// so kind labels drop first (existing behaviour), then bodies collapse.
-const COLLAPSE_BELOW = 1.0;
+// Every Block (the magenta sequential-code cells — function bodies,
+// if/for/while/try bodies, standalone braced scopes) defaults to a
+// COLLAPSED single-cell rendering: just the kind outline, no
+// children. Clicking a collapsed Block toggles it in the store's
+// `expandedAstNodes` set; the layout rebuilds and the Block's
+// statements appear. Clicking it again re-collapses. State lives in
+// the Zustand store so it survives across re-renders but resets on
+// project open / AST re-walk.
 // Labels appear only while their container is at least the label's own box
 // (text + insets) on screen — see labelScreenBox / the gate in drawAstNode.
 
@@ -191,40 +190,9 @@ function isSignificant(node: { name: string | null; syntaxKind: string }): boole
   );
 }
 
-// AST kinds whose direct child `Block` is the body of a function-like.
-// The "collapsed" layout (cameraScale < COLLAPSE_BELOW) replaces that
-// body's interior with a single kind-outlined cell when nothing inside
-// it carries a name — gives Game-style classes a useful overview at low
-// zoom without losing the methods themselves.
-const FUNCTION_LIKE_KINDS = new Set([
-  'FunctionDeclaration',
-  'FunctionExpression',
-  'ArrowFunction',
-  'MethodDeclaration',
-  'Constructor',
-  'GetAccessor',
-  'SetAccessor',
-]);
-
-// Predicate handed to `layoutAst` when building the "collapsed" tree:
-// any Block whose parent is a function-like (method / function /
-// constructor / arrow / accessor) is collapsed to a single
-// kind-outlined cell. We tried gating on "no named descendants" first,
-// but the AST extractor synthesises a `name` for every CallExpression
-// (e.g. `call this.players.delete`) so almost every method body has
-// "named" descendants — the rule collapsed almost nothing. The
-// unconditional version is also closer to what the user asked for:
-// at coarse zoom every function body shows as a placeholder; zoom in
-// past COLLAPSE_BELOW to read individual statements.
-function makeCollapseChildren(
-  _ast: FileAstResponse,
-): (
-  n: { name: string | null; syntaxKind: string; id: string },
-  parentKind: string,
-) => boolean {
-  return (n, parentKind) =>
-    n.syntaxKind === 'Block' && FUNCTION_LIKE_KINDS.has(parentKind);
-}
+// The collapse predicate now lives at the call site
+// (`buildPerFileLayout` in the useEffect closure) because it needs to
+// close over the per-file slice of the store's `expandedAstNodes`.
 
 // Label text colored like the code editor (Monaco `vs-dark` / Dark+ family,
 // matching EditorPane's theme): types teal, functions yellow, control-flow
@@ -400,12 +368,10 @@ export function PixiCanvas({ project }: CanvasProps) {
             const n = layout.byId.get(id);
             return n ? { w: n.width, h: n.height, x: n.x, y: n.y } : null;
           },
-          // Active-mode lookups (layouts now live keyed by fileId in
-          // `layoutsByFileId`; activeForce/activeTree pick the entry
-          // matching the current `astDetailLevel`).
+          // Layouts now live in `layoutsByFileId` (single per-file
+          // entry that the user's manual Block expansions feed into).
           getAstForce: (id: string) => activeForce(id),
           getAstTree: (id: string) => activeTree(id),
-          getDetailLevel: () => astDetailLevel,
           ensureExpandedLayout,
           applyExpansionToSim: () => applyExpansionToSim(),
           getCameraScale: () => world.scale.x,
@@ -477,33 +443,55 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       // ----- expansion handling -----
 
-      // Each expanded file owns TWO layouts — `full` (no collapse) and
-      // `collapsed` (function bodies without named descendants reduced
-      // to a single kind-outlined cell; see makeCollapseChildren above).
-      // Both are built eagerly on first cache miss; the active one is
-      // chosen at draw time by `astDetailLevel`, which the ticker flips
-      // when cameraScale crosses COLLAPSE_BELOW.
-      type LodMode = 'full' | 'collapsed';
-      interface PerModeLayout {
+      // Single per-file layout. The treemap's `collapseChildren`
+      // predicate consults `store.expandedAstNodes` so every Block
+      // starts collapsed and the user can selectively expand
+      // individual ones via click. The cache keeps a snapshot of the
+      // file's expanded-block set so we can detect when a toggle
+      // requires a rebuild.
+      interface PerFileLayout {
         tree: TreemapLayout;
         force: AstForceLayout;
         size: { w: number; h: number };
       }
       const layoutsByFileId = new Map<
         string,
-        { ast: FileAstResponse; full: PerModeLayout; collapsed: PerModeLayout }
+        {
+          ast: FileAstResponse;
+          // Per-file slice of the global expandedAstNodes set at the
+          // time this layout was built. The cache invalidates when the
+          // FILE'S slice changes — toggling a Block in another file
+          // doesn't force this one to rebuild.
+          expandedSnapshot: ReadonlySet<string>;
+          layout: PerFileLayout;
+        }
       >();
 
-      // Tracks which mode is currently being rendered. Default for the
-      // very first frame derives from `world.scale.x`; the ticker keeps
-      // it in sync with the camera afterwards.
-      let astDetailLevel: LodMode =
-        world.scale.x < COLLAPSE_BELOW ? 'collapsed' : 'full';
+      function fileSliceOfExpanded(
+        fileId: string,
+        all: ReadonlySet<string>,
+      ): Set<string> {
+        const out = new Set<string>();
+        const prefix = `${fileId}#`;
+        for (const id of all) {
+          if (id.startsWith(prefix)) out.add(id);
+        }
+        return out;
+      }
 
-      function buildPerModeLayout(
+      function setsEqual(
+        a: ReadonlySet<string>,
+        b: ReadonlySet<string>,
+      ): boolean {
+        if (a.size !== b.size) return false;
+        for (const v of a) if (!b.has(v)) return false;
+        return true;
+      }
+
+      function buildPerFileLayout(
         ast: FileAstResponse,
-        mode: LodMode,
-      ): PerModeLayout {
+        expandedInThisFile: ReadonlySet<string>,
+      ): PerFileLayout {
         const tree = layoutAst(ast, {
           originX: 0,
           originY: 0,
@@ -519,10 +507,10 @@ export function PixiCanvas({ project }: CanvasProps) {
           // Exactly the box the renderer's LOD gate checks below, so a
           // cell sized here shows its label at 1:1 and nothing larger.
           measure: labelScreenBox,
-          // Only the COLLAPSED tree uses the body-collapse predicate.
-          // The FULL tree behaves exactly as before (no collapse).
-          collapseChildren:
-            mode === 'collapsed' ? makeCollapseChildren(ast) : undefined,
+          // Every Block is a candidate for collapse; expanded ones
+          // come back from the store.
+          collapseChildren: (n) =>
+            n.syntaxKind === 'Block' && !expandedInThisFile.has(n.id),
         });
         const force = buildAstForceLayout({
           fileId: ast.fileId,
@@ -546,36 +534,37 @@ export function PixiCanvas({ project }: CanvasProps) {
         return { tree, force, size };
       }
 
-      // Idempotent builder for the per-file layouts. Returns the entry
-      // for the currently active mode, or null when the file's AST
-      // hasn't been fetched yet.
-      function ensureExpandedLayout(fileId: string): PerModeLayout | null {
-        const ast = useGraphStore.getState().asts.get(fileId);
+      // Idempotent builder. Rebuilds whenever the file's AST changes
+      // OR the user has toggled a Block belonging to this file since
+      // the last build.
+      function ensureExpandedLayout(fileId: string): PerFileLayout | null {
+        const state = useGraphStore.getState();
+        const ast = state.asts.get(fileId);
         if (!ast) return null;
+        const slice = fileSliceOfExpanded(fileId, state.expandedAstNodes);
         const cached = layoutsByFileId.get(fileId);
-        if (cached && cached.ast === ast) {
-          return cached[astDetailLevel];
+        if (
+          cached &&
+          cached.ast === ast &&
+          setsEqual(cached.expandedSnapshot, slice)
+        ) {
+          return cached.layout;
         }
-        // First build (or AST-identity changed via file watcher) — build
-        // BOTH modes up front so a subsequent zoom transition just looks
-        // up the other entry rather than recomputing the layout.
-        const full = buildPerModeLayout(ast, 'full');
-        const collapsed = buildPerModeLayout(ast, 'collapsed');
-        layoutsByFileId.set(fileId, { ast, full, collapsed });
-        return astDetailLevel === 'full' ? full : collapsed;
+        const layout = buildPerFileLayout(ast, slice);
+        layoutsByFileId.set(fileId, { ast, expandedSnapshot: slice, layout });
+        return layout;
       }
 
       function expandedSizeFor(fileId: string): { w: number; h: number } | null {
         return ensureExpandedLayout(fileId)?.size ?? null;
       }
 
-      // Shorthand active-mode accessors used throughout draw + edge
-      // anchoring code.
+      // Accessors used throughout draw + edge anchoring code.
       function activeTree(fileId: string): TreemapLayout | undefined {
-        return layoutsByFileId.get(fileId)?.[astDetailLevel].tree;
+        return ensureExpandedLayout(fileId)?.tree;
       }
       function activeForce(fileId: string): AstForceLayout | undefined {
-        return layoutsByFileId.get(fileId)?.[astDetailLevel].force;
+        return ensureExpandedLayout(fileId)?.force;
       }
 
       function applyExpansionToSim() {
@@ -1403,18 +1392,6 @@ export function PixiCanvas({ project }: CanvasProps) {
       }
 
       const tickerCb = () => {
-        // Zoom-driven LOD swap: when cameraScale crosses COLLAPSE_BELOW
-        // we flip the active layout mode for every expanded file and
-        // reheat the file-level sim (so SimFileNode.width/height
-        // updates ripple through collide + link). The actual TreemapLayout
-        // / AstForceLayout entries are already cached in `layoutsByFileId`
-        // — we just toggle which one drawSubtree etc. read from.
-        const desired: LodMode =
-          world.scale.x < COLLAPSE_BELOW ? 'collapsed' : 'full';
-        if (desired !== astDetailLevel) {
-          astDetailLevel = desired;
-          applyExpansionToSim();
-        }
         draw();
         updateFollow();
       };
@@ -1484,8 +1461,21 @@ export function PixiCanvas({ project }: CanvasProps) {
         followId = target.id;
         if (target.kind === 'file') {
           void onFileClick(target.fileId);
-        } else {
-          useGraphStore.getState().setSelection(target.id);
+          return;
+        }
+        const state = useGraphStore.getState();
+        state.setSelection(target.id);
+        // Block toggle: clicking the magenta sequential-code cell flips
+        // its entry in the store's expandedAstNodes. The layout cache
+        // for this file invalidates (its expandedSnapshot no longer
+        // matches), the file's circle resizes via applyExpansionToSim,
+        // and the file-level sim reheats so neighbours move out of the
+        // way. Re-click to collapse again.
+        const tree = activeTree(target.fileId);
+        const tn = tree?.byId.get(target.id);
+        if (tn && tn.syntaxKind === 'Block') {
+          state.toggleAstNode(target.id);
+          applyExpansionToSim();
         }
       }
 

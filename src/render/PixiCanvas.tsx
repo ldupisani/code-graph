@@ -2822,22 +2822,22 @@ export function PixiCanvas({ project }: CanvasProps) {
         container,
         getCameraScale: () => cameraScale,
         setCameraScale: (s: number) => {
-          // Reheat the sim when zoom drifts >1.5× away from the
-          // LAST reheat anchor (not from the previous frame's
-          // cameraScale). Anchoring on the last reheat means a
-          // continuous overview-to-detail scroll triggers exactly
-          // one reheat — when the user actually crosses into a
-          // different zoom regime — instead of re-firing on every
-          // wheel tick once the layout has briefly settled near
-          // the threshold. Alpha lowered from 0.25 to 0.15: just
-          // enough for the new multipliers to bias the existing
-          // arrangement, not enough to fling outliers.
+          // Big zoom transitions still warrant a small reheat so
+          // the rearrangement is visible rather than glacial — but
+          // alpha is gentler now (0.08) because the sim's
+          // alphaTarget keeps it permanently alive at 0.005. The
+          // reheat is a 'briefly more energetic' pulse on top of
+          // continuous drift, not a wake-up from death.
+          //
+          // Anchor on lastReheatScale (not live cameraScale) so a
+          // continuous scroll session triggers exactly one reheat
+          // when the user crosses into a different zoom regime.
           if (
             s > 0 &&
             lastReheatScale > 0 &&
             (s / lastReheatScale > 1.5 || lastReheatScale / s > 1.5)
           ) {
-            layout.simulation.alpha(0.15).restart();
+            layout.simulation.alpha(0.08).restart();
             lastReheatScale = s;
           }
           cameraScale = s;

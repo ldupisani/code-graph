@@ -588,7 +588,19 @@ export function buildFileLayout(
         .force("leashX", forceX<SimFileNode>(0).strength(0.004))
         .force("leashY", forceY<SimFileNode>(0).strength(0.004))
         .alpha(1)
-        .alphaDecay(0.035);
+        .alphaDecay(0.035)
+        // Continuous low-grade drift. alphaTarget is the value alpha
+        // decays TOWARD (not zero by default — d3-force then stops the
+        // sim when alpha < alphaMin). With a small positive target,
+        // the sim never fully settles: forces stay live, so zoom-
+        // modulated multipliers continuously bias the layout as the
+        // user zooms instead of needing a reheat to take effect, and
+        // small connectivity perturbations (file open/close, edge
+        // filter toggle) settle into the layout smoothly rather than
+        // freezing in mid-rearrangement. 0.005 is low enough that
+        // per-tick movement is sub-pixel for most files — visually a
+        // gentle 'breathing' rather than active motion.
+        .alphaTarget(0.005);
 
     return {nodes, links, byId, simulation};
 }

@@ -4178,7 +4178,15 @@ class LabelPool {
   }
 
   put(req: LabelRequest): void {
-    let label = this.cache.get(req.text);
+    // Key on text + size + color so any combination of those gets
+    // its OWN stable Text instance. Style mutations (fontSize, fill)
+    // also hit Pixi v8's broken returnTexture path when the canvas
+    // resizes — same bug as in-place text mutation. Treating each
+    // (text, size, color) as a distinct cache entry sidesteps the
+    // mutation entirely; only position / scale / visibility are
+    // touched per frame, none of which resize the canvas.
+    const key = `${req.text}|${req.size}|${req.color.toString(16)}`;
+    let label = this.cache.get(key);
     if (!label) {
       label = new Text({
         text: req.text,
@@ -4190,7 +4198,7 @@ class LabelPool {
       });
       label.eventMode = 'none';
       this.parent.addChild(label);
-      this.cache.set(req.text, label);
+      this.cache.set(key, label);
       // Evict the LEAST-RECENTLY-USED label when the cache gets too
       // big. We only evict labels that aren't active this frame so
       // we don't yank something out of the current render.
@@ -4211,11 +4219,10 @@ class LabelPool {
       }
     } else {
       // Refresh LRU position by re-inserting at the end of the Map.
-      this.cache.delete(req.text);
-      this.cache.set(req.text, label);
-      // Style mutations are safe — same canvas, just a re-paint.
-      if (label.style.fontSize !== req.size) label.style.fontSize = req.size;
-      if (label.style.fill !== req.color) label.style.fill = req.color;
+      // No style mutation needed — the key guarantees the cached
+      // Text already has the right size and color.
+      this.cache.delete(key);
+      this.cache.set(key, label);
     }
     label.anchor.set(req.anchorX ?? 0.5, req.anchorY ?? 0.5);
     label.position.set(req.worldX, req.worldY);

@@ -488,9 +488,21 @@ export function PixiCanvas({ project }: CanvasProps) {
       app.canvas.style.display = 'block';
       app.canvas.style.touchAction = 'none';
 
-      const layout = buildFileLayout(project);
+      // World container + cameraScale must exist BEFORE
+      // buildFileLayout because the zoom-modulated forces read
+      // cameraScale via the getter passed in. The auto-fit warm-up
+      // (simulation.tick(50)) runs synchronously below, so the
+      // getter is invoked before any other code in the IIFE
+      // assigns cameraScale.
       const world = new Container();
       app.stage.addChild(world);
+      let cameraScale = world.scale.x;
+
+      // getCameraScale is a closure-captured getter — the sim's
+      // zoom-modulated forces (folder cluster / subsystem repulsion
+      // / link-loosen counter) read it each tick so the layout
+      // continuously adapts as the user zooms.
+      const layout = buildFileLayout(project, () => cameraScale);
       if (import.meta.env.DEV && typeof window !== 'undefined') {
         (window as unknown as { __codegraph: unknown }).__codegraph = {
           layout, world,
@@ -784,9 +796,10 @@ export function PixiCanvas({ project }: CanvasProps) {
       let currentGfx: Graphics = worldGfx;
       let currentLabelPool: LabelPool = labelPool;
 
-      // Camera (mirrors world.scale.x; held in a ref so handlers can read
-      // and write without a closure stale-read.)
-      let cameraScale = world.scale.x;
+      // (cameraScale moved earlier in the IIFE — it's now hoisted
+      // before buildFileLayout so the zoom-modulated forces can
+      // read it from their tick callbacks. See the original
+      // declaration further up.)
 
       // ----- focus-mode adjacency + live set -----
       //
@@ -2789,6 +2802,20 @@ export function PixiCanvas({ project }: CanvasProps) {
         container,
         getCameraScale: () => cameraScale,
         setCameraScale: (s: number) => {
+          // Reheat the sim when zoom crosses a multiplicative
+          // threshold so the zoom-modulated forces (folder cluster /
+          // subsystem repulsion / link-loosen counter) can actually
+          // reshape the layout — without this, the sim sits at low
+          // alpha and the force-strength changes have no visible
+          // effect. Threshold tuned so casual zooms don't trigger
+          // it, but a clear overview ↔ detail transition does.
+          if (
+            s > 0 &&
+            cameraScale > 0 &&
+            (s / cameraScale > 1.5 || cameraScale / s > 1.5)
+          ) {
+            layout.simulation.alpha(0.25).restart();
+          }
           cameraScale = s;
         },
         hitTest: (worldX: number, worldY: number) => {

@@ -91,6 +91,11 @@ const CALLS_BELOW = 0.5;
 // per-file names. Icons remain visible at every zoom so structure is
 // still readable.
 const FILE_LABEL_BELOW = 0.5;
+// Intra-directory edges — imports / calls / extends between two files
+// in the SAME directory — are mostly local plumbing and dense to look
+// at. Below this zoom they're hidden entirely so only cross-directory
+// connections remain visible. Zoom in past it for the local detail.
+const INTRA_DIR_BELOW = 0.6;
 // Edge "screen length" below which the edge progressively dims. Short
 // edges (within-cluster local plumbing) get muted; long edges
 // (cross-cluster architectural connections) stay bright. Linear ramp
@@ -820,8 +825,14 @@ export function PixiCanvas({ project }: CanvasProps) {
       // `showSupportFiles` is off to skip drawing the file AND
       // every edge touching it.
       const supportFileIds = new Set<string>();
+      // file id → its containing directory (parent path, '' for root
+      // files). Used by the intra-directory edge LOD gate so we can
+      // ask "are these two files siblings?" in O(1).
+      const fileToDir = new Map<string, string>();
       for (const f of project.files) {
         if (isSupportFile(f.relativePath)) supportFileIds.add(f.id);
+        const i = f.relativePath.lastIndexOf('/');
+        fileToDir.set(f.id, i < 0 ? '' : f.relativePath.slice(0, i));
       }
       const addAdjacency = (kind: AdjKind, from: string, to: string): void => {
         if (from === to) return;
@@ -1359,6 +1370,7 @@ export function PixiCanvas({ project }: CanvasProps) {
             liveFiles,
             pathEdgeKeys,
             hideSupportForEdges ? supportFileIds : null,
+            fileToDir,
           );
         } else {
           visibleSemanticPairs.clear();
@@ -1529,6 +1541,7 @@ export function PixiCanvas({ project }: CanvasProps) {
           liveFiles,
           pathEdgeKeys,
           hideSupportForEdges ? supportFileIds : null,
+          fileToDir,
         );
       }
 
@@ -2962,6 +2975,11 @@ function drawEdges(
   // support files). Skips any edge with either endpoint in this
   // set. null = render everything.
   hiddenFileIds: ReadonlySet<string> | null,
+  // file id → containing directory. Used by the intra-directory
+  // edge LOD: when cameraScale is below INTRA_DIR_BELOW and both
+  // endpoints share a directory, skip the edge so the diagram
+  // shows only cross-cluster connections at low zoom.
+  fileToDir: ReadonlyMap<string, string>,
 ): void {
   // Import links: a quiet subdued background layer. Suppressed when a
   // calls/extends/implements link is already visible between the same two
@@ -2984,6 +3002,13 @@ function drawEdges(
       (hiddenFileIds.has(edge.fromId) || hiddenFileIds.has(edge.toId))
     ) {
       continue;
+    }
+    // Intra-directory LOD: at low zoom, suppress sibling edges so
+    // the architectural cross-cluster lines stand out.
+    if (cameraScale < INTRA_DIR_BELOW) {
+      const dirFrom = fileToDir.get(edge.fromId);
+      const dirTo = fileToDir.get(edge.toId);
+      if (dirFrom != null && dirFrom === dirTo) continue;
     }
     if (visibleSemanticPairs.has(`${edge.fromId} ${edge.toId}`)) continue;
 
@@ -3253,6 +3278,9 @@ function drawSemanticEdges(
   // files). Edges whose endpoint resolves to one of these files are
   // skipped wholesale. null = render everything.
   hiddenFileIds: ReadonlySet<string> | null,
+  // file id → containing directory, for the intra-directory LOD
+  // gate (see drawEdges).
+  fileToDir: ReadonlyMap<string, string>,
 ): void {
   visibleSemanticPairs.clear();
   const fileOf = (id: string): string => {
@@ -3291,10 +3319,17 @@ function drawSemanticEdges(
     // Hidden-files filter: same suppression as drawEdges. Endpoint
     // file id is the part of the AST id before '#'; if either side
     // resolves to a hidden file, skip the edge entirely.
-    if (hiddenFileIds) {
+    if (hiddenFileIds || cameraScale < INTRA_DIR_BELOW) {
       const fromF = fileOf(edge.fromId);
       const toF = fileOf(edge.toId);
-      if (hiddenFileIds.has(fromF) || hiddenFileIds.has(toF)) continue;
+      if (hiddenFileIds && (hiddenFileIds.has(fromF) || hiddenFileIds.has(toF))) {
+        continue;
+      }
+      if (cameraScale < INTRA_DIR_BELOW) {
+        const dirFrom = fileToDir.get(fromF);
+        const dirTo = fileToDir.get(toF);
+        if (dirFrom != null && dirFrom === dirTo) continue;
+      }
     }
     // Per-edge layer choice: above the overlay panes if either
     // endpoint resolves to an overlay-rendered rect; else below

@@ -1764,7 +1764,24 @@ export function PixiCanvas({ project }: CanvasProps) {
               visibleById.get(followId) ??
               findVisibleAnchor(followId, visibleById, activeTree);
             if (!r) return; // not resolvable yet — try again next frame
-            followAt = { x: r.x + r.w / 2, y: r.y + r.h / 2 };
+            // Code blocks anchor at their TOP-LEFT, not their centre:
+            // an expanded Block overlay reads top-down / left-to-right
+            // (it's a code statement, not a circular node), and the
+            // overlay can be substantially larger than the viewport.
+            // Centering its bounds would push the start of the code
+            // off-screen up-left; anchoring at the top-left puts the
+            // start of the statement at screen centre so the user can
+            // read down from there.
+            const isBlock =
+              followId.includes('#') &&
+              useGraphStore
+                .getState()
+                .asts.get(fileIdOfAstId(followId))
+                ?.nodes.find((n) => n.id === followId)?.syntaxKind ===
+                'Block';
+            followAt = isBlock
+              ? { x: r.x, y: r.y }
+              : { x: r.x + r.w / 2, y: r.y + r.h / 2 };
           }
         }
         const targetX = app.screen.width / 2 - followAt.x * cameraScale;

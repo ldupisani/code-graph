@@ -224,6 +224,18 @@ function isSignificant(node: { name: string | null; syntaxKind: string }): boole
 // (`buildPerFileLayout` in the useEffect closure) because it needs to
 // close over the per-file slice of the store's `expandedAstNodes`.
 
+// Nodes that participate in the click-to-expand-as-overlay model.
+// Each defaults to a small kind-outlined collapsed cell in the
+// main layout; clicking spawns an overlay with the node's full
+// content. Today: code blocks (`Block`) and object literals
+// (`ObjectLiteralExpression`). Sharing the predicate keeps the
+// main layout, overlay layout, click handler and hover affordances
+// in sync.
+const EXPANDABLE_KINDS = new Set(['Block', 'ObjectLiteralExpression']);
+function isExpandableKind(kind: string): boolean {
+  return EXPANDABLE_KINDS.has(kind);
+}
+
 // Label text colored like the code editor (Monaco `vs-dark` / Dark+ family,
 // matching EditorPane's theme): types teal, functions yellow, control-flow
 // pink, other keywords blue, strings salmon, numbers green, everything
@@ -1017,7 +1029,12 @@ export function PixiCanvas({ project }: CanvasProps) {
           // Expanded Blocks are rendered as OVERLAYS on top of the
           // main scene (anchored at the cell's world position), so
           // the main layout dimensions stay stable across toggles.
-          collapseChildren: (n) => n.syntaxKind === 'Block',
+          // Every expandable container (Block + ObjectLiteralExpression)
+          // collapses to a small kind-outlined cell in the main layout
+          // — the file's footprint stays stable across toggles. The
+          // user expands one by clicking it, which spawns an overlay
+          // anchored at the cell's world position.
+          collapseChildren: (n) => isExpandableKind(n.syntaxKind),
         });
         const force = buildAstForceLayout({
           fileId: ast.fileId,
@@ -1080,8 +1097,14 @@ export function PixiCanvas({ project }: CanvasProps) {
             rowGroup: (n) =>
               n.syntaxKind === 'HeritageClause' ? 'extends' : 'n',
             measure: labelScreenBox,
+            // Inside an overlay, nested expandable containers STAY
+            // collapsed so the user can open them as their own
+            // overlay too (same model as nested Blocks). The
+            // synthetic root itself (`blockId`) is exempt — its
+            // own content is the whole point of opening THIS
+            // overlay.
             collapseChildren: (n) =>
-              n.syntaxKind === 'Block' && n.id !== blockId,
+              isExpandableKind(n.syntaxKind) && n.id !== blockId,
           },
         );
         overlayLayouts.set(blockId, { ast, layout });
@@ -1729,8 +1752,13 @@ export function PixiCanvas({ project }: CanvasProps) {
         // a faint ghost, which reads as "text peeking through" even
         // when no actual label is leaking. The kind-coloured stroke
         // and the alpha-0.55 file circle behind do enough of the
-        // "this is a layer above the file" lift on their own.
-        const stroke = KIND_OUTLINE['Block'] ?? COLORS.astBorder;
+        // "this is a layer above the file" lift on their own. The
+        // stroke colour matches the underlying node's kind outline
+        // (magenta for Block, yellow for ObjectLiteralExpression)
+        // so the overlay reads as a magnified version of the cell
+        // it was spawned from.
+        const stroke =
+          KIND_OUTLINE[blockNode.syntaxKind] ?? COLORS.astBorder;
         worldGfx
           .rect(x, y, w, h)
           .fill({ color: COLORS.fileExpanded, alpha: 1 })
@@ -1866,9 +1894,10 @@ export function PixiCanvas({ project }: CanvasProps) {
             area: node.rect.w * node.rect.h,
           });
           // Record the cell's world rect so any overlay built for this
-          // Block can anchor its top-left here. Only Block kinds: other
+          // node (expanded later by the multi-pass loop) can anchor
+          // its top-left here. Restricted to EXPANDABLE_KINDS — other
           // collapsed leaves don't get overlays.
-          if (node.syntaxKind === 'Block') {
+          if (isExpandableKind(node.syntaxKind)) {
             blockCellsThisFrame.set(node.id, {
               x,
               y,
@@ -2506,7 +2535,13 @@ export function PixiCanvas({ project }: CanvasProps) {
           } else if (target?.kind === 'ast') {
             const tree = activeTree(target.fileId);
             const tn = tree?.byId.get(target.id);
-            if (tn?.syntaxKind === 'Block' && tn.collapsed) isToggleable = true;
+            if (
+              tn?.syntaxKind != null &&
+              isExpandableKind(tn.syntaxKind) &&
+              tn.collapsed
+            ) {
+              isToggleable = true;
+            }
           }
           container.style.cursor = isToggleable ? 'pointer' : 'grab';
         },
@@ -2586,9 +2621,10 @@ export function PixiCanvas({ project }: CanvasProps) {
           // settle on a comfortable view depth and then explore.
           state.setFocus(target.id);
         }
-        // Block toggle: clicking the magenta cell (in the main scene
-        // or inside an overlay) or an overlay's handle (kind
-        // 'ast-toggle') flips this Block in expandedAstNodes. The
+        // Expandable-container toggle: clicking the collapsed cell
+        // (Block or ObjectLiteralExpression, in the main scene or
+        // inside an overlay) or an overlay's handle (kind
+        // 'ast-toggle') flips this node in expandedAstNodes. The
         // MAIN layout doesn't change — the file's footprint is stable
         // across toggles — so we don't call applyExpansionToSim.
         // drawOverlay reads the new expandedAstNodes set on the next
@@ -2597,16 +2633,19 @@ export function PixiCanvas({ project }: CanvasProps) {
         //
         // Resolve syntaxKind via the file's flat AST (not via
         // mainTree.byId): the main layout's `collapseChildren`
-        // predicate stops recursion on EVERY Block, so a Block nested
-        // inside another Block isn't in the main tree at all. The flat
-        // ast.nodes list has every node regardless of any layout's
-        // collapse decisions, so this works at any nesting depth.
+        // predicate stops recursion on EVERY expandable kind, so an
+        // expandable nested inside another isn't in the main tree at
+        // all. The flat ast.nodes list has every node regardless of
+        // any layout's collapse decisions, so this works at any
+        // nesting depth.
         const astKind = ((): string | undefined => {
           const ast = state.asts.get(target.fileId);
           return ast?.nodes.find((n) => n.id === target.id)?.syntaxKind;
         })();
-        const isBlock = astKind === 'Block' || target.kind === 'ast-toggle';
-        if (isBlock) {
+        const isExpandable =
+          (astKind != null && isExpandableKind(astKind)) ||
+          target.kind === 'ast-toggle';
+        if (isExpandable) {
           // Two cases for the prev-rect snapshot:
           //   * Expanding: target is the cell HitRect (kind 'ast'); its
           //     w/h are the cell's small size.

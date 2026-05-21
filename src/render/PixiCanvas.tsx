@@ -317,6 +317,31 @@ const SYNTAX_CATEGORY: Record<string, keyof typeof SYNTAX> = {
   BigIntLiteral: 'number',
 };
 
+// HSL → packed 0xRRGGBB. Saturation / lightness are percentages 0-100;
+// hue is 0-360. Used by the directory-boundary palette so each
+// folder gets a stable colour derived from a hash of its path.
+function hslToHex(h: number, s: number, l: number): number {
+  const sNorm = s / 100;
+  const lNorm = l / 100;
+  const c = (1 - Math.abs(2 * lNorm - 1)) * sNorm;
+  const hp = h / 60;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+  let r1 = 0;
+  let g1 = 0;
+  let b1 = 0;
+  if (hp < 1) { r1 = c; g1 = x; }
+  else if (hp < 2) { r1 = x; g1 = c; }
+  else if (hp < 3) { g1 = c; b1 = x; }
+  else if (hp < 4) { g1 = x; b1 = c; }
+  else if (hp < 5) { r1 = x; b1 = c; }
+  else { r1 = c; b1 = x; }
+  const m = lNorm - c / 2;
+  const r = Math.round((r1 + m) * 255);
+  const g = Math.round((g1 + m) * 255);
+  const b = Math.round((b1 + m) * 255);
+  return (r << 16) | (g << 8) | b;
+}
+
 function syntaxColor(node: { syntaxKind: string; isType?: boolean }): number {
   // `isType` is set by the server for nodes that ARE types in the user's
   // source even though their syntaxKind isn't a type-category kind —
@@ -495,6 +520,13 @@ export function PixiCanvas({ project }: CanvasProps) {
       // Hit-test priority is independent of Graphics z: a separate
       // `overlayHitRects` list is consulted before `hitRects` so an
       // overlay always wins clicks within its bounds.
+      // Directory-boundary backdrop. Below worldGfx so it sits BEHIND
+      // every file and edge — pure spatial grouping cue. Stroked + fill
+      // are both translucent so the boundary doesn't compete with file
+      // content for attention.
+      const directoryGfx = new Graphics();
+      world.addChild(directoryGfx);
+
       const worldGfx = new Graphics();
       world.addChild(worldGfx);
 
@@ -708,6 +740,141 @@ export function PixiCanvas({ project }: CanvasProps) {
       // "no focus mode active, render everything at full brightness".
       let liveFiles: Set<string> | null = null;
       let liveFilesKey = '';
+
+      // Directory-boundary rendering. Each frame, for every directory
+      // with ≥2 files, compute the convex hull of its members' current
+      // positions (inflated by FILE_RIM + a tunable padding) and
+      // stroke + fill it on directoryGfx. A pale directory label
+      // floats at the hull's topmost point.
+      //
+      // Convex hull uses the monotone-chain algorithm — O(n log n),
+      // ~15 lines — which is plenty fast for the typical handful of
+      // files per directory.
+      type Pt = { x: number; y: number };
+      const BOUNDARY_PAD = 28;
+      const colourForDirectory = (dir: string): number => {
+        let h = 0;
+        for (let i = 0; i < dir.length; i++) {
+          h = (h * 31 + dir.charCodeAt(i)) | 0;
+        }
+        const hue = ((h % 360) + 360) % 360;
+        // Muted saturation / mid lightness so boundaries don't compete
+        // with file content for attention.
+        return hslToHex(hue, 38, 52);
+      };
+      const dirnameOfRel = (rel: string): string => {
+        const i = rel.lastIndexOf('/');
+        return i < 0 ? '' : rel.slice(0, i);
+      };
+      const convexHull = (pts: Pt[]): Pt[] => {
+        if (pts.length < 3) return pts.slice();
+        const sorted = pts.slice().sort((a, b) => a.x - b.x || a.y - b.y);
+        const cross = (o: Pt, a: Pt, b: Pt): number =>
+          (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+        const lower: Pt[] = [];
+        for (const p of sorted) {
+          while (
+            lower.length >= 2 &&
+            cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0
+          ) {
+            lower.pop();
+          }
+          lower.push(p);
+        }
+        const upper: Pt[] = [];
+        for (let i = sorted.length - 1; i >= 0; i--) {
+          const p = sorted[i];
+          while (
+            upper.length >= 2 &&
+            cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0
+          ) {
+            upper.pop();
+          }
+          upper.push(p);
+        }
+        lower.pop();
+        upper.pop();
+        return lower.concat(upper);
+      };
+      const inflateHull = (hull: Pt[], pad: number): Pt[] => {
+        if (hull.length === 0) return hull;
+        let cx = 0;
+        let cy = 0;
+        for (const p of hull) {
+          cx += p.x;
+          cy += p.y;
+        }
+        cx /= hull.length;
+        cy /= hull.length;
+        return hull.map((p) => {
+          const dx = p.x - cx;
+          const dy = p.y - cy;
+          const d = Math.hypot(dx, dy) || 1;
+          return { x: p.x + (dx / d) * pad, y: p.y + (dy / d) * pad };
+        });
+      };
+      const drawDirectoryBoundaries = (): void => {
+        const byDir = new Map<string, SimFileNode[]>();
+        for (const sim of layout.nodes) {
+          const dir = dirnameOfRel(sim.relativePath);
+          if (!dir) continue;
+          let list = byDir.get(dir);
+          if (!list) {
+            list = [];
+            byDir.set(dir, list);
+          }
+          list.push(sim);
+        }
+        for (const [dir, mems] of byDir) {
+          if (mems.length < 2) continue;
+          // Inflate each file's footprint into a small star of corner
+          // points so the hull encloses the file rect, not just its
+          // centre. Cheaper than per-file circle sampling and visually
+          // identical for the convex-hull algorithm.
+          const pts: Pt[] = [];
+          for (const m of mems) {
+            const half = Math.max(m.width, m.height) / 2;
+            pts.push({ x: m.x - half, y: m.y - half });
+            pts.push({ x: m.x + half, y: m.y - half });
+            pts.push({ x: m.x + half, y: m.y + half });
+            pts.push({ x: m.x - half, y: m.y + half });
+          }
+          const hull = inflateHull(convexHull(pts), BOUNDARY_PAD);
+          if (hull.length < 3) continue;
+          const colour = colourForDirectory(dir);
+          // Build the path.
+          directoryGfx.moveTo(hull[0].x, hull[0].y);
+          for (let i = 1; i < hull.length; i++) {
+            directoryGfx.lineTo(hull[i].x, hull[i].y);
+          }
+          directoryGfx
+            .closePath()
+            .fill({ color: colour, alpha: 0.06 })
+            .stroke({
+              color: colour,
+              width: 1 / cameraScale,
+              alpha: 0.45,
+            });
+          // Directory label at the hull's topmost point. Compute once
+          // per directory; placement is below the topmost vertex so
+          // the label sits INSIDE the hull rather than overlapping a
+          // file above.
+          let topI = 0;
+          for (let i = 1; i < hull.length; i++) {
+            if (hull[i].y < hull[topI].y) topI = i;
+          }
+          labelPool.put({
+            text: dir,
+            worldX: hull[topI].x,
+            worldY: hull[topI].y + 14 / cameraScale,
+            color: colour,
+            size: 12,
+            anchorX: 0,
+            anchorY: 0,
+            scale: 1 / cameraScale,
+          });
+        }
+      };
 
       // BFS shortest-path between two file IDs through the visible
       // adjacency, returning the ordered list of file IDs (inclusive
@@ -990,6 +1157,7 @@ export function PixiCanvas({ project }: CanvasProps) {
         const selection = state.selection;
 
         worldGfx.clear();
+        directoryGfx.clear();
         dimGfx.clear();
         semanticEdgeGfx.clear();
         hitRects.length = 0;
@@ -1043,6 +1211,12 @@ export function PixiCanvas({ project }: CanvasProps) {
         } else {
           visibleSemanticPairs.clear();
         }
+
+        // 1b. Directory boundaries (translucent convex hull + label
+        //     behind file circles). Drawn AFTER edges so import lines
+        //     pass cleanly through, and BEFORE files so file circles
+        //     sit on top of the boundary fill.
+        drawDirectoryBoundaries();
 
         // 2. Files + AST subtrees on `worldGfx`. pushRect keeps visibleById
         //    in sync so the edge pass below can find precise anchors.

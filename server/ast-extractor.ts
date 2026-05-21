@@ -63,6 +63,7 @@ export function extractAst(
 
   function pushAndRecurse(node: Node, id: string, parentId: string | null): void {
     idByNode.set(node, id);
+    const typeFlag = isTypeImportBinding(node) || undefined;
     nodes.push({
       id,
       parentId,
@@ -72,6 +73,7 @@ export function extractAst(
       exported: exportedOf(node),
       abstract: abstractOf(node),
       extendsName: extendsNameOf(node),
+      isType: typeFlag,
       start: node.getStart(),
       end: node.getEnd(),
     });
@@ -153,6 +155,71 @@ function synthesizeCallLabel(node: Node, inlined: Set<Node>): string | null {
   }
 
   return null;
+}
+
+// True when the node is an import binding for a type, i.e. either
+//   * an ImportSpecifier with its own `isTypeOnly` (`import { type Foo }`), or
+//   * any descendant of an ImportClause whose `isTypeOnly` is set
+//     (`import type { Foo }`, `import type Default from ...`).
+// The latter covers both the default-import Identifier (which reparents to
+// ImportDeclaration after ImportClause elision in visit()) AND the named
+// ImportSpecifier children — both should render in the type colour.
+function isTypeImportBinding(node: Node): boolean {
+  const k = node.getKind();
+  if (
+    k !== ts.SyntaxKind.ImportSpecifier &&
+    k !== ts.SyntaxKind.Identifier
+  ) {
+    return false;
+  }
+  if (k === ts.SyntaxKind.ImportSpecifier) {
+    const spec = node as unknown as { isTypeOnly?: () => boolean };
+    if (typeof spec.isTypeOnly === 'function') {
+      try {
+        if (spec.isTypeOnly()) return true;
+      } catch {
+        /* defensive — fall through to the ancestry check */
+      }
+    }
+  }
+  // Walk up to the closest ImportClause (bounded by the enclosing
+  // ImportDeclaration). If we pass an ImportDeclaration without seeing an
+  // ImportClause we're not in an import position at all — bail out.
+  let cur: Node | undefined = node.getParent();
+  while (cur) {
+    const ck = cur.getKind();
+    if (ck === ts.SyntaxKind.ImportClause) {
+      const clause = cur as unknown as { isTypeOnly?: () => boolean };
+      if (typeof clause.isTypeOnly === 'function') {
+        try {
+          return !!clause.isTypeOnly();
+        } catch {
+          return false;
+        }
+      }
+      return false;
+    }
+    if (
+      ck === ts.SyntaxKind.SourceFile ||
+      ck === ts.SyntaxKind.ImportDeclaration
+    ) {
+      return false;
+    }
+    cur = cur.getParent();
+  }
+  return false;
+}
+
+// A TypeReference renders as a single labelled rect carrying the type's
+// text (e.g. `Player`, `Map<string, Foo>`, `MyNs.Inner`). The wrapping
+// "type" rect with its identifier child inside was visual noise — the
+// referenced name *is* the type, and the syntaxKind already routes the
+// colour through SYNTAX.type. Inlining every descendant suppresses the
+// inner Identifier so it doesn't render its own rect.
+function synthesizeTypeRefLabel(node: Node, inlined: Set<Node>): string | null {
+  if (node.getKind() !== ts.SyntaxKind.TypeReference) return null;
+  node.forEachDescendant((d) => inlined.add(d));
+  return node.getText();
 }
 
 // Synthesised label for a standalone PropertyAccess/ElementAccess — one that
@@ -443,6 +510,14 @@ function friendlyName(node: Node, inlined: Set<Node>): string | null {
   // On success the callee subtree is added to `inlined`.
   const synthesised = synthesizeCallLabel(node, inlined);
   if (synthesised !== null) return synthesised;
+
+  // TypeReference: emit the referenced type's text as a single label
+  // (e.g. `Player`, `Map<string, Player>`, `MyNs.Inner`) and inline
+  // every descendant so the identifier inside doesn't render as its
+  // own child rect. The client paints these in SYNTAX.type because
+  // syntaxKind is 'TypeReference'.
+  const typeRefLabel = synthesizeTypeRefLabel(node, inlined);
+  if (typeRefLabel !== null) return typeRefLabel;
 
   // Standalone PropertyAccess/ElementAccess (not the callee of a Call/New, or
   // a callee whose surrounding Call couldn't be collapsed). Render the dotted

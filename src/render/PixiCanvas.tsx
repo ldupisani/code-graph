@@ -281,7 +281,13 @@ const SYNTAX_CATEGORY: Record<string, keyof typeof SYNTAX> = {
   BigIntLiteral: 'number',
 };
 
-function syntaxColor(node: { syntaxKind: string }): number {
+function syntaxColor(node: { syntaxKind: string; isType?: boolean }): number {
+  // `isType` is set by the server for nodes that ARE types in the user's
+  // source even though their syntaxKind isn't a type-category kind —
+  // currently the bindings inside an `import type { ... }` (kind
+  // ImportSpecifier or Identifier, default-category 'keyword'). Map them
+  // to the same green the editor uses for type names regardless of kind.
+  if (node.isType) return SYNTAX.type;
   return SYNTAX[SYNTAX_CATEGORY[node.syntaxKind] ?? 'default'];
 }
 

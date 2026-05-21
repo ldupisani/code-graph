@@ -22,6 +22,10 @@ export interface TreemapNode {
   exported?: boolean;
   abstract?: boolean;
   extendsName?: string;
+  // True for nodes that should render in the type colour regardless of
+  // their syntaxKind's normal category — currently set by the server
+  // for type-only import bindings (see AstNode.isType in api/types.ts).
+  isType?: boolean;
   // Relational rendering: when set, the renderer draws `op` centered at
   // `opAnchor` between this node's two operand boxes. For the `let i = j`
   // case the left operand is the node's own name, drawn in `labelChip`
@@ -328,6 +332,7 @@ export function layoutAst(
       exported: s.node.exported,
       abstract: s.node.abstract,
       extendsName: s.node.extendsName,
+      isType: s.node.isType,
       rect: { x, y, w: s.w, h: s.h },
       depth,
       collapsed: s.collapsed,

@@ -105,6 +105,14 @@ export interface AstNode {
   // (e.g. "Animal", or "A, B" for an interface). Rendered inline on the
   // header ("Dog extends Animal") instead of as a separate block.
   extendsName?: string;
+  // True when the node is a type in the user's source code: a
+  // TypeReference (always), or an import binding whose closest
+  // ImportClause has `isTypeOnly` (the `import type { Foo }` form),
+  // or an ImportSpecifier with its own `isTypeOnly` (the
+  // `import { type Foo }` form). The renderer paints these in the
+  // SYNTAX.type colour regardless of their syntaxKind's normal
+  // category, matching how the editor highlights types.
+  isType?: boolean;
   start: number;          // char offset in source, inclusive
   end: number;            // char offset, exclusive
 }

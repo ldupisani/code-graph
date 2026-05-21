@@ -913,11 +913,6 @@ export function PixiCanvas({ project }: CanvasProps) {
         // with file content for attention.
         return hslToHex(hue, 38, 52);
       };
-      const dirnameOfRel = (rel: string): string => {
-        const i = rel.lastIndexOf('/');
-        return i < 0 ? '' : rel.slice(0, i);
-      };
-
       // Take the first `depth` components of a relative path. Used to
       // group deeply-nested files into a smaller number of meaningful
       // architectural clusters. `src/components/data-display/list/item.tsx`

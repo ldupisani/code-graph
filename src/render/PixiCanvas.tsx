@@ -84,6 +84,22 @@ const OUTLINE_BELOW = 0.5;
 // file must be expanded), so they can come back early too — otherwise
 // they're invisible until an expanded node fills the whole viewport.
 const CALLS_BELOW = 0.5;
+// File-name labels are constant-screen-size 12px text. In dense
+// projects (hundreds of files per directory) they overlap heavily at
+// low zoom. Below this threshold, file labels drop entirely — the
+// directory-hull labels carry the spatial story; zoom in to reveal
+// per-file names. Icons remain visible at every zoom so structure is
+// still readable.
+const FILE_LABEL_BELOW = 0.5;
+// Edge "screen length" below which the edge progressively dims. Short
+// edges (within-cluster local plumbing) get muted; long edges
+// (cross-cluster architectural connections) stay bright. Linear ramp
+// from full alpha at EDGE_LENGTH_BRIGHT_PX → minimum alpha at
+// EDGE_LENGTH_DIM_PX. Keeps the architectural signal visible even
+// when local imports densely overlap.
+const EDGE_LENGTH_DIM_PX = 50;
+const EDGE_LENGTH_BRIGHT_PX = 180;
+const EDGE_LENGTH_MIN_ALPHA = 0.18;
 // Every Block (the magenta sequential-code cells — function bodies,
 // if/for/while/try bodies, standalone braced scopes) defaults to a
 // COLLAPSED single-cell rendering: just the kind outline, no
@@ -328,6 +344,28 @@ const SYNTAX_CATEGORY: Record<string, keyof typeof SYNTAX> = {
   NumericLiteral: 'number',
   BigIntLiteral: 'number',
 };
+
+// Edge-length LOD: maps the on-screen length of an edge segment to an
+// alpha multiplier. Short edges (local intra-cluster plumbing) get
+// progressively muted to ~MIN_ALPHA; long edges (cross-cluster
+// architectural connections) keep full strength. Linear ramp between
+// the two thresholds.
+function edgeLengthAlphaMultiplier(
+  sx: number,
+  sy: number,
+  tx: number,
+  ty: number,
+  cameraScale: number,
+): number {
+  // Convert world distance to screen pixels.
+  const screenLen = Math.hypot(tx - sx, ty - sy) * cameraScale;
+  if (screenLen >= EDGE_LENGTH_BRIGHT_PX) return 1;
+  if (screenLen <= EDGE_LENGTH_DIM_PX) return EDGE_LENGTH_MIN_ALPHA;
+  const t =
+    (screenLen - EDGE_LENGTH_DIM_PX) /
+    (EDGE_LENGTH_BRIGHT_PX - EDGE_LENGTH_DIM_PX);
+  return EDGE_LENGTH_MIN_ALPHA + (1 - EDGE_LENGTH_MIN_ALPHA) * t;
+}
 
 // HSL → packed 0xRRGGBB. Saturation / lightness are percentages 0-100;
 // hue is 0-360. Used by the directory-boundary palette so each
@@ -1430,6 +1468,11 @@ export function PixiCanvas({ project }: CanvasProps) {
         const labelScale = 1 / cameraScale;
         const aboveGap = 8 / cameraScale; // screen-constant gap above the node
         const putName = (topY: number): void => {
+          // LOD gate: hide individual file names at low zoom so the
+          // directory-hull labels carry the spatial story. Selected
+          // / focused files keep their name regardless — they're the
+          // user's anchor and shouldn't fade out under them.
+          if (cameraScale < FILE_LABEL_BELOW && !isSelected) return;
           labelPool.put({
             text: fileLabel(sim.relativePath),
             worldX: sim.x,
@@ -2893,6 +2936,13 @@ function drawEdges(
     ) {
       edgeAlpha *= 0.18;
     }
+    // Edge-length LOD: short edges (within-cluster local imports)
+    // get progressively muted; long edges (cross-cluster
+    // architectural links) stay bright. Path-traced edges always
+    // stay bright — they ARE the user's question.
+    if (!onPath) {
+      edgeAlpha *= edgeLengthAlphaMultiplier(sx, sy, tx, ty, cameraScale);
+    }
     gfx
       .moveTo(sx, sy)
       .lineTo(tx, ty)
@@ -3237,6 +3287,22 @@ function drawSemanticEdges(
       (!liveFiles.has(fromFile) || !liveFiles.has(toFile))
     ) {
       edgeAlpha *= 0.18;
+    }
+    // Edge-length LOD (centre-to-centre as a length proxy — the
+    // actual bezier is curved but its endpoints' separation is what
+    // determines whether it reads as 'local' or 'cross-cluster').
+    if (!onPath) {
+      const fcx = from.x + from.w / 2;
+      const fcy = from.y + from.h / 2;
+      const tcx = to.x + to.w / 2;
+      const tcy = to.y + to.h / 2;
+      edgeAlpha *= edgeLengthAlphaMultiplier(
+        fcx,
+        fcy,
+        tcx,
+        tcy,
+        cameraScale,
+      );
     }
     // Routing the extends/implements line THROUGH the import binding when
     // the source file is expanded: subclass → local imported name → real

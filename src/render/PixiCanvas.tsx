@@ -545,6 +545,20 @@ export function PixiCanvas({ project }: CanvasProps) {
       let followStartAt = 0;
       let followAt: { x: number; y: number } | null = null;
 
+      // Zoom-to-fit animation. Set by `fitFileInViewport` when a freshly
+      // expanded file is larger than the viewport; cleared once the
+      // scale has converged or the user moves the camera themselves.
+      // The `pivot` is a fixed world point — usually the file's centre
+      // — that we keep at the same SCREEN position throughout the zoom
+      // (by compensating world.x/y per tick), so the file appears to
+      // shrink in place rather than drift toward the world origin.
+      // Centering itself is handled by the existing followId/followAt
+      // logic, which runs each tick using the current cameraScale.
+      let zoomFit: {
+        targetScale: number;
+        pivot: { x: number; y: number };
+      } | null = null;
+
       // Directional `${fromFileId} ${toFileId}` keys for semantic edges
       // (calls/extends/implements) actually drawn this frame. drawSemanticEdges
       // rebuilds it; drawEdges (which runs earlier in the frame) reads the
@@ -1820,7 +1834,64 @@ export function PixiCanvas({ project }: CanvasProps) {
         }
       }
 
+      // If a file's expanded footprint doesn't fit at the current zoom,
+      // schedule a smooth zoom-OUT (never zoom in) so it lands inside
+      // the viewport with a small margin. Pivots around the file's
+      // current centre so the file shrinks in place; the existing
+      // followId pan then centres it.
+      function fitFileInViewport(fileId: string): void {
+        const simNode = layout.byId.get(fileId);
+        if (!simNode) return;
+        // 10% breathing room on each axis — flush-to-edge reads as
+        // clipped even when geometrically correct.
+        const MARGIN = 0.9;
+        const fitW = (app.screen.width * MARGIN) / simNode.width;
+        const fitH = (app.screen.height * MARGIN) / simNode.height;
+        const fitScale = Math.min(fitW, fitH);
+        // Only ever zoom OUT to fit. If the file already fits at the
+        // user's current zoom, leave their zoom alone.
+        if (fitScale >= world.scale.x) return;
+        zoomFit = {
+          targetScale: fitScale,
+          pivot: { x: simNode.x, y: simNode.y },
+        };
+      }
+
+      // Lerp world.scale toward zoomFit.targetScale, pivoting around
+      // zoomFit.pivot (a fixed world point). Compensating world.x/y
+      // each tick keeps the pivot at the same SCREEN position so the
+      // file appears to shrink in place rather than drift toward the
+      // world origin during the animation.
+      function updateZoomFit(): void {
+        if (zoomFit === null) return;
+        const current = world.scale.x;
+        const target = zoomFit.targetScale;
+        // Where is the pivot on screen right now?
+        const pivotScreenX = world.x + zoomFit.pivot.x * current;
+        const pivotScreenY = world.y + zoomFit.pivot.y * current;
+        const diff = target - current;
+        if (Math.abs(diff) < 0.0005) {
+          // Snap final values so the animation ends crisply.
+          world.scale.set(target);
+          cameraScale = target;
+          world.x = pivotScreenX - zoomFit.pivot.x * target;
+          world.y = pivotScreenY - zoomFit.pivot.y * target;
+          zoomFit = null;
+          return;
+        }
+        const next = current + diff * 0.12;
+        world.scale.set(next);
+        cameraScale = next;
+        world.x = pivotScreenX - zoomFit.pivot.x * next;
+        world.y = pivotScreenY - zoomFit.pivot.y * next;
+      }
+
       const tickerCb = () => {
+        // updateZoomFit BEFORE draw so this frame renders at the
+        // already-lerped scale (the alternative — one-frame lag —
+        // looks like a stutter on the first frame of the zoom).
+        // updateFollow AFTER draw so it can read visibleById.
+        updateZoomFit();
         draw();
         updateFollow();
       };
@@ -1918,6 +1989,9 @@ export function PixiCanvas({ project }: CanvasProps) {
         onUserCameraMove: () => {
           followId = null;
           followAt = null;
+          // User scrolled or dragged — drop any in-flight zoom-to-fit
+          // so we don't fight their input.
+          zoomFit = null;
         },
       });
 
@@ -2032,6 +2106,11 @@ export function PixiCanvas({ project }: CanvasProps) {
         useGraphStore.getState().expandFile(fileId);
         applyExpansionToSim();
         buildSubtreeLayout(fileId);
+        // After expansion the file's sim footprint is its real size
+        // (applyExpansion writes sim.width/height from expandedSizeFor).
+        // If that footprint exceeds the viewport at the current zoom,
+        // ease the camera out so it fits.
+        fitFileInViewport(fileId);
       }
 
       cleanup = () => {

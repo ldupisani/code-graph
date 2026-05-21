@@ -3,6 +3,7 @@ import { Group, Panel, Separator } from 'react-resizable-panels';
 import { openProject, subscribeToWatch, type WatchEvent } from './api/client';
 import { useGraphStore } from './graph/store';
 import { PixiCanvas } from './render/PixiCanvas';
+import { EdgeFilterPills } from './ui/EdgeFilterPills';
 import { EditorPane } from './ui/EditorPane';
 import { FolderPicker } from './ui/FolderPicker';
 import type { AstNode, FileNode, ProjectResponse } from './api/types';
@@ -111,6 +112,7 @@ export function App() {
               <div style={{ position: 'relative', width: '100%', height: '100%' }}>
                 <PixiCanvas project={project} />
                 <SelectionPanel />
+                <EdgeFilterPills />
                 <Hints />
               </div>
             </Panel>

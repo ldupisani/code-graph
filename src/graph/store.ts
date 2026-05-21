@@ -1,6 +1,16 @@
 import { create } from 'zustand';
 import type { FileAstResponse, ProjectResponse } from '../api/types';
 
+// Which edge kinds the renderer should draw. The user toggles these
+// via the EdgeFilterPills HUD; the renderer consults this set each
+// frame and skips passes / individual edges accordingly. Default is
+// "all on" — toggling off is a *lens* the user opts into.
+export interface EdgeFilter {
+  imports: boolean;
+  calls: boolean;
+  extends: boolean; // covers both 'extends' and 'implements' semantic edges
+}
+
 export interface GraphStore {
   project: ProjectResponse | null;
   selection: string | null; // node id (file or AST node)
@@ -13,6 +23,7 @@ export interface GraphStore {
   // `collapseChildren` predicate consults this set.
   expandedAstNodes: ReadonlySet<string>;
   asts: ReadonlyMap<string, FileAstResponse>;
+  edgeFilter: EdgeFilter;
   setProject: (p: ProjectResponse | null) => void;
   refreshProject: (p: ProjectResponse) => void;
   setSelection: (id: string | null) => void;
@@ -20,7 +31,10 @@ export interface GraphStore {
   expandFile: (fileId: string) => void;
   collapseFile: (fileId: string) => void;
   toggleAstNode: (id: string) => void;
+  setEdgeFilter: (next: Partial<EdgeFilter>) => void;
 }
+
+const ALL_EDGES_ON: EdgeFilter = { imports: true, calls: true, extends: true };
 
 export const useGraphStore = create<GraphStore>((set) => ({
   project: null,
@@ -28,6 +42,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
   expandedFiles: new Set<string>(),
   expandedAstNodes: new Set<string>(),
   asts: new Map<string, FileAstResponse>(),
+  edgeFilter: { ...ALL_EDGES_ON },
   setProject: (project) =>
     set({
       project,
@@ -35,6 +50,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
       expandedFiles: new Set(),
       expandedAstNodes: new Set(),
       asts: new Map(),
+      edgeFilter: { ...ALL_EDGES_ON },
     }),
   // Used after a filesystem-driven re-walk: file-level identity is stable so
   // we keep expansion state, but AST node IDs may have shifted (sequential
@@ -77,6 +93,8 @@ export const useGraphStore = create<GraphStore>((set) => ({
       else next.add(id);
       return { expandedAstNodes: next };
     }),
+  setEdgeFilter: (next) =>
+    set((s) => ({ edgeFilter: { ...s.edgeFilter, ...next } })),
 }));
 
 // Dev-only escape hatch: lets the chrome-devtools-mcp / browser console drive

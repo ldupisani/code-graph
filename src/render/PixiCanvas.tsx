@@ -839,15 +839,21 @@ export function PixiCanvas({ project }: CanvasProps) {
         // 1. Import edges (under rects). Now anchored to the specific
         //    `import` AST node on the source side when that file is
         //    expanded, and clipped to the file's circle on the target
-        //    side — see drawEdges for the geometry.
-        drawEdges(
-          layout,
-          project.edges,
-          activeForce,
-          worldGfx,
-          cameraScale,
-          visibleSemanticPairs,
-        );
+        //    side — see drawEdges for the geometry. Gated by the
+        //    user's edge filter; toggling 'imports' off skips this
+        //    pass entirely.
+        if (state.edgeFilter.imports) {
+          drawEdges(
+            layout,
+            project.edges,
+            activeForce,
+            worldGfx,
+            cameraScale,
+            visibleSemanticPairs,
+          );
+        } else {
+          visibleSemanticPairs.clear();
+        }
 
         // 2. Files + AST subtrees on `worldGfx`. pushRect keeps visibleById
         //    in sync so the edge pass below can find precise anchors.
@@ -934,6 +940,7 @@ export function PixiCanvas({ project }: CanvasProps) {
           selection,
           state.expandedFiles,
           visibleSemanticPairs,
+          state.edgeFilter,
         );
       }
 
@@ -2491,6 +2498,12 @@ function drawSemanticEdges(
   // Rebuilt here each frame: directional `${fromFile} ${toFile}` keys for
   // every edge actually drawn, so drawEdges can suppress redundant imports.
   visibleSemanticPairs: Set<string>,
+  // User's HUD toggle for which edge kinds to draw. We still RECORD
+  // visibleSemanticPairs for hidden edges so suppressed import lines
+  // don't reappear when calls are merely toggled off — toggling
+  // imports back ON shouldn't make redundant import lines flicker
+  // back in.
+  edgeFilter: { calls: boolean; extends: boolean },
 ): void {
   visibleSemanticPairs.clear();
   const fileOf = (id: string): string => {
@@ -2515,6 +2528,17 @@ function drawSemanticEdges(
   // (kind, rect) so overlapping calls don't stack the stroke into a blob.
   const drawnOutlines = new Set<string>();
   for (const edge of edges) {
+    // User-driven kind filter. 'extends' covers both 'extends' and
+    // 'implements' semantic edges (they're structurally the same
+    // "this thing is built from that thing" relationship and toggle
+    // together).
+    if (edge.kind === 'calls' && !edgeFilter.calls) continue;
+    if (
+      (edge.kind === 'extends' || edge.kind === 'implements') &&
+      !edgeFilter.extends
+    ) {
+      continue;
+    }
     // Call links come back early (CALLS_BELOW), well before full detail —
     // otherwise they'd be invisible until an expanded node fills the screen.
     // They're still only meaningful when you can see who's calling: if the

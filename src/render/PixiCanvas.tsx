@@ -776,7 +776,11 @@ export function PixiCanvas({ project }: CanvasProps) {
       // ~15 lines — which is plenty fast for the typical handful of
       // files per directory.
       type Pt = { x: number; y: number };
-      const BOUNDARY_PAD = 28;
+      // Larger pad makes the hull "breathe" so adjacent directories
+      // visually separate even when their file clusters are close;
+      // also keeps file icons + labels comfortably INSIDE the hull
+      // rather than clipping its boundary.
+      const BOUNDARY_PAD = 48;
       const colourForDirectory = (dir: string): number => {
         let h = 0;
         for (let i = 0; i < dir.length; i++) {
@@ -874,11 +878,15 @@ export function PixiCanvas({ project }: CanvasProps) {
           }
           directoryGfx
             .closePath()
-            .fill({ color: colour, alpha: 0.06 })
+            // Quieter: very low fill alpha + subtler stroke so dense
+            // projects with many overlapping hulls don't read as
+            // chaos. The cluster + label do the spatial work; the
+            // hull is just a hint.
+            .fill({ color: colour, alpha: 0.04 })
             .stroke({
               color: colour,
               width: 1 / cameraScale,
-              alpha: 0.45,
+              alpha: 0.28,
             });
           // Directory label at the hull's topmost point. Compute once
           // per directory; placement is below the topmost vertex so

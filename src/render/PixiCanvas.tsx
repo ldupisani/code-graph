@@ -575,6 +575,49 @@ export function PixiCanvas({ project }: CanvasProps) {
         );
       }
 
+      // Per-file circle-grow animation, started when a Block toggle
+      // changes the file's size. sim.width is set to the TARGET
+      // immediately by applyExpansionToSim (so collide + the file
+      // sim's link distances are correct from frame 0 — neighbours
+      // start moving toward their final positions right away). The
+      // animation only smooths the DRAWN circle radius from `prev`
+      // to `target` over `duration` ms, giving the user the visual
+      // of the file growing rather than jumping. Brief AST overflow
+      // during the ~250 ms is acceptable.
+      interface FileAnim {
+        startedAt: number;
+        duration: number;
+        prevSize: number;
+      }
+      const fileAnims = new Map<string, FileAnim>();
+      const FILE_ANIM_DURATION = 250;
+
+      function startFileAnim(fileId: string, prevSize: number, targetSize: number) {
+        if (prevSize === targetSize) return;
+        fileAnims.set(fileId, {
+          startedAt: performance.now(),
+          duration: FILE_ANIM_DURATION,
+          prevSize,
+        });
+      }
+
+      // Returns the size (sim.width-equivalent) the drawn circle should
+      // use this frame. `actualSize` is the sim's current width (the
+      // target). Returns the actual size when no animation is active.
+      function animatedSize(fileId: string, actualSize: number): number {
+        const a = fileAnims.get(fileId);
+        if (!a) return actualSize;
+        const elapsed = performance.now() - a.startedAt;
+        if (elapsed >= a.duration) {
+          fileAnims.delete(fileId);
+          return actualSize;
+        }
+        const t = elapsed / a.duration;
+        // easeOutCubic — fast start, gentle settle.
+        const eased = 1 - Math.pow(1 - t, 3);
+        return a.prevSize + (actualSize - a.prevSize) * eased;
+      }
+
       function buildSubtreeLayout(fileId: string): void {
         ensureExpandedLayout(fileId);
       }
@@ -706,7 +749,12 @@ export function PixiCanvas({ project }: CanvasProps) {
         // Expanded files: a translucent CIRCLE encompassing the cluster.
         // sim.width === sim.height by construction (see ensureExpandedLayout)
         // so radius = half the footprint. Selection thickens the stroke.
-        const fileRadius = sim.width / 2;
+        // The DRAWN radius is animated by `animatedSize` after a Block
+        // toggle — the circle grows from prev to target over ~250 ms.
+        // The hit-rect below uses the TARGET size so clicks land on the
+        // file's final footprint immediately (no ambiguity if the user
+        // clicks the about-to-grow-into region).
+        const fileRadius = animatedSize(sim.id, sim.width) / 2;
         worldGfx
           .circle(sim.x, sim.y, fileRadius)
           .fill({ color: COLORS.fileExpanded, alpha: 0.7 });
@@ -930,17 +978,24 @@ export function PixiCanvas({ project }: CanvasProps) {
         // Collapsed-leaf path: layoutAst's `collapseChildren` predicate
         // fired on this node (so its children were dropped at layout
         // time). Paint just the parent kind's outline — no label band,
-        // no fill, no recursion. The cell stays selectable and the
-        // user reads "this is a function body, source-code panel for
-        // detail" from the magenta outline (Block).
+        // no fill, no recursion. Hovering the cell brightens the outline
+        // (alpha 1 + thicker stroke) so the user sees it's interactive;
+        // clicking toggles it via handleClick.
         if (node.collapsed) {
           const stroke = KIND_OUTLINE[node.syntaxKind] ?? COLORS.astBorder;
           const isSelectedLeaf = selection === node.id;
+          const isHovered = hoveredId === node.id;
           worldGfx
             .rect(x, y, node.rect.w, node.rect.h)
+            .fill({
+              color: stroke,
+              // Hover gets a soft tint of the outline color so the cell
+              // reads as a button without changing the visual grammar.
+              alpha: isHovered ? 0.18 : 0,
+            })
             .stroke({
               color: isSelectedLeaf ? COLORS.astSelected : stroke,
-              width: 1 / cameraScale,
+              width: (isHovered ? 2 : 1) / cameraScale,
               alpha: 1,
             });
           pushRect({
@@ -1436,6 +1491,13 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       // Camera & input
 
+      // Hover state: the AST node currently under the cursor when the
+      // user isn't dragging. Read by drawAstNode's collapsed-Block
+      // branch to render the cell with a brightened outline, and used
+      // to flip the canvas cursor between 'grab' and 'pointer' as a
+      // clickability cue.
+      let hoveredId: string | null = null;
+
       const detachCamera = wireCamera({
         app,
         world,
@@ -1446,6 +1508,20 @@ export function PixiCanvas({ project }: CanvasProps) {
         },
         hitTest: (worldX: number, worldY: number) => smallestContaining(hitRects, worldX, worldY),
         onClick: handleClick,
+        onHover: (target) => {
+          hoveredId = target?.id ?? null;
+          // Set the cursor only when the hovered node is a Block —
+          // that's where a click does something extra (toggles
+          // expansion). Other AST cells get the default grab cursor;
+          // the user can still click them to select.
+          let isToggleable = false;
+          if (target && target.kind === 'ast') {
+            const tree = activeTree(target.fileId);
+            const tn = tree?.byId.get(target.id);
+            if (tn?.syntaxKind === 'Block') isToggleable = true;
+          }
+          container.style.cursor = isToggleable ? 'pointer' : 'grab';
+        },
         onUserCameraMove: () => {
           followId = null;
         },
@@ -1468,14 +1544,21 @@ export function PixiCanvas({ project }: CanvasProps) {
         // Block toggle: clicking the magenta sequential-code cell flips
         // its entry in the store's expandedAstNodes. The layout cache
         // for this file invalidates (its expandedSnapshot no longer
-        // matches), the file's circle resizes via applyExpansionToSim,
-        // and the file-level sim reheats so neighbours move out of the
-        // way. Re-click to collapse again.
+        // matches); applyExpansionToSim pushes the new size into the
+        // file-level sim (so collide + link forces are correct and
+        // neighbours start moving right away). We also snapshot the
+        // prev/target sizes for the per-file circle-grow animation,
+        // which lerps the DRAWN radius over ~250 ms — keeps the
+        // transition smooth instead of jumping.
         const tree = activeTree(target.fileId);
         const tn = tree?.byId.get(target.id);
         if (tn && tn.syntaxKind === 'Block') {
+          const fileSim = layout.byId.get(target.fileId);
+          const prevSize = fileSim?.width ?? 0;
           state.toggleAstNode(target.id);
           applyExpansionToSim();
+          const targetSize = fileSim?.width ?? prevSize;
+          startFileAnim(target.fileId, prevSize, targetSize);
         }
       }
 
@@ -2189,13 +2272,18 @@ interface CameraDeps {
   setCameraScale: (s: number) => void;
   hitTest: (wx: number, wy: number) => HitRect | null;
   onClick: (target: HitRect | null) => void;
+  // Called whenever the (non-dragging) cursor moves over a new target.
+  // `null` means the cursor moved off any hit-tested rect. Used by the
+  // renderer to highlight collapsed Block cells under the cursor and to
+  // flip container.style.cursor between 'grab' and 'pointer'.
+  onHover: (target: HitRect | null) => void;
   // Called when the user takes manual camera control (drag-pan or zoom) so an
   // in-progress auto-pan/follow can bow out.
   onUserCameraMove: () => void;
 }
 
 function wireCamera(deps: CameraDeps): () => void {
-  const { app, world, container, setCameraScale, hitTest, onClick } = deps;
+  const { app, world, container, setCameraScale, hitTest, onClick, onHover } = deps;
   const { onUserCameraMove } = deps;
   app.stage.eventMode = 'static';
   app.stage.hitArea = app.screen;
@@ -2222,16 +2310,30 @@ function wireCamera(deps: CameraDeps): () => void {
     container.style.cursor = 'grabbing';
   };
 
+  let lastHoverId: string | null = null;
   const onMove = (e: FederatedPointerEvent) => {
-    if (!dragging) return;
-    const dx = e.global.x - pointerStart.x;
-    const dy = e.global.y - pointerStart.y;
-    movedDistance = Math.max(movedDistance, Math.hypot(dx, dy));
-    if (movedDistance > DRAG_DEADZONE) {
-      pendingTarget = null;
-      onUserCameraMove();
-      world.x = worldStart.x + dx;
-      world.y = worldStart.y + dy;
+    if (dragging) {
+      const dx = e.global.x - pointerStart.x;
+      const dy = e.global.y - pointerStart.y;
+      movedDistance = Math.max(movedDistance, Math.hypot(dx, dy));
+      if (movedDistance > DRAG_DEADZONE) {
+        pendingTarget = null;
+        onUserCameraMove();
+        world.x = worldStart.x + dx;
+        world.y = worldStart.y + dy;
+      }
+      return;
+    }
+    // Hover tracking: only when NOT dragging — during drag the rect under
+    // the cursor is moving, so hover is meaningless. Sub-pixel changes
+    // would re-hit-test every frame; we de-dupe per HitRect id so the
+    // callback only fires when the cursor crosses into / out of a rect.
+    const w = screenToWorld(e.global.x, e.global.y);
+    const hit = hitTest(w.x, w.y);
+    const hitId = hit?.id ?? null;
+    if (hitId !== lastHoverId) {
+      lastHoverId = hitId;
+      onHover(hit);
     }
   };
 

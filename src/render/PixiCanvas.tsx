@@ -1006,11 +1006,17 @@ export function PixiCanvas({ project }: CanvasProps) {
       // every file in it — useless. Depth 2 typically resolves to the
       // real architectural subdirectories, which is what we want.
       // Stop iterating only when the next depth exceeds the cap.
+      //
+      // targetMax grows steeply with zoom (slope 280, cap 240) so
+      // sub-directories resolve EARLY as the user zooms in: depth 3
+      // becomes reachable around cameraScale ~0.14, depth 4 ~0.4 —
+      // a typical React project's nested folders appear without
+      // having to zoom most of the way in.
       function chooseClusterDepth(): number {
         const hideSupport = !useGraphStore.getState().showSupportFiles;
         const targetMax = Math.max(
           8,
-          Math.min(60, Math.round(10 + cameraScale * 80)),
+          Math.min(240, Math.round(12 + cameraScale * 280)),
         );
         let chosen = 1;
         for (let d = 1; d <= 6; d++) {

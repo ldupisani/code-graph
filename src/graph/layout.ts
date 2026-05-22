@@ -431,10 +431,10 @@ export function computeRigidLayout(project: ProjectResponse): Map<string, {x: nu
             .get(dir)!
             .slice()
             .sort((a, b) => (a.relativePath < b.relativePath ? -1 : 1));
-        // Slightly-wide grid (1.5× the columns of a square) so a
-        // folder's band stays short and the vertical folder order
-        // dominates the read.
-        const cols = Math.max(1, Math.round(Math.sqrt(members.length) * 1.5));
+        // Wide grid (3× the columns of a square) so each folder
+        // reads as a short horizontal strip and the vertical
+        // folder ordering dominates the read.
+        const cols = Math.max(1, Math.round(Math.sqrt(members.length) * 3));
         members.forEach((f, i) => {
             out.set(f.id, {
                 x: x0 + (i % cols) * RIGID_CELL_W,

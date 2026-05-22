@@ -2788,8 +2788,8 @@ export function PixiCanvas({ project }: CanvasProps) {
       // force-directed connectivity layout. Log-space because zoom
       // is multiplicative (each doubling should move the blend by a
       // constant amount); smoothstep for an ease-in-out feel.
-      const RIGID_FULL_AT = 0.18; // at/below this zoom: fully rigid
-      const RIGID_NONE_AT = 1.3; // at/above this zoom: fully connectivity
+      const RIGID_FULL_AT = 0.5; // at/below this zoom: fully rigid
+      const RIGID_NONE_AT = 1.5; // at/above this zoom: fully connectivity
       function rigidness(scale: number): number {
         const lo = Math.log(RIGID_FULL_AT);
         const hi = Math.log(RIGID_NONE_AT);

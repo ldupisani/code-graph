@@ -385,23 +385,28 @@ export interface FileLayoutResult {
 }
 
 // --- Rigid folder-outline layout -----------------------------------------
-// A fully deterministic layout: folders ordered top→bottom by their
-// lexicographic path (which equals an alphabetical tree pre-order)
-// and shifted left→right by path depth; a folder's files fill a
-// compact grid inside that folder's horizontal band. The shape is
-// the same indented tree a file explorer draws. The renderer
-// interpolates toward this as the zoomed-OUT layout and away from
-// it (toward the force-directed connectivity layout) as the user
-// zooms in.
+// A fully deterministic layout: each folder's files fill a wide grid
+// (its "block"); blocks are ordered by lexicographic path (an
+// alphabetical tree pre-order) and FLOW top→bottom down a column,
+// wrapping into a new column to the right once a column reaches its
+// height budget — like a multi-column index. Within a column, depth
+// indents a folder left→right. The column count is chosen to make
+// the whole layout land near RIGID_TARGET_ASPECT (wider than tall),
+// so when zoomed out files spread horizontally rather than into one
+// tall ribbon. The renderer interpolates toward this as the
+// zoomed-OUT layout and away from it (toward the force-directed
+// connectivity layout) as the user zooms in.
 //
 // Coordinates are in connectivity-layout world units — cells are
 // sized to comfortably hold a collapsed file box (~140×28) so the
 // rigid grid is overlap-free on its own; assignRigidPositions only
 // TRANSLATES it (no scaling), so these are real sizes, not ratios.
-const RIGID_COL_W = 560; // left→right shift per path-depth level
+const RIGID_COL_W = 360; // left→right depth indent within a column
 const RIGID_CELL_W = 230; // file-cell width within a folder grid
 const RIGID_CELL_H = 76; // file-cell height within a folder grid
-const RIGID_BAND_GAP = 130; // vertical gap between folder bands
+const RIGID_BAND_GAP = 120; // vertical gap between folders in a column
+const RIGID_COLUMN_GAP = 440; // horizontal gap between folder columns
+const RIGID_TARGET_ASPECT = 1.7; // desired width : height of the layout
 
 export function computeRigidLayout(project: ProjectResponse): Map<string, {x: number; y: number}> {
     // Group files by parent directory ('<root>' for files with no
@@ -418,32 +423,77 @@ export function computeRigidLayout(project: ProjectResponse): Map<string, {x: nu
     }
     // Lexicographic sort of directory paths == alphabetical tree
     // pre-order: a parent sorts immediately before its children,
-    // siblings sort alphabetically. That ordering IS the top→bottom
-    // row order the user asked for.
+    // siblings sort alphabetically.
     const dirs = [...byDir.keys()].sort();
-    const out = new Map<string, {x: number; y: number}>();
-    let cursorY = 0;
+
+    // 1. Build each folder's block: its files in a wide grid, plus
+    //    the block's own width/height and its depth indent.
+    interface Block {
+        depth: number;
+        w: number;
+        h: number;
+        files: {id: string; dx: number; dy: number}[];
+    }
+    const blocks: Block[] = [];
     for (const dir of dirs) {
-        // depth → X column: '<root>' is 0, 'src' is 1,
-        // 'src/components' is 2, ...
         const depth = dir === ROOT_CLUSTER ? 0 : dir.split("/").length;
-        const x0 = depth * RIGID_COL_W;
         const members = byDir
             .get(dir)!
             .slice()
             .sort((a, b) => (a.relativePath < b.relativePath ? -1 : 1));
         // Wide grid (3× the columns of a square) so each folder
-        // reads as a short horizontal strip and the vertical
-        // folder ordering dominates the read.
+        // reads as a short horizontal strip.
         const cols = Math.max(1, Math.round(Math.sqrt(members.length) * 3));
-        members.forEach((f, i) => {
-            out.set(f.id, {
-                x: x0 + (i % cols) * RIGID_CELL_W,
-                y: cursorY + Math.floor(i / cols) * RIGID_CELL_H,
-            });
-        });
         const rows = Math.ceil(members.length / cols);
-        cursorY += rows * RIGID_CELL_H + RIGID_BAND_GAP;
+        blocks.push({
+            depth,
+            w: cols * RIGID_CELL_W,
+            h: rows * RIGID_CELL_H,
+            files: members.map((f, i) => ({
+                id: f.id,
+                dx: (i % cols) * RIGID_CELL_W,
+                dy: Math.floor(i / cols) * RIGID_CELL_H,
+            })),
+        });
+    }
+
+    // 2. Total single-column height, and the widest column slot (a
+    //    folder's depth indent + its block width).
+    let totalStackH = 0;
+    let maxSlotW = 1;
+    for (const b of blocks) {
+        totalStackH += b.h + RIGID_BAND_GAP;
+        const slotW = b.depth * RIGID_COL_W + b.w;
+        if (slotW > maxSlotW) maxSlotW = slotW;
+    }
+
+    // 3. Pick the column count that lands the layout near the
+    //    target aspect. With K columns the layout is ~K·colSlotW
+    //    wide and ~totalStackH/K tall, so width/height = K²·colSlotW
+    //    / totalStackH; solving for the target gives K below.
+    const colSlotW = maxSlotW + RIGID_COLUMN_GAP;
+    const columns = Math.max(
+        1,
+        Math.round(Math.sqrt((RIGID_TARGET_ASPECT * totalStackH) / colSlotW)),
+    );
+    const budget = totalStackH / columns;
+
+    // 4. Flow folders top→bottom down a column; once a column passes
+    //    its height budget, wrap to the next (the last column takes
+    //    whatever remains).
+    const out = new Map<string, {x: number; y: number}>();
+    let col = 0;
+    let cursorY = 0;
+    for (const b of blocks) {
+        if (cursorY > 0 && cursorY + b.h > budget && col < columns - 1) {
+            col++;
+            cursorY = 0;
+        }
+        const x0 = col * colSlotW + b.depth * RIGID_COL_W;
+        for (const f of b.files) {
+            out.set(f.id, {x: x0 + f.dx, y: cursorY + f.dy});
+        }
+        cursorY += b.h + RIGID_BAND_GAP;
     }
     return out;
 }

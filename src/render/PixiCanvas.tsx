@@ -494,6 +494,11 @@ export function PixiCanvas({ project }: CanvasProps) {
       const world = new Container();
       app.stage.addChild(world);
       let cameraScale = world.scale.x;
+      // The zoom the auto-fit chose at project open. The rigid ↔
+      // connectivity transition band is positioned relative to this
+      // (see rigidness) so the transition is always reachable by a
+      // moderate zoom-in whatever the project's size.
+      let fitScale = 1;
 
       const layout = buildFileLayout(project);
       if (import.meta.env.DEV && typeof window !== 'undefined') {
@@ -551,17 +556,15 @@ export function PixiCanvas({ project }: CanvasProps) {
       snapshotConn();
       assignRigidPositions(layout, connCentre());
 
-      // Restore camera if we're rebuilding the same project (filesystem
-      // refresh); otherwise auto-fit the WHOLE project to the
-      // viewport so the user lands on a meaningful overview instead
-      // of the centre of an unstabilised mess at default zoom (which
-      // for a 500+ file React project is "in the middle of the
-      // wallpaper").
+      // Always run the auto-fit: besides framing the project it
+      // computes fitScale, which the rigidness transition band is
+      // positioned relative to. When restoring a saved camera
+      // (filesystem refresh) we then overwrite the camera transform
+      // but keep the computed fitScale.
+      fitProjectToViewport();
       if (savedCamera && savedCamera.rootPath === project.rootPath) {
         world.position.set(savedCamera.x, savedCamera.y);
         world.scale.set(savedCamera.scale);
-      } else {
-        fitProjectToViewport();
       }
       // Sync the closure variable to world.scale.x AFTER auto-fit /
       // restore so the first frame's draw + the first rigidness()
@@ -616,6 +619,8 @@ export function PixiCanvas({ project }: CanvasProps) {
           0.05,
           Math.min(2, Math.min(fitW, fitH)),
         );
+        // Record for the rigidness transition band (see rigidness).
+        fitScale = scale;
         world.scale.set(scale);
         world.x = app.screen.width / 2 - cx * scale;
         world.y = app.screen.height / 2 - cy * scale;
@@ -2803,14 +2808,22 @@ export function PixiCanvas({ project }: CanvasProps) {
 
       // Camera zoom → rigid-layout blend amount. 1 = positions snap
       // fully to the deterministic folder outline; 0 = pure
-      // force-directed connectivity layout. Log-space because zoom
-      // is multiplicative (each doubling should move the blend by a
-      // constant amount); smoothstep for an ease-in-out feel.
-      const RIGID_FULL_AT = 0.5; // at/below this zoom: fully rigid
-      const RIGID_NONE_AT = 1.5; // at/above this zoom: fully connectivity
+      // force-directed connectivity layout.
+      //
+      // The transition band is RELATIVE to fitScale (the zoom the
+      // auto-fit chose at project open), not absolute: fully rigid
+      // at/below fitScale × 1.5, fully connectivity at/above
+      // fitScale × 4.5. A big project auto-fits to a tiny zoom and
+      // a small project to a large one — an absolute band would sit
+      // unreachably far from one or the other. Relative means the
+      // transition is always the same 1.5×–4.5× zoom-in from wherever
+      // the project landed. Log-space because zoom is multiplicative;
+      // smoothstep for an ease-in-out feel.
+      const RIGID_FULL_MUL = 1.5; // fully rigid at/below fitScale × this
+      const RIGID_NONE_MUL = 4.5; // fully connectivity at/above fitScale × this
       function rigidness(scale: number): number {
-        const lo = Math.log(RIGID_FULL_AT);
-        const hi = Math.log(RIGID_NONE_AT);
+        const lo = Math.log(fitScale * RIGID_FULL_MUL);
+        const hi = Math.log(fitScale * RIGID_NONE_MUL);
         let t = (Math.log(Math.max(1e-4, scale)) - lo) / (hi - lo);
         t = t < 0 ? 0 : t > 1 ? 1 : t;
         const s = t * t * (3 - 2 * t); // smoothstep

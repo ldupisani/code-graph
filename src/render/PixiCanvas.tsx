@@ -2844,7 +2844,13 @@ export function PixiCanvas({ project }: CanvasProps) {
       // and animates files out of the way when something does.
       const OVERLAP_PAD = 12; // min whitespace kept between file boxes
       const OVERLAP_ITERS = 6; // max relaxation passes per frame
-      const OVERLAP_DECAY = 0.85; // per-frame decay of the offset
+      // Per-frame decay of the offset. 0.9 (not lower): with the
+      // rigid layout now kept partly active while a file is open
+      // (RIGID_OPEN_BLEND), an open file's neighbours sit under a
+      // deeper rigid pull, so the decay must stay gentle enough that
+      // the relax pass out-pushes it rather than the offset eroding
+      // faster than it can be re-established.
+      const OVERLAP_DECAY = 0.9;
       // Per-node, per-iteration push cap. Small overlaps (two
       // collapsed files, penetration < ~500) resolve in one
       // iteration as before; only a pathological deep overlap gets
@@ -2890,13 +2896,17 @@ export function PixiCanvas({ project }: CanvasProps) {
         return moved;
       }
 
-      // Global rigid-layout enable, eased 1→0 while any file is
-      // open. An expanded file is a huge box the rigid folder grid
-      // has no concept of, so any rigid blend drags its neighbours
-      // back underneath it. The connectivity sim DOES handle
-      // expansion (forceCollide + the applyExpansion reheat), so
-      // while a file is open we fade the layout toward pure
-      // connectivity and let the sim do the spacing.
+      // Fraction of the zoom-derived rigidness still applied while a
+      // file is open. NOT 0 — the user wants to keep "some semblance
+      // of the folder structure" rather than fully deforming to the
+      // connectivity layout. NOT 1 either — an expanded file is a
+      // big box the rigid grid has no concept of, and a full rigid
+      // blend would drag its neighbours under it. 0.5 keeps half the
+      // folder structure; the overlap-relaxation pass plus the
+      // connectivity sim space things out so the open file stays clear.
+      const RIGID_OPEN_BLEND = 0.5;
+      // Eased multiplier on rigidness: 1 when nothing is open, eased
+      // toward RIGID_OPEN_BLEND while any file is open.
       let rigidEnable = 1;
 
       // Drives the sim one tick (while it still has energy), then
@@ -2927,12 +2937,13 @@ export function PixiCanvas({ project }: CanvasProps) {
             assignRigidPositions(layout, connCentre());
           }
         }
-        // Ease the rigid layout out while any file is open (see
-        // rigidEnable). 0.08/frame ≈ a ~0.4s fade — slow enough to
-        // read as a transition, fast enough not to drag.
+        // Ease rigidEnable toward RIGID_OPEN_BLEND while any file is
+        // open, back to 1 when none are. 0.08/frame ≈ a ~0.4s fade —
+        // slow enough to read as a transition, fast enough not to drag.
         const anyFileOpen =
           useGraphStore.getState().expandedFiles.size > 0;
-        rigidEnable += ((anyFileOpen ? 0 : 1) - rigidEnable) * 0.08;
+        rigidEnable +=
+          ((anyFileOpen ? RIGID_OPEN_BLEND : 1) - rigidEnable) * 0.08;
         const t = rigidness(cameraScale) * rigidEnable;
         // 1. Tentative render position = interpolated base + the
         //    decayed collision offset carried from last frame.

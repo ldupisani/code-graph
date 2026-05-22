@@ -708,6 +708,17 @@ function rawFriendlyName(node: Node, inlined: Set<Node>): string | null {
 
   if (REFERENCE_KINDS_TO_SKIP.has(kind)) return null;
 
+  // JSX attribute (`ref={…}`, `className="…"`, namespaced `a:b`).
+  // ts-morph's JsxAttribute exposes getNameNode() but NOT getName()
+  // — its base class is plain Node, not NamedNode — so the generic
+  // getName() duck-type below misses it. Without this the attribute
+  // ends up nameless, is treated as insignificant, and gets
+  // collapsed away entirely, so `ref` / `fill` / `width` never
+  // appear in the diagram. Pull the name node's text directly.
+  if (Node.isJsxAttribute(node)) {
+    return node.getNameNode().getText();
+  }
+
   // ts-morph uses structural typing for "named" nodes — many declarations
   // expose a getName() method but it's not part of the base Node API. We
   // duck-type and fall back gracefully.

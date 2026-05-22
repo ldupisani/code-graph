@@ -240,9 +240,31 @@ export function layoutAst(
       if (!label && kids.length === 2) {
         return relational(node, node.op, size(kids[0]), null, size(kids[1]));
       }
-      // `let i = j`: the name is the left operand, drawn as a chip.
+      // `let i = j` / `const Icon = forwardRef(...)`: name as a top
+      // label BAND, then `op [init]` in a row below. A top band —
+      // not an inline name-chip — because a chip is sized exactly to
+      // its label and so only fits at 1:1 zoom, making the name
+      // vanish at every lower zoom. A band gets the same robust
+      // container-header LOD every other named container uses (the
+      // header shows while the whole node — initializer included —
+      // is wide enough on screen, which happens far below 1:1).
       if (label && kids.length === 1) {
-        return relational(node, node.op, null, lb, size(kids[0]));
+        const right = size(kids[0]);
+        const ob = opts.measure(node.op);
+        const rowH = Math.max(right.h, ob.h);
+        const rightX = ob.w + GAP;
+        const rowW = rightX + right.w;
+        const contentW = Math.max(lb.w, rowW);
+        const contentH = lb.h + GAP + rowH;
+        return {
+          node,
+          labelH: lb.h,
+          w: contentW + PAD * 2,
+          h: contentH + PAD * 2,
+          kids: [{ sized: right, x: rightX, y: (rowH - right.h) / 2 }],
+          op: node.op,
+          opRel: { x: ob.w / 2, y: rowH / 2 },
+        };
       }
       // Typed-and-initialized declaration: `let i: T = v`, or a class
       // property `tickInterval: T | null = null`. Label band on top

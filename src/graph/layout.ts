@@ -394,13 +394,14 @@ export interface FileLayoutResult {
 // it (toward the force-directed connectivity layout) as the user
 // zooms in.
 //
-// Coordinates here are arbitrary-scale — assignRigidPositions
-// normalises the whole thing into the connectivity layout's box —
-// so only the RATIOS between these four constants matter.
-const RIGID_COL_W = 640; // left→right shift per path-depth level
-const RIGID_CELL_W = 210; // file-cell width within a folder grid
-const RIGID_CELL_H = 150; // file-cell height within a folder grid
-const RIGID_BAND_GAP = 200; // vertical gap between folder bands
+// Coordinates are in connectivity-layout world units — cells are
+// sized to comfortably hold a collapsed file box (~140×28) so the
+// rigid grid is overlap-free on its own; assignRigidPositions only
+// TRANSLATES it (no scaling), so these are real sizes, not ratios.
+const RIGID_COL_W = 560; // left→right shift per path-depth level
+const RIGID_CELL_W = 230; // file-cell width within a folder grid
+const RIGID_CELL_H = 76; // file-cell height within a folder grid
+const RIGID_BAND_GAP = 130; // vertical gap between folder bands
 
 export function computeRigidLayout(project: ProjectResponse): Map<string, {x: number; y: number}> {
     // Group files by parent directory ('<root>' for files with no
@@ -447,19 +448,16 @@ export function computeRigidLayout(project: ProjectResponse): Map<string, {x: nu
     return out;
 }
 
-// Normalises the raw rigid layout into a target bounding box (the
-// connectivity layout's, supplied by the caller) and writes the
-// result into every node's rigidX / rigidY. Uniform scaling keeps
-// the tree's aspect ratio; the scale is the largest that still
-// fits the rigid layout ENTIRELY INSIDE the target box, so a
-// tall-narrow folder tree stays fully framed by the same camera
-// auto-fit that framed the connectivity layout (a tall tree
-// becomes a narrow column with side whitespace rather than
-// overflowing top and bottom). Both layouts are centred on the
-// same point so the render-time interpolation path stays short.
+// Positions the rigid folder layout by TRANSLATING it so its
+// centroid sits on `centre` (the connectivity layout's centroid).
+// No scaling — the rigid layout's cells are already sized in
+// connectivity-world units to hold a file box, so the grid is
+// overlap-free as-is. Centring both layouts on the same point
+// keeps the render-time interpolation between them a short travel
+// rather than a fly-across. Writes every node's rigidX / rigidY.
 export function assignRigidPositions(
     layout: FileLayoutResult,
-    target: {minX: number; minY: number; maxX: number; maxY: number},
+    centre: {x: number; y: number},
 ): void {
     let rMinX = Infinity;
     let rMinY = Infinity;
@@ -471,24 +469,17 @@ export function assignRigidPositions(
         if (p.x > rMaxX) rMaxX = p.x;
         if (p.y > rMaxY) rMaxY = p.y;
     }
-    const rW = Math.max(1, rMaxX - rMinX);
-    const rH = Math.max(1, rMaxY - rMinY);
-    const tW = Math.max(1, target.maxX - target.minX);
-    const tH = Math.max(1, target.maxY - target.minY);
-    const scale = Math.min(tW / rW, tH / rH);
     const rCx = (rMinX + rMaxX) / 2;
     const rCy = (rMinY + rMaxY) / 2;
-    const tCx = (target.minX + target.maxX) / 2;
-    const tCy = (target.minY + target.maxY) / 2;
     for (const n of layout.nodes) {
         const p = layout.rigidRaw.get(n.id);
         if (!p) {
-            n.rigidX = tCx;
-            n.rigidY = tCy;
+            n.rigidX = centre.x;
+            n.rigidY = centre.y;
             continue;
         }
-        n.rigidX = tCx + (p.x - rCx) * scale;
-        n.rigidY = tCy + (p.y - rCy) * scale;
+        n.rigidX = centre.x + (p.x - rCx);
+        n.rigidY = centre.y + (p.y - rCy);
     }
 }
 
@@ -518,9 +509,11 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
             connX: seedX,
             connY: seedY,
             // Placeholder — assignRigidPositions overwrites these
-            // once the connectivity layout's bbox is known.
+            // once the connectivity layout's centroid is known.
             rigidX: seedX,
             rigidY: seedY,
+            offX: 0,
+            offY: 0,
         };
     });
     const byId = new Map(nodes.map((n) => [n.id, n]));

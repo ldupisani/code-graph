@@ -538,18 +538,18 @@ export function PixiCanvas({ project }: CanvasProps) {
           getBlockAnim: (id: string) => blockAnims.get(id),
         };
       }
-      // Warm the sim up synchronously so the connectivity bounding
-      // box is representative — initial node positions are seeded on
-      // a tiny ring (see buildFileLayout), so without settling the
-      // bbox would be coin-sized. 50 ticks puts alpha at
+      // Warm the sim up synchronously so the connectivity layout is
+      // representative — initial node positions are seeded on a tiny
+      // ring (see buildFileLayout), so without settling the layout
+      // would be coin-sized. 50 ticks puts alpha at
       // (1 - 0.035) ^ 50 ≈ 0.17 — past the major rearrangement.
-      // Then snapshot the connectivity positions and normalise the
-      // rigid folder layout into that same bbox, so the two layouts
-      // overlap and the render-time interpolation between them is a
-      // short travel rather than a fly-across.
+      // Then snapshot the connectivity positions and anchor the
+      // rigid folder layout on the connectivity centroid, so the
+      // two layouts overlap and the render-time interpolation
+      // between them is a short travel rather than a fly-across.
       layout.simulation.tick(50);
       snapshotConn();
-      assignRigidPositions(layout, connBounds());
+      assignRigidPositions(layout, connCentre());
 
       // Restore camera if we're rebuilding the same project (filesystem
       // refresh); otherwise auto-fit the WHOLE project to the
@@ -568,11 +568,16 @@ export function PixiCanvas({ project }: CanvasProps) {
       // evaluation reflect the actual on-screen zoom.
       cameraScale = world.scale.x;
 
-      // Frame the bounding box of all sim nodes in the viewport with
-      // ~6% margin on each side. Caps the zoom at 2 (don't zoom in
-      // on tiny projects) and 0.05 (don't disappear pathological
-      // ones). Sets cameraScale + world position directly — no
-      // animation, since this is the initial framing.
+      // Frame the project in the viewport with ~6% margin on each
+      // side. Caps the zoom at 2 (don't zoom in on tiny projects)
+      // and 0.05 (don't disappear pathological ones). Sets
+      // cameraScale + world position directly — no animation, since
+      // this is the initial framing.
+      //
+      // Frames the UNION of the connectivity layout and the rigid
+      // folder layout: the user lands zoomed-out (rigid view) for a
+      // big project, but the zoom may sit anywhere in the transition
+      // band, so both layouts must be on screen whatever the blend.
       function fitProjectToViewport(): void {
         const nodes = layout.nodes;
         if (nodes.length === 0) {
@@ -589,10 +594,16 @@ export function PixiCanvas({ project }: CanvasProps) {
         for (const n of nodes) {
           const halfW = n.width / 2;
           const halfH = n.height / 2;
-          if (n.x - halfW < minX) minX = n.x - halfW;
-          if (n.y - halfH < minY) minY = n.y - halfH;
-          if (n.x + halfW > maxX) maxX = n.x + halfW;
-          if (n.y + halfH > maxY) maxY = n.y + halfH;
+          // Connectivity-layout extent.
+          if (n.connX - halfW < minX) minX = n.connX - halfW;
+          if (n.connY - halfH < minY) minY = n.connY - halfH;
+          if (n.connX + halfW > maxX) maxX = n.connX + halfW;
+          if (n.connY + halfH > maxY) maxY = n.connY + halfH;
+          // Rigid-layout extent.
+          if (n.rigidX - halfW < minX) minX = n.rigidX - halfW;
+          if (n.rigidY - halfH < minY) minY = n.rigidY - halfH;
+          if (n.rigidX + halfW > maxX) maxX = n.rigidX + halfW;
+          if (n.rigidY + halfH > maxY) maxY = n.rigidY + halfH;
         }
         const bboxW = maxX - minX;
         const bboxH = maxY - minY;
@@ -2783,6 +2794,13 @@ export function PixiCanvas({ project }: CanvasProps) {
         return { minX, minY, maxX, maxY };
       }
 
+      // Centroid of the connectivity layout — where assignRigidPositions
+      // anchors the rigid folder layout.
+      function connCentre(): { x: number; y: number } {
+        const b = connBounds();
+        return { x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2 };
+      }
+
       // Camera zoom → rigid-layout blend amount. 1 = positions snap
       // fully to the deterministic folder outline; 0 = pure
       // force-directed connectivity layout. Log-space because zoom
@@ -2799,14 +2817,85 @@ export function PixiCanvas({ project }: CanvasProps) {
         return 1 - s;
       }
 
+      // --- Overlap relaxation -------------------------------------------
+      //
+      // lerp(connectivity, rigid) is not overlap-free even though
+      // each layout is: at an intermediate blend two files can land
+      // on top of each other, and the rigid grid has no knowledge of
+      // EXPANDED file sizes so any rigid blend drags neighbours under
+      // an open file. relaxOverlaps pushes intersecting file boxes
+      // apart along their axis of least penetration; stepLayout runs
+      // it for a few iterations each frame and records the net push
+      // as a per-node offset that decays back toward zero once the
+      // overlap clears. So it costs ~nothing when nothing overlaps,
+      // and animates files out of the way when something does.
+      const OVERLAP_PAD = 12; // min whitespace kept between file boxes
+      const OVERLAP_ITERS = 6; // max relaxation passes per frame
+      const OVERLAP_DECAY = 0.85; // per-frame decay of the offset
+      // Per-node, per-iteration push cap. Small overlaps (two
+      // collapsed files, penetration < ~500) resolve in one
+      // iteration as before; only a pathological deep overlap gets
+      // rate-limited, so a file emerging from under a big box
+      // animates out over a few frames instead of teleporting.
+      const OVERLAP_PUSH_CAP = 250;
+
+      function relaxOverlaps(nodes: SimFileNode[]): boolean {
+        let moved = false;
+        for (let i = 0; i < nodes.length; i++) {
+          const a = nodes[i];
+          const aHalfW = a.width / 2;
+          const aHalfH = a.height / 2;
+          for (let j = i + 1; j < nodes.length; j++) {
+            const b = nodes[j];
+            const dx = b.x - a.x;
+            const padX = aHalfW + b.width / 2 + OVERLAP_PAD;
+            // Cheap early-out: most pairs are far apart on X.
+            if (dx > padX || dx < -padX) continue;
+            const dy = b.y - a.y;
+            const padY = aHalfH + b.height / 2 + OVERLAP_PAD;
+            if (dy > padY || dy < -padY) continue;
+            // Boxes intersect — separate along the axis of least
+            // penetration so they part the short way.
+            const ox = padX - Math.abs(dx);
+            const oy = padY - Math.abs(dy);
+            if (ox < oy) {
+              let push = ox / 2;
+              if (push > OVERLAP_PUSH_CAP) push = OVERLAP_PUSH_CAP;
+              if (dx < 0) push = -push;
+              a.x -= push;
+              b.x += push;
+            } else {
+              let push = oy / 2;
+              if (push > OVERLAP_PUSH_CAP) push = OVERLAP_PUSH_CAP;
+              if (dy < 0) push = -push;
+              a.y -= push;
+              b.y += push;
+            }
+            moved = true;
+          }
+        }
+        return moved;
+      }
+
+      // Global rigid-layout enable, eased 1→0 while any file is
+      // open. An expanded file is a huge box the rigid folder grid
+      // has no concept of, so any rigid blend drags its neighbours
+      // back underneath it. The connectivity sim DOES handle
+      // expansion (forceCollide + the applyExpansion reheat), so
+      // while a file is open we fade the layout toward pure
+      // connectivity and let the sim do the spacing.
+      let rigidEnable = 1;
+
       // Drives the sim one tick (while it still has energy), then
-      // interpolates every node toward the rigid layout. The sim's
-      // forces must compute from PURE connectivity positions, so
-      // connX/connY are restored before the tick and re-snapshotted
-      // after; node.x/node.y then carry the interpolated RENDER
-      // position. Once alpha decays below alphaMin the sim stops
-      // ticking entirely — it does not run indefinitely — but the
-      // interpolation keeps running so zoom changes still re-blend.
+      // interpolates every node toward the rigid layout and relaxes
+      // any resulting overlaps. The sim's forces must compute from
+      // PURE connectivity positions, so connX/connY are restored
+      // before the tick and re-snapshotted after; node.x/node.y then
+      // carry the interpolated + overlap-relaxed RENDER position.
+      // Once alpha decays below alphaMin the sim stops ticking — it
+      // does not run indefinitely — but the interpolation and
+      // overlap relaxation keep running so zoom changes and file
+      // expand/collapse still re-blend cleanly.
       function stepLayout(): void {
         const sim = layout.simulation;
         if (sim.alpha() > sim.alphaMin()) {
@@ -2820,15 +2909,35 @@ export function PixiCanvas({ project }: CanvasProps) {
             n.connY = n.y;
           }
           if (sim.alpha() <= sim.alphaMin()) {
-            // Sim just settled — re-normalise the rigid layout to
-            // the FINAL connectivity bbox so the two stay co-located.
-            assignRigidPositions(layout, connBounds());
+            // Sim just settled — re-anchor the rigid layout on the
+            // FINAL connectivity centroid so the two stay co-located.
+            assignRigidPositions(layout, connCentre());
           }
         }
-        const t = rigidness(cameraScale);
+        // Ease the rigid layout out while any file is open (see
+        // rigidEnable). 0.08/frame ≈ a ~0.4s fade — slow enough to
+        // read as a transition, fast enough not to drag.
+        const anyFileOpen =
+          useGraphStore.getState().expandedFiles.size > 0;
+        rigidEnable += ((anyFileOpen ? 0 : 1) - rigidEnable) * 0.08;
+        const t = rigidness(cameraScale) * rigidEnable;
+        // 1. Tentative render position = interpolated base + the
+        //    decayed collision offset carried from last frame.
         for (const n of layout.nodes) {
-          n.x = n.connX + (n.rigidX - n.connX) * t;
-          n.y = n.connY + (n.rigidY - n.connY) * t;
+          n.offX *= OVERLAP_DECAY;
+          n.offY *= OVERLAP_DECAY;
+          n.x = n.connX + (n.rigidX - n.connX) * t + n.offX;
+          n.y = n.connY + (n.rigidY - n.connY) * t + n.offY;
+        }
+        // 2. Relax overlaps — early-exit once a pass moves nothing.
+        for (let i = 0; i < OVERLAP_ITERS; i++) {
+          if (!relaxOverlaps(layout.nodes)) break;
+        }
+        // 3. Record net displacement from the interpolated base as
+        //    the new offset (carried, decayed, into the next frame).
+        for (const n of layout.nodes) {
+          n.offX = n.x - (n.connX + (n.rigidX - n.connX) * t);
+          n.offY = n.y - (n.connY + (n.rigidY - n.connY) * t);
         }
       }
 

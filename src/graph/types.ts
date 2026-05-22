@@ -26,11 +26,20 @@ export interface SimFileNode {
   connX: number;
   connY: number;
   // Target position in the deterministic folder-outline layout,
-  // already normalised into the connectivity layout's bounding box
-  // (see assignRigidPositions). The renderer lerps x/y toward these
-  // as the user zooms out.
+  // translated so the layout is centred on the connectivity
+  // layout's centroid (see assignRigidPositions). The renderer
+  // lerps x/y toward these as the user zooms out.
   rigidX: number;
   rigidY: number;
+  // Collision-relaxation offset. The render position is
+  // lerp(connectivity, rigid) PLUS this offset; the offset is what
+  // a per-frame overlap-relaxation pass produces to keep file
+  // boxes from intersecting (the naive lerp can overlap them, and
+  // the rigid grid doesn't account for expanded file sizes). It
+  // decays toward zero each frame so files ease back to their
+  // intended position once the overlap clears.
+  offX: number;
+  offY: number;
   width: number;
   height: number;
   // The minimized box, sized to this file's basename label + padding. Stored

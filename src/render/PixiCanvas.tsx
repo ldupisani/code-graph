@@ -2945,6 +2945,17 @@ export function PixiCanvas({project}: CanvasProps) {
                     // so we don't fight their input.
                     zoomFit = null;
                 },
+                // While the cursor sits over a file, anchor the wheel-
+                // zoom on that file's centre — so the file stays under
+                // the cursor as the user zooms in/out. Returns null for
+                // any non-file hover (or no hover); the wheel handler
+                // then falls back to the default cursor-pivot zoom.
+                getZoomPivot: () => {
+                    if (!hoveredHit || hoveredHit.kind !== "file") return null;
+                    const sim = layout.byId.get(hoveredHit.fileId);
+                    if (!sim) return null;
+                    return {worldX: sim.x, worldY: sim.y};
+                },
             });
 
             function handleClick(target: HitRect | null) {
@@ -3863,6 +3874,13 @@ interface CameraDeps {
     // Called when the user takes manual camera control (drag-pan or zoom) so an
     // in-progress auto-pan/follow can bow out.
     onUserCameraMove: () => void;
+    // World point the next wheel-zoom should keep ANCHORED at the
+    // cursor's screen position. Returning a point makes the hovered
+    // file stay centred under the cursor as the user scrolls —
+    // instead of the default 'whatever world point was under the
+    // cursor stays under the cursor'. Returning null falls back to
+    // the cursor-pivot behaviour.
+    getZoomPivot?: () => {worldX: number; worldY: number} | null;
 }
 
 function wireCamera(deps: CameraDeps): () => void {
@@ -3942,9 +3960,21 @@ function wireCamera(deps: CameraDeps): () => void {
         const py = e.clientY - rect.top;
         const factor = Math.exp(-e.deltaY * 0.0015);
         const next = clamp(world.scale.x * factor, 0.05, 32);
-        const k = next / world.scale.x;
-        world.x = px - (px - world.x) * k;
-        world.y = py - (py - world.y) * k;
+        const pivot = deps.getZoomPivot?.() ?? null;
+        if (pivot) {
+            // Map this world point to the cursor's screen position at
+            // the new scale — the hovered file (or whatever the host
+            // chose) ends up centred under the cursor and stays there
+            // across the zoom.
+            world.x = px - pivot.worldX * next;
+            world.y = py - pivot.worldY * next;
+        } else {
+            // Default: keep whatever world point is currently under the
+            // cursor at that same screen position.
+            const k = next / world.scale.x;
+            world.x = px - (px - world.x) * k;
+            world.y = py - (py - world.y) * k;
+        }
         world.scale.set(next);
         setCameraScale(next);
     };

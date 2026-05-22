@@ -9,6 +9,7 @@ import {
 import { getFileAst } from '../api/client';
 import {
   applyExpansion,
+  assignRigidPositions,
   buildFileLayout,
   EXPANDED_MAX,
   EXPANDED_MIN,
@@ -488,26 +489,13 @@ export function PixiCanvas({ project }: CanvasProps) {
       app.canvas.style.display = 'block';
       app.canvas.style.touchAction = 'none';
 
-      // World container + cameraScale must exist BEFORE
-      // buildFileLayout because the zoom-modulated forces read
-      // cameraScale via the getter passed in. The auto-fit warm-up
-      // (simulation.tick(50)) runs synchronously below, so the
-      // getter is invoked before any other code in the IIFE
-      // assigns cameraScale.
+      // cameraScale mirrors world.scale.x; stepLayout reads it each
+      // frame to decide the rigid-layout blend (see rigidness()).
       const world = new Container();
       app.stage.addChild(world);
       let cameraScale = world.scale.x;
-      // Anchor used by setCameraScale to decide whether a fresh
-      // zoom session crosses the reheat threshold. Compared against
-      // the live cameraScale, NOT updated on every wheel event —
-      // see setCameraScale below.
-      let lastReheatScale = cameraScale;
 
-      // getCameraScale is a closure-captured getter — the sim's
-      // zoom-modulated forces (folder cluster / subsystem repulsion
-      // / link-loosen counter) read it each tick so the layout
-      // continuously adapts as the user zooms.
-      const layout = buildFileLayout(project, () => cameraScale);
+      const layout = buildFileLayout(project);
       if (import.meta.env.DEV && typeof window !== 'undefined') {
         (window as unknown as { __codegraph: unknown }).__codegraph = {
           layout, world,
@@ -550,6 +538,19 @@ export function PixiCanvas({ project }: CanvasProps) {
           getBlockAnim: (id: string) => blockAnims.get(id),
         };
       }
+      // Warm the sim up synchronously so the connectivity bounding
+      // box is representative — initial node positions are seeded on
+      // a tiny ring (see buildFileLayout), so without settling the
+      // bbox would be coin-sized. 50 ticks puts alpha at
+      // (1 - 0.035) ^ 50 ≈ 0.17 — past the major rearrangement.
+      // Then snapshot the connectivity positions and normalise the
+      // rigid folder layout into that same bbox, so the two layouts
+      // overlap and the render-time interpolation between them is a
+      // short travel rather than a fly-across.
+      layout.simulation.tick(50);
+      snapshotConn();
+      assignRigidPositions(layout, connBounds());
+
       // Restore camera if we're rebuilding the same project (filesystem
       // refresh); otherwise auto-fit the WHOLE project to the
       // viewport so the user lands on a meaningful overview instead
@@ -560,31 +561,12 @@ export function PixiCanvas({ project }: CanvasProps) {
         world.position.set(savedCamera.x, savedCamera.y);
         world.scale.set(savedCamera.scale);
       } else {
-        // Warm the sim up synchronously so the bbox we frame
-        // against is representative — initial node positions are
-        // seeded on a tiny ring (see buildFileLayout), so without
-        // settling we'd auto-fit to a region the size of a coin.
-        // 50 ticks puts alpha at (1 - 0.035) ^ 50 ≈ 0.17 — past the
-        // major rearrangement, into the gentle settling phase.
-        // Cost is one-time at project open; tolerable.
-        layout.simulation.tick(50);
         fitProjectToViewport();
       }
       // Sync the closure variable to world.scale.x AFTER auto-fit /
-      // restore. Without this the closure stayed at 1.0 (its
-      // initial value) until the first wheel event, at which point
-      // setCameraScale would see a 20× jump and trigger a violent
-      // reheat with the multipliers swinging in lock-step. The
-      // first frame's draw + the zoom-modulated forces also read
-      // this closure, so syncing here makes both consistent with
-      // what's actually on screen.
+      // restore so the first frame's draw + the first rigidness()
+      // evaluation reflect the actual on-screen zoom.
       cameraScale = world.scale.x;
-      // Anchor for the reheat threshold — see setCameraScale. We
-      // only reheat when the zoom drifts >1.5× from the LAST
-      // reheat (not from the live cameraScale), so a single zoom
-      // session triggers at most one reheat regardless of how
-      // many wheel events arrive.
-      lastReheatScale = cameraScale;
 
       // Frame the bounding box of all sim nodes in the viewport with
       // ~6% margin on each side. Caps the zoom at 2 (don't zoom in
@@ -2757,12 +2739,106 @@ export function PixiCanvas({ project }: CanvasProps) {
         world.y = pivotScreenY - zoomFit.pivot.y * next;
       }
 
+      // --- Layout: connectivity sim ↔ rigid folder outline --------------
+      //
+      // Two layouts coexist. The d3-force sim produces the
+      // CONNECTIVITY layout (stored per node in connX/connY). The
+      // deterministic folder outline produces the RIGID layout
+      // (rigidX/rigidY, normalised into the connectivity bbox by
+      // assignRigidPositions). Each frame, the rendered position
+      // node.x/node.y is lerp(connectivity, rigid) by a zoom-derived
+      // amount — fully rigid when zoomed out, fully connectivity
+      // when zoomed in. Everything downstream (draw, hulls, edges,
+      // hit-testing) reads node.x/node.y and so sees the blend for
+      // free.
+
+      // Copy the sim's current positions into connX/connY.
+      function snapshotConn(): void {
+        for (const n of layout.nodes) {
+          n.connX = n.x;
+          n.connY = n.y;
+        }
+      }
+
+      // Bounding box of the connectivity layout (connX/connY).
+      function connBounds(): {
+        minX: number;
+        minY: number;
+        maxX: number;
+        maxY: number;
+      } {
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const n of layout.nodes) {
+          if (n.connX < minX) minX = n.connX;
+          if (n.connY < minY) minY = n.connY;
+          if (n.connX > maxX) maxX = n.connX;
+          if (n.connY > maxY) maxY = n.connY;
+        }
+        if (!Number.isFinite(minX)) {
+          return { minX: 0, minY: 0, maxX: 1, maxY: 1 };
+        }
+        return { minX, minY, maxX, maxY };
+      }
+
+      // Camera zoom → rigid-layout blend amount. 1 = positions snap
+      // fully to the deterministic folder outline; 0 = pure
+      // force-directed connectivity layout. Log-space because zoom
+      // is multiplicative (each doubling should move the blend by a
+      // constant amount); smoothstep for an ease-in-out feel.
+      const RIGID_FULL_AT = 0.18; // at/below this zoom: fully rigid
+      const RIGID_NONE_AT = 1.3; // at/above this zoom: fully connectivity
+      function rigidness(scale: number): number {
+        const lo = Math.log(RIGID_FULL_AT);
+        const hi = Math.log(RIGID_NONE_AT);
+        let t = (Math.log(Math.max(1e-4, scale)) - lo) / (hi - lo);
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const s = t * t * (3 - 2 * t); // smoothstep
+        return 1 - s;
+      }
+
+      // Drives the sim one tick (while it still has energy), then
+      // interpolates every node toward the rigid layout. The sim's
+      // forces must compute from PURE connectivity positions, so
+      // connX/connY are restored before the tick and re-snapshotted
+      // after; node.x/node.y then carry the interpolated RENDER
+      // position. Once alpha decays below alphaMin the sim stops
+      // ticking entirely — it does not run indefinitely — but the
+      // interpolation keeps running so zoom changes still re-blend.
+      function stepLayout(): void {
+        const sim = layout.simulation;
+        if (sim.alpha() > sim.alphaMin()) {
+          for (const n of layout.nodes) {
+            n.x = n.connX;
+            n.y = n.connY;
+          }
+          sim.tick();
+          for (const n of layout.nodes) {
+            n.connX = n.x;
+            n.connY = n.y;
+          }
+          if (sim.alpha() <= sim.alphaMin()) {
+            // Sim just settled — re-normalise the rigid layout to
+            // the FINAL connectivity bbox so the two stay co-located.
+            assignRigidPositions(layout, connBounds());
+          }
+        }
+        const t = rigidness(cameraScale);
+        for (const n of layout.nodes) {
+          n.x = n.connX + (n.rigidX - n.connX) * t;
+          n.y = n.connY + (n.rigidY - n.connY) * t;
+        }
+      }
+
       const tickerCb = () => {
-        // updateZoomFit BEFORE draw so this frame renders at the
-        // already-lerped scale (the alternative — one-frame lag —
-        // looks like a stutter on the first frame of the zoom).
-        // updateFollow AFTER draw so it can read visibleById.
+        // updateZoomFit BEFORE stepLayout so rigidness() reads this
+        // frame's already-lerped scale. stepLayout BEFORE draw so
+        // draw sees the interpolated positions. updateFollow AFTER
+        // draw so it can read visibleById.
         updateZoomFit();
+        stepLayout();
         draw();
         updateFollow();
       };
@@ -2822,24 +2898,10 @@ export function PixiCanvas({ project }: CanvasProps) {
         container,
         getCameraScale: () => cameraScale,
         setCameraScale: (s: number) => {
-          // Big zoom transitions still warrant a small reheat so
-          // the rearrangement is visible rather than glacial — but
-          // alpha is gentler now (0.08) because the sim's
-          // alphaTarget keeps it permanently alive at 0.005. The
-          // reheat is a 'briefly more energetic' pulse on top of
-          // continuous drift, not a wake-up from death.
-          //
-          // Anchor on lastReheatScale (not live cameraScale) so a
-          // continuous scroll session triggers exactly one reheat
-          // when the user crosses into a different zoom regime.
-          if (
-            s > 0 &&
-            lastReheatScale > 0 &&
-            (s / lastReheatScale > 1.5 || lastReheatScale / s > 1.5)
-          ) {
-            layout.simulation.alpha(0.08).restart();
-            lastReheatScale = s;
-          }
+          // Zoom no longer reheats the sim. The connectivity layout
+          // is static once settled; zoom only changes rigidness(),
+          // which stepLayout re-applies as a render-time
+          // interpolation every frame regardless of sim alpha.
           cameraScale = s;
         },
         hitTest: (worldX: number, worldY: number) => {

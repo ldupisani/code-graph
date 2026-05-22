@@ -1,5 +1,5 @@
 import {forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY, type Simulation} from "d3-force";
-import type {ProjectResponse, SemanticEdge} from "../api/types";
+import type {FileNode, ProjectResponse, SemanticEdge} from "../api/types";
 import type {SimFileNode, SimImportLink} from "./types";
 import {fileLabel, measureMono} from "./labels";
 
@@ -79,60 +79,6 @@ const WEIGHT_CAP = 3;
 const LINK_CLEARANCE_STRENGTH = 0.18;
 const LINK_CLEARANCE_PAD = 24; // world px the line should clear the box edge by
 
-// Zoom-modulated strength curves. The goal at deep low zoom is
-// "grouping is almost EXCLUSIVELY by folder name" — folder pull
-// and inter-subsystem repulsion both dominate, the link-attraction
-// counter-force exceeds forceLink itself so cross-folder links
-// can't drag files out of their folder cluster, and the
-// directional (calls / inherit) forces fade so they don't bias
-// layout against folder grouping. At cameraScale ≥ 1 every
-// modulation collapses to baseline and the diagram reads by
-// connectivity again.
-//
-// folderMul: applied to directoryClusterForce AND
-// directorySubsystemRepulsion. Steep at low zoom for "almost
-// exclusively folder", linear back through baseline at cam=1,
-// fades to a soft floor at high zoom so folder still has SOME
-// pull when reading details.
-//
-//   cameraScale 0.05 → ~4.8  (heavy folder dominance)
-//   cameraScale 0.1  → ~4.5
-//   cameraScale 0.3  → ~3.5
-//   cameraScale 0.5  → ~2.5
-//   cameraScale 1.0  → 1.0    (baseline)
-//   cameraScale 2.0  → 0.3
-function folderMul(cameraScale: number): number {
-    return Math.max(0.3, Math.min(5, 5 - cameraScale * 4));
-}
-// linkLoosenMul: applied to linkLooseningForce. To make folder
-// "almost exclusively" win at low zoom, we need this to OVERPOWER
-// forceLink (strength=0.3 with d3-force's symmetric pull). The
-// counter pushes connected pairs apart proportional to (target -
-// d) / target * baseStrength * mul * alpha. At low zoom we let
-// it ramp to ~2.5 so cross-folder pairs that try to settle close
-// get pushed apart fast.
-//
-//   cameraScale 0.05 → ~2.4
-//   cameraScale 0.5  → ~1.4
-//   cameraScale 1.0  → 0       (no-op, forceLink unopposed)
-function linkLoosenMul(cameraScale: number): number {
-    return Math.max(0, Math.min(2.5, 2.5 - cameraScale * 2.5));
-}
-// directionalMul: applied to callsX / callsY / inheritY. These
-// are connectivity-driven biases — at very low zoom they actively
-// fight folder grouping (a class extends from a different folder
-// → inheritY pulls the subclass DOWN out of its sibling cluster).
-// Fading them to ~0.2 at low zoom lets folder dominate; at
-// cameraScale ≥ 1 they're at baseline so call chains still read
-// L→R as before.
-//
-//   cameraScale 0.05 → ~0.21
-//   cameraScale 0.5  → ~0.6
-//   cameraScale 1.0  → 1.0
-function directionalMul(cameraScale: number): number {
-    return Math.max(0.2, Math.min(1, 0.2 + cameraScale * 0.8));
-}
-
 interface DirectionalEdge {
     aId: string; // tends toward the LOWER coordinate along the axis
     bId: string; // tends toward the HIGHER coordinate along the axis
@@ -174,20 +120,9 @@ function directionalEdges(
 // least `separation` *before* `b` along `axis`, apply equal-and-opposite
 // nudges to push them into order. A no-op once satisfied, so it never fights
 // a layout that already reads correctly — that is the "gentle" behavior.
-//
-// getMul (optional) fades the force at low zoom — call/inherit
-// biases are CONNECTIVITY signals that compete with folder
-// grouping, so at the overview we want them quiet.
-function directionalForce(
-    edges: readonly DirectionalEdge[],
-    axis: "x" | "y",
-    strength: number,
-    getMul: () => number = () => 1,
-) {
+function directionalForce(edges: readonly DirectionalEdge[], axis: "x" | "y", strength: number) {
     let lookup = new Map<string, SimFileNode>();
     function force(alpha: number): void {
-        const mul = getMul();
-        if (mul === 0) return;
         for (const e of edges) {
             const a = lookup.get(e.aId);
             const b = lookup.get(e.bId);
@@ -199,7 +134,7 @@ function directionalForce(
             const deficit = separation - (bPos - aPos);
             if (deficit <= 0) continue; // already ordered with room to spare
             const w = Math.min(Math.sqrt(e.weight), WEIGHT_CAP);
-            const push = strength * mul * alpha * deficit * w * 0.5;
+            const push = strength * alpha * deficit * w * 0.5;
             if (axis === "x") {
                 a.vx = (a.vx ?? 0) - push;
                 b.vx = (b.vx ?? 0) + push;
@@ -263,12 +198,10 @@ function clusterDirAt(relativePath: string, depth: number): string {
 const SUBSYSTEM_SOFTEN = 60;
 const SUBSYSTEM_SOFTEN_SQ = SUBSYSTEM_SOFTEN * SUBSYSTEM_SOFTEN;
 
-function directorySubsystemRepulsion(strength: number, depth: number, getMul: () => number = () => 1) {
+function directorySubsystemRepulsion(strength: number, depth: number) {
     let members = new Map<string, SimFileNode[]>();
     function force(alpha: number): void {
         if (members.size < 2) return;
-        const mul = getMul();
-        if (mul === 0) return;
         const groups: {cx: number; cy: number; mems: SimFileNode[]}[] = [];
         for (const mems of members.values()) {
             let sx = 0;
@@ -291,7 +224,7 @@ function directorySubsystemRepulsion(strength: number, depth: number, getMul: ()
                 const d2 = Math.max(SUBSYSTEM_SOFTEN_SQ, rawD2);
                 const d = Math.sqrt(d2);
                 const weight = Math.sqrt(a.mems.length * b.mems.length);
-                const f = (strength * mul * alpha * weight) / d2;
+                const f = (strength * alpha * weight) / d2;
                 // Direction: away from a → b. When the two centroids
                 // coincide, use an arbitrary unit vector so we still
                 // push them apart (rather than 0/0 stall).
@@ -336,14 +269,12 @@ function directorySubsystemRepulsion(strength: number, depth: number, getMul: ()
     return force;
 }
 
-function directoryClusterForce(strength: number, getMul: () => number = () => 1) {
+function directoryClusterForce(strength: number) {
     let allNodes: SimFileNode[] = [];
     let directoryOf = new Map<string, string>();
     let members = new Map<string, SimFileNode[]>();
 
     function force(alpha: number): void {
-        const mul = getMul();
-        if (mul === 0) return;
         const centroid = new Map<string, {x: number; y: number}>();
         for (const [dir, mems] of members) {
             let sx = 0;
@@ -359,8 +290,8 @@ function directoryClusterForce(strength: number, getMul: () => number = () => 1)
             if (!dir) continue;
             const c = centroid.get(dir);
             if (!c) continue;
-            node.vx = (node.vx ?? 0) + (c.x - node.x) * alpha * strength * mul;
-            node.vy = (node.vy ?? 0) + (c.y - node.y) * alpha * strength * mul;
+            node.vx = (node.vx ?? 0) + (c.x - node.x) * alpha * strength;
+            node.vy = (node.vy ?? 0) + (c.y - node.y) * alpha * strength;
         }
     }
     force.initialize = (n: SimFileNode[]): void => {
@@ -379,53 +310,6 @@ function directoryClusterForce(strength: number, getMul: () => number = () => 1)
             mems.push(node);
         }
     };
-    return force;
-}
-
-// d3-force custom force: a small repulsion between LINKED file
-// pairs, modulated by the camera zoom. forceLink's per-link
-// strength is cached at .strength() init time so we can't cheaply
-// vary it per tick; instead we add a counter force here that
-// PUSHES linked pairs apart, scaled up at low zoom. Net effect at
-// low zoom: link attraction effectively weakens (the counter
-// cancels it more); at high zoom: counter ≈ 0, so forceLink
-// dominates.
-//
-// Direction is *toward each endpoint's away vector* with magnitude
-// proportional to (linkDistance / distance) — so once links sit
-// near their preferred distance the counter is mild, but if forceLink
-// has pulled them very close at low zoom, the counter pushes
-// proportionally back.
-function linkLooseningForce(
-    links: readonly SimImportLink[],
-    baseStrength: number,
-    getMul: () => number,
-) {
-    function force(alpha: number): void {
-        const mul = getMul();
-        if (mul === 0) return;
-        for (const link of links) {
-            const s = typeof link.source === "string" ? null : link.source;
-            const t = typeof link.target === "string" ? null : link.target;
-            if (!s || !t) continue;
-            const dx = t.x - s.x;
-            const dy = t.y - s.y;
-            const d2 = dx * dx + dy * dy + 1;
-            const d = Math.sqrt(d2);
-            const target = linkDistance(link);
-            // Only push if currently closer than target — never pull
-            // farther than the link's preferred distance.
-            if (d >= target) continue;
-            const deficit = target - d;
-            const f = baseStrength * mul * alpha * (deficit / target);
-            const nx = dx / d;
-            const ny = dy / d;
-            s.vx = (s.vx ?? 0) - nx * f;
-            s.vy = (s.vy ?? 0) - ny * f;
-            t.vx = (t.vx ?? 0) + nx * f;
-            t.vy = (t.vy ?? 0) + ny * f;
-        }
-    }
     return force;
 }
 
@@ -492,25 +376,135 @@ export interface FileLayoutResult {
     links: SimImportLink[];
     byId: Map<string, SimFileNode>;
     simulation: Simulation<SimFileNode, SimImportLink>;
+    // Raw (un-normalised) target positions for the deterministic
+    // folder-outline layout, keyed by file id. The renderer
+    // normalises these into the connectivity layout's bounding box
+    // via assignRigidPositions, then interpolates toward them as
+    // the user zooms out.
+    rigidRaw: Map<string, {x: number; y: number}>;
 }
 
-// Builds simulation nodes/links from a project and starts a force simulation.
-// Caller is responsible for calling simulation.stop() on cleanup.
-export function buildFileLayout(
-    project: ProjectResponse,
-    // Caller-supplied getter for the current camera zoom. Used by
-    // the zoom-modulated forces below: at low zoom we strengthen
-    // directory clustering + subsystem repulsion AND apply a
-    // link-loosening counter-force, so the layout reads as
-    // 'organized by folder' when overview-zoomed. At high zoom
-    // these all relax and forceLink + the directional forces
-    // dominate, so the layout reads as 'organized by what calls
-    // what'. Default getter returns 1 (no modulation) — keeps the
-    // function backwards-callable.
-    getCameraScale: () => number = () => 1,
-): FileLayoutResult {
+// --- Rigid folder-outline layout -----------------------------------------
+// A fully deterministic layout: folders ordered top→bottom by their
+// lexicographic path (which equals an alphabetical tree pre-order)
+// and shifted left→right by path depth; a folder's files fill a
+// compact grid inside that folder's horizontal band. The shape is
+// the same indented tree a file explorer draws. The renderer
+// interpolates toward this as the zoomed-OUT layout and away from
+// it (toward the force-directed connectivity layout) as the user
+// zooms in.
+//
+// Coordinates here are arbitrary-scale — assignRigidPositions
+// normalises the whole thing into the connectivity layout's box —
+// so only the RATIOS between these four constants matter.
+const RIGID_COL_W = 640; // left→right shift per path-depth level
+const RIGID_CELL_W = 210; // file-cell width within a folder grid
+const RIGID_CELL_H = 150; // file-cell height within a folder grid
+const RIGID_BAND_GAP = 200; // vertical gap between folder bands
+
+export function computeRigidLayout(project: ProjectResponse): Map<string, {x: number; y: number}> {
+    // Group files by parent directory ('<root>' for files with no
+    // directory component — see dirnameOf).
+    const byDir = new Map<string, FileNode[]>();
+    for (const f of project.files) {
+        const dir = dirnameOf(f.relativePath);
+        let arr = byDir.get(dir);
+        if (!arr) {
+            arr = [];
+            byDir.set(dir, arr);
+        }
+        arr.push(f);
+    }
+    // Lexicographic sort of directory paths == alphabetical tree
+    // pre-order: a parent sorts immediately before its children,
+    // siblings sort alphabetically. That ordering IS the top→bottom
+    // row order the user asked for.
+    const dirs = [...byDir.keys()].sort();
+    const out = new Map<string, {x: number; y: number}>();
+    let cursorY = 0;
+    for (const dir of dirs) {
+        // depth → X column: '<root>' is 0, 'src' is 1,
+        // 'src/components' is 2, ...
+        const depth = dir === ROOT_CLUSTER ? 0 : dir.split("/").length;
+        const x0 = depth * RIGID_COL_W;
+        const members = byDir
+            .get(dir)!
+            .slice()
+            .sort((a, b) => (a.relativePath < b.relativePath ? -1 : 1));
+        // Slightly-wide grid (1.5× the columns of a square) so a
+        // folder's band stays short and the vertical folder order
+        // dominates the read.
+        const cols = Math.max(1, Math.round(Math.sqrt(members.length) * 1.5));
+        members.forEach((f, i) => {
+            out.set(f.id, {
+                x: x0 + (i % cols) * RIGID_CELL_W,
+                y: cursorY + Math.floor(i / cols) * RIGID_CELL_H,
+            });
+        });
+        const rows = Math.ceil(members.length / cols);
+        cursorY += rows * RIGID_CELL_H + RIGID_BAND_GAP;
+    }
+    return out;
+}
+
+// Normalises the raw rigid layout into a target bounding box (the
+// connectivity layout's, supplied by the caller) and writes the
+// result into every node's rigidX / rigidY. Uniform scaling keeps
+// the tree's aspect ratio; the scale is the largest that still
+// fits the rigid layout ENTIRELY INSIDE the target box, so a
+// tall-narrow folder tree stays fully framed by the same camera
+// auto-fit that framed the connectivity layout (a tall tree
+// becomes a narrow column with side whitespace rather than
+// overflowing top and bottom). Both layouts are centred on the
+// same point so the render-time interpolation path stays short.
+export function assignRigidPositions(
+    layout: FileLayoutResult,
+    target: {minX: number; minY: number; maxX: number; maxY: number},
+): void {
+    let rMinX = Infinity;
+    let rMinY = Infinity;
+    let rMaxX = -Infinity;
+    let rMaxY = -Infinity;
+    for (const p of layout.rigidRaw.values()) {
+        if (p.x < rMinX) rMinX = p.x;
+        if (p.y < rMinY) rMinY = p.y;
+        if (p.x > rMaxX) rMaxX = p.x;
+        if (p.y > rMaxY) rMaxY = p.y;
+    }
+    const rW = Math.max(1, rMaxX - rMinX);
+    const rH = Math.max(1, rMaxY - rMinY);
+    const tW = Math.max(1, target.maxX - target.minX);
+    const tH = Math.max(1, target.maxY - target.minY);
+    const scale = Math.min(tW / rW, tH / rH);
+    const rCx = (rMinX + rMaxX) / 2;
+    const rCy = (rMinY + rMaxY) / 2;
+    const tCx = (target.minX + target.maxX) / 2;
+    const tCy = (target.minY + target.maxY) / 2;
+    for (const n of layout.nodes) {
+        const p = layout.rigidRaw.get(n.id);
+        if (!p) {
+            n.rigidX = tCx;
+            n.rigidY = tCy;
+            continue;
+        }
+        n.rigidX = tCx + (p.x - rCx) * scale;
+        n.rigidY = tCy + (p.y - rCy) * scale;
+    }
+}
+
+// Builds simulation nodes/links from a project. The simulation is
+// created STOPPED — the renderer drives it tick-by-tick (see
+// PixiCanvas) so it can restore connectivity positions before each
+// tick and interpolate toward the rigid layout after. Caller is
+// responsible for cleanup.
+export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
+    const rigidRaw = computeRigidLayout(project);
     const nodes: SimFileNode[] = project.files.map((f, i) => {
         const cs = collapsedSize(f.relativePath);
+        // Seed in a small ring so the force simulation has something
+        // to spread out from.
+        const seedX = Math.cos(i * 2.4) * 80;
+        const seedY = Math.sin(i * 2.4) * 80;
         return {
             id: f.id,
             relativePath: f.relativePath,
@@ -519,9 +513,14 @@ export function buildFileLayout(
             collapsedW: cs.w,
             collapsedH: cs.h,
             expanded: false,
-            // Seed in a small ring so the force simulation has something to spread out.
-            x: Math.cos(i * 2.4) * 80,
-            y: Math.sin(i * 2.4) * 80,
+            x: seedX,
+            y: seedY,
+            connX: seedX,
+            connY: seedY,
+            // Placeholder — assignRigidPositions overwrites these
+            // once the connectivity layout's bbox is known.
+            rigidX: seedX,
+            rigidY: seedY,
         };
     });
     const byId = new Map(nodes.map((n) => [n.id, n]));
@@ -552,57 +551,38 @@ export function buildFileLayout(
         .force("charge", forceManyBody<SimFileNode>().strength(-650))
         .force("center", forceCenter(0, 0))
         .force("collide", forceCollide<SimFileNode>().radius(collisionRadius).strength(0.95).iterations(2))
-        .force("callsX", directionalForce(callEdges, "x", CALLS_X_STRENGTH, () => directionalMul(getCameraScale())))
-        .force("callsY", directionalForce(callEdges, "y", CALLS_Y_STRENGTH, () => directionalMul(getCameraScale())))
-        .force("inheritY", directionalForce(inheritEdges, "y", INHERIT_Y_STRENGTH, () => directionalMul(getCameraScale())))
-        // Stronger directory pull (was 0.04) so large React-style
-        // projects with hundreds of files per directory still settle
-        // into visibly distinct clusters rather than interleaving.
-        // Multiplier scales UP at low zoom so folder structure
-        // dominates the overview view, and DOWN at high zoom so
-        // connectivity (forceLink + directional) wins where the
-        // user wants to read 'what calls what'.
-        .force("directoryCluster", directoryClusterForce(0.13, () => folderMul(getCameraScale())))
-        // Inter-subsystem repulsion — same zoom modulation as the
-        // cluster force. At low zoom, subsystems push apart hard;
-        // at high zoom, the repulsion fades and the link / call /
-        // inherit forces take over.
-        .force("directorySubsystemRepulsion", directorySubsystemRepulsion(150, 2, () => folderMul(getCameraScale())))
-        // Link-loosening counter-force: at low zoom, applies a small
-        // repulsion between linked file pairs that's closer than
-        // their preferred link distance. Effectively weakens
-        // forceLink's pull-together at overview zoom. At high zoom
-        // the multiplier is 0 → no-op, forceLink dominates.
-        .force("linkLoosen", linkLooseningForce(links, 0.6, () => linkLoosenMul(getCameraScale())))
+        .force("callsX", directionalForce(callEdges, "x", CALLS_X_STRENGTH))
+        .force("callsY", directionalForce(callEdges, "y", CALLS_Y_STRENGTH))
+        .force("inheritY", directionalForce(inheritEdges, "y", INHERIT_Y_STRENGTH))
+        // Modest directory cohesion for the CONNECTIVITY layout —
+        // the one the user reads when zoomed IN, where connectivity
+        // should dominate but a little folder grouping still aids
+        // orientation. The deterministic rigid layout
+        // (computeRigidLayout) does the strong folder organisation
+        // at the zoomed-out end, so these no longer need to be
+        // strong or zoom-modulated.
+        .force("directoryCluster", directoryClusterForce(0.09))
+        .force("directorySubsystemRepulsion", directorySubsystemRepulsion(120, 2))
         .force("clearance", linkClearanceForce(links, LINK_CLEARANCE_STRENGTH))
         // Defensive per-file soft leash toward origin. forceCenter
         // only constrains the global CENTROID — it can't stop a
         // single low-connectivity file from accumulating outward
         // drift while the rest of the cluster slides the other way
-        // to balance. At strength 0.004 this is ~150× weaker than
-        // the low-zoom directoryCluster pull (0.65), so it doesn't
-        // visibly fight folder grouping; but for a file with no
-        // siblings it's the only restoring force keeping it from
-        // sailing off into deep space as manyBody slowly pushes
-        // it outward over thousands of ticks.
+        // to balance. For a file with no siblings it's the only
+        // restoring force keeping it from sailing off as manyBody
+        // slowly pushes it outward.
         .force("leashX", forceX<SimFileNode>(0).strength(0.004))
         .force("leashY", forceY<SimFileNode>(0).strength(0.004))
         .alpha(1)
-        .alphaDecay(0.035)
-        // Continuous low-grade drift. alphaTarget is the value alpha
-        // decays TOWARD (not zero by default — d3-force then stops the
-        // sim when alpha < alphaMin). With a small positive target,
-        // the sim never fully settles: forces stay live, so zoom-
-        // modulated multipliers continuously bias the layout as the
-        // user zooms instead of needing a reheat to take effect, and
-        // small connectivity perturbations (file open/close, edge
-        // filter toggle) settle into the layout smoothly rather than
-        // freezing in mid-rearrangement. 0.005 is low enough that
-        // per-tick movement is sub-pixel for most files — visually a
-        // gentle 'breathing' rather than active motion.
-        .alphaTarget(0.005);
+        .alphaDecay(0.035);
+    // Created stopped: the renderer drives .tick() manually so it
+    // can restore connectivity positions before each tick and
+    // interpolate toward the rigid layout after. With alphaTarget
+    // at its default 0, alpha decays to alphaMin and the renderer
+    // stops ticking — the sim does NOT run indefinitely.
+    simulation.stop();
 
-    return {nodes, links, byId, simulation};
+    return {nodes, links, byId, simulation, rigidRaw};
 }
 
 /**
@@ -641,7 +621,12 @@ export function applyExpansion(layout: FileLayoutResult, expandedFiles: Readonly
             .distance(linkDistance)
             .strength(0.3),
     );
-    // High alpha so the rebalance is visibly animated rather than a teleport.
-    layout.simulation.alpha(0.9).restart();
+    // High alpha so the rebalance is visibly animated rather than a
+    // teleport. No .restart() — the sim is driven manually by the
+    // renderer's ticker; restart() would re-enable d3's internal
+    // timer and double-drive it. Bumping alpha is enough: the
+    // renderer's per-frame stepLayout sees alpha > alphaMin and
+    // resumes ticking.
+    layout.simulation.alpha(0.9);
     return true;
 }

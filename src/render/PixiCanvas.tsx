@@ -136,6 +136,15 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
     // Other
     HeritageClause: "extends",
     TypeReference: "type",
+    // Type literal — the inline `{ a: string; b: number }` that
+    // appears as a property's type. Rendered as `{}` and treated as
+    // expandable, mirroring ObjectLiteralExpression so the user can
+    // drill into its member signatures.
+    TypeLiteral: "{}",
+    // Array type — only labelled when synthesizeFlatTypeLabel bailed
+    // out (because it contains an inline TypeLiteral). Plain
+    // `Pulse[]` keeps its flattened text label.
+    ArrayType: "[]",
     ImportDeclaration: "import",
     ExportDeclaration: "export",
     ImportClause: "imports",
@@ -184,6 +193,9 @@ const NAME_LIKE_KINDS = new Set(["ImportDeclaration", "ReturnStatement"]);
 const KIND_OUTLINE: Record<string, number> = {
     Block: COLORS.astOutlineBlock,
     ObjectLiteralExpression: COLORS.astOutlineObject,
+    // Same outline as ObjectLiteralExpression — TypeLiteral reads as
+    // an "object shape" too, just in type position.
+    TypeLiteral: COLORS.astOutlineObject,
     Parameter: COLORS.astOutlineParam,
 };
 
@@ -212,7 +224,7 @@ function isSignificant(node: {name: string | null; syntaxKind: string}): boolean
 // (`ObjectLiteralExpression`). Sharing the predicate keeps the
 // main layout, overlay layout, click handler and hover affordances
 // in sync.
-const EXPANDABLE_KINDS = new Set(["Block", "ObjectLiteralExpression"]);
+const EXPANDABLE_KINDS = new Set(["Block", "ObjectLiteralExpression", "TypeLiteral"]);
 function isExpandableKind(kind: string): boolean {
     return EXPANDABLE_KINDS.has(kind);
 }

@@ -271,6 +271,15 @@ function synthesizeFlatTypeLabel(node: Node, inlined: Set<Node>): string | null 
   if (k !== ts.SyntaxKind.TypeReference && k !== ts.SyntaxKind.ArrayType) {
     return null;
   }
+  // Bail out if an inline object type literal `{...}` sits anywhere
+  // inside this type — flattening would inline the TypeLiteral and
+  // its members away, but the user wants to drill into those members
+  // like an ObjectLiteralExpression. Letting the type emit as its
+  // own container (label falls back to '[]' / 'type') keeps the
+  // TypeLiteral reachable as a child rect.
+  for (const d of node.getDescendants()) {
+    if (d.getKind() === ts.SyntaxKind.TypeLiteral) return null;
+  }
   // Use the array form so every descendant — type-argument identifiers,
   // TypeQuery exprNames, qualified-name segments, the inner element
   // type of an ArrayType — is unambiguously included before visit()

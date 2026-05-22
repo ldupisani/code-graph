@@ -898,8 +898,8 @@ export function PixiCanvas({ project }: CanvasProps) {
       // edges (calls / extends / implements). A file imported by 50
       // others is a "hub" in the architecture and should look
       // proportionally bigger than a leaf utility imported once.
-      // Sqrt scaling keeps the visual range bounded — a 100-incoming
-      // file is ~3x a 10-incoming one, not 10x.
+      // The raw score is normalised per-project into a [1, 10] icon
+      // scale — see popFactor / minPopularity / maxPopularity below.
       const filePopularity = new Map<string, number>();
       {
         const seen = new Set<string>();
@@ -914,6 +914,18 @@ export function PixiCanvas({ project }: CanvasProps) {
           bumpInbound(fileIdOfAstId(e.fromId), fileIdOfAstId(e.toId));
         }
       }
+      // Project-wide popularity range. drawFile normalises each
+      // file's score against this so the LEAST-referenced file's
+      // icon is 1× and the MOST-referenced is 10×, whatever the
+      // project's absolute reference counts happen to be.
+      let minPopularity = Infinity;
+      let maxPopularity = 0;
+      for (const f of project.files) {
+        const p = filePopularity.get(f.id) ?? 0;
+        if (p < minPopularity) minPopularity = p;
+        if (p > maxPopularity) maxPopularity = p;
+      }
+      if (!Number.isFinite(minPopularity)) minPopularity = 0;
 
       // Shift-key tracking for path tracing. wireCamera's onClick
       // doesn't pass modifier state, so we mirror it via window key
@@ -1672,12 +1684,23 @@ export function PixiCanvas({ project }: CanvasProps) {
         // hit-test pipeline; we just consult it here.
         const isHovered =
           hoveredHit?.kind === 'file' && hoveredHit.id === sim.id;
-        // Popularity-based scale factor. A file referenced by N
-        // OTHER files gets an icon ~(1 + sqrt(N)/8)x its base size.
-        // sqrt keeps the range bounded: 0 refs → 1x; 16 refs →
-        // 1.5x; 64 refs → 2x; 144 refs → 2.5x.
+        // Popularity-based scale factor, normalised across the
+        // project into [1, 10]: the least-referenced file's icon is
+        // 1× its base size, the most-referenced is 10×. Normalising
+        // on sqrt(refs) (rather than raw refs) spreads the scaling
+        // across the mid-popular files instead of letting a single
+        // mega-hub outlier flatten everyone else toward 1×. The
+        // final on-screen size is still clamped by the min(world,
+        // screen/zoom) formula below — popularity sets the cap, it
+        // doesn't bypass it.
         const popularity = filePopularity.get(sim.id) ?? 0;
-        const popFactor = 1 + Math.sqrt(popularity) / 8;
+        const popSpan =
+          Math.sqrt(maxPopularity) - Math.sqrt(minPopularity);
+        const popNorm =
+          popSpan > 0
+            ? (Math.sqrt(popularity) - Math.sqrt(minPopularity)) / popSpan
+            : 0;
+        const popFactor = 1 + 9 * popNorm;
 
         // The filename is ALWAYS drawn above the node (centered, counter-
         // scaled to constant size) — never inside it — so it can't overlap

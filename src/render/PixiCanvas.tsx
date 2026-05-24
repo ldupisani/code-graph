@@ -219,6 +219,12 @@ const KIND_OUTLINE: Record<string, number> = {
     // value, type, and binding positions all read as one visual idiom.
     ObjectBindingPattern: COLORS.astOutlineObject,
     Parameter: COLORS.astOutlineParam,
+    // Type definitions (interfaces, type aliases). They used to render
+    // as a dashed green circle with every member visible; now they're
+    // collapsed cells (see EXPANDABLE_KINDS) with this same green for
+    // continuity. Click to drill into members.
+    InterfaceDeclaration: COLORS.astOutlineAbstract,
+    TypeAliasDeclaration: COLORS.astOutlineAbstract,
 };
 
 // A node is "significant" — worth its own box, never collapsed as a
@@ -257,6 +263,16 @@ const EXPANDABLE_KINDS = new Set([
     // not expandable — they're rare and the bracket cell is small
     // enough to read inline.)
     "ObjectBindingPattern",
+    // Type definitions — `interface Props { ... }`, `type Props = { ... }`.
+    // Previously interfaces rendered as a prominent dashed circle
+    // with every member visible, which doubled up against the
+    // destructured-prop cell next to them. Now they're a labelled
+    // green cell (the interface / alias name) you drill into to
+    // see members — same affordance as the {} cells, applied to
+    // the things that DEFINE the props rather than just consume
+    // them.
+    "InterfaceDeclaration",
+    "TypeAliasDeclaration",
 ]);
 function isExpandableKind(kind: string): boolean {
     return EXPANDABLE_KINDS.has(kind);

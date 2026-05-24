@@ -907,6 +907,11 @@ export function PixiCanvas({project}: CanvasProps) {
             // the focus-mode dim path.
             let liveFiles: Set<string> | null = null;
             let liveFilesKey = "";
+            // The selectionSet REFERENCE that produced the cached
+            // liveFiles. The store returns a fresh Set on every
+            // mutation, so identity equality is enough — no need to
+            // hash the contents.
+            let liveFilesSelectionRef: ReadonlySet<string> | null = null;
             // Shared empty live set for the ambient (no-selection) case —
             // a single allocation so we don't make a new Set each frame.
             const AMBIENT_EMPTY_LIVE_SET: ReadonlySet<string> = new Set();
@@ -1121,10 +1126,26 @@ export function PixiCanvas({project}: CanvasProps) {
             // re-bound to a different gesture.)
             const computeLiveFiles = (): Set<string> | null => {
                 const st = useGraphStore.getState();
-                if (!st.focusId) return null;
-                const seedFile = st.focusId.includes("#") ? fileIdOfAstId(st.focusId) : st.focusId;
-                const visited = new Set<string>([seedFile]);
-                let frontier: string[] = [seedFile];
+                if (st.selectionSet.size === 0) return null;
+                // BFS seeds from EVERY selected file. With multi-select,
+                // each selection contributes its own hop-neighbourhood —
+                // shift-selecting two files means BOTH stay bright AND
+                // every file within `focusHops` edges of EITHER stays
+                // bright. AST node ids fold to their containing file.
+                //
+                // The hop semantics:
+                //   focusHops = 0: just the selected files themselves.
+                //   focusHops = 1: + files directly connected to any seed.
+                //   focusHops = 2: + their neighbours (children of the
+                //                  directly-connected ring).
+                //   focusHops = N: + N-step out from the seeds.
+                const seeds = new Set<string>();
+                for (const id of st.selectionSet) {
+                    const fileId = id.includes("#") ? fileIdOfAstId(id) : id;
+                    seeds.add(fileId);
+                }
+                const visited = new Set<string>(seeds);
+                let frontier: string[] = [...seeds];
                 // Direction picks WHICH side of the bidirectional adjacency
                 // to traverse: 'in' follows edges that POINT AT each node (so
                 // we walk toward the file's callers / importers — 'who calls
@@ -1157,8 +1178,14 @@ export function PixiCanvas({project}: CanvasProps) {
             };
             const maybeRecomputeLiveFiles = (): void => {
                 const st = useGraphStore.getState();
-                const key = `${st.focusId}|${st.focusHops}|${st.focusDirection}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}`;
-                if (key === liveFilesKey) return;
+                const key = `${st.focusHops}|${st.focusDirection}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}`;
+                if (
+                    st.selectionSet === liveFilesSelectionRef &&
+                    key === liveFilesKey
+                ) {
+                    return;
+                }
+                liveFilesSelectionRef = st.selectionSet;
                 liveFilesKey = key;
                 liveFiles = computeLiveFiles();
             };

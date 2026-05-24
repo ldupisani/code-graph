@@ -1109,43 +1109,10 @@ export function PixiCanvas({project}: CanvasProps) {
                 }
             };
 
-            // BFS shortest-path between two file IDs through the visible
-            // adjacency, returning the ordered list of file IDs (inclusive
-            // of source and target) or null if disconnected. Respects the
-            // current edgeFilter so toggling 'imports' off makes
-            // import-only paths disappear from results.
-            const shortestPath = (sourceFile: string, targetFile: string): string[] | null => {
-                if (sourceFile === targetFile) return [sourceFile];
-                const st = useGraphStore.getState();
-                const prev = new Map<string, string>();
-                const visited = new Set<string>([sourceFile]);
-                const queue: string[] = [sourceFile];
-                while (queue.length) {
-                    const node = queue.shift()!;
-                    if (node === targetFile) break;
-                    for (const kind of ["imports", "calls", "extends"] as const) {
-                        if (!st.edgeFilter[kind]) continue;
-                        const b = fileEdgesByKind[kind];
-                        for (const bucket of [b.in.get(node), b.out.get(node)]) {
-                            if (!bucket) continue;
-                            for (const n of bucket) {
-                                if (visited.has(n)) continue;
-                                visited.add(n);
-                                prev.set(n, node);
-                                queue.push(n);
-                            }
-                        }
-                    }
-                }
-                if (!visited.has(targetFile)) return null;
-                const path: string[] = [];
-                let cur: string | undefined = targetFile;
-                while (cur != null) {
-                    path.unshift(cur);
-                    cur = prev.get(cur);
-                }
-                return path;
-            };
+            // (Shift-click path-trace was removed when Shift was repurposed
+            // for additive multi-select. The shortestPath helper and the
+            // tracedPath rendering can come back if path tracing is
+            // re-bound to a different gesture.)
             const computeLiveFiles = (): Set<string> | null => {
                 const st = useGraphStore.getState();
                 if (!st.focusId) return null;
@@ -1379,7 +1346,11 @@ export function PixiCanvas({project}: CanvasProps) {
 
             function draw(): void {
                 const state = useGraphStore.getState();
-                const selection = state.selection;
+                // Outlines and edge emphasis read from selectionSet so all
+                // Shift-selected siblings highlight together. The primary
+                // (last-clicked) lives on as state.selection and is consumed
+                // by single-target UI elsewhere (editor pane, focus mode).
+                const selectionSet = state.selectionSet;
 
                 worldGfx.clear();
                 directoryGfx.clear();
@@ -1481,7 +1452,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 for (const sim of layout.nodes) {
                     if (hideSupport && supportFileIds.has(sim.id)) continue;
                     const dimmed = liveFiles != null && !liveFiles.has(sim.id) && !pathFileSet.has(sim.id);
-                    drawFile(sim, selection, dimmed ? 0.22 : 1);
+                    drawFile(sim, selectionSet, dimmed ? 0.22 : 1);
                 }
                 // 2c. Path overlay: thin yellow outline around every file
                 //     in the traced path.
@@ -1535,7 +1506,7 @@ export function PixiCanvas({project}: CanvasProps) {
                         pane.labels.beginFrame();
                         currentGfx = pane.gfx;
                         currentLabelPool = pane.labels;
-                        drawOverlay(blockId, cell, selection);
+                        drawOverlay(blockId, cell, selectionSet);
                         pane.labels.endFrame();
                         renderedOverlays.add(blockId);
                         paneCursor++;
@@ -1583,7 +1554,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     visibleById,
                     activeTree,
                     cameraScale,
-                    selection,
+                    selectionSet,
                     state.expandedFiles,
                     visibleSemanticPairs,
                     state.edgeFilter,
@@ -1597,7 +1568,7 @@ export function PixiCanvas({project}: CanvasProps) {
 
             function drawFile(
                 sim: SimFileNode,
-                selection: string | null,
+                selectionSet: ReadonlySet<string>,
                 // Alpha multiplier applied to every fill/stroke emitted by
                 // this function. Used by focus-mode dimming — non-live
                 // files draw at ~0.22, everything else at 1. Labels are NOT
@@ -1608,7 +1579,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 const x = sim.x - sim.width / 2;
                 const y = sim.y - sim.height / 2;
                 const expanded = useGraphStore.getState().expandedFiles.has(sim.id);
-                const isSelected = selection === sim.id;
+                const isSelected = selectionSet.has(sim.id);
                 // Hover reveals the file name even when the LOD gate would
                 // otherwise hide it — `hoveredHit` is set by the camera's
                 // hit-test pipeline; we just consult it here.
@@ -1768,11 +1739,11 @@ export function PixiCanvas({project}: CanvasProps) {
                         buildSubtreeLayout(sim.id);
                         tree = activeTree(sim.id);
                     }
-                    if (tree) drawSubtree(tree, x, y, sim.id, selection);
+                    if (tree) drawSubtree(tree, x, y, sim.id, selectionSet);
                 }
             }
 
-            function drawSubtree(tree: TreemapLayout, _baseX: number, _baseY: number, fileId: string, selection: string | null): void {
+            function drawSubtree(tree: TreemapLayout, _baseX: number, _baseY: number, fileId: string, selectionSet: ReadonlySet<string>): void {
                 // Top-level statements are positioned by the per-file fractal force
                 // layout, not the treemap's wrapped-row defaults. Each top-level
                 // subtree translates as a rigid body — descendants render unchanged
@@ -1797,7 +1768,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     // the (untransformed) drawAstNode recursion back onto the sim.
                     const dx = sn.x - tn.rect.w / 2 - tn.rect.x;
                     const dy = sn.y - tn.rect.h / 2 - tn.rect.y;
-                    drawAstNode(tn, offsetX + dx, offsetY + dy, fileId, tree, selection);
+                    drawAstNode(tn, offsetX + dx, offsetY + dy, fileId, tree, selectionSet);
                 }
             }
 
@@ -1808,12 +1779,12 @@ export function PixiCanvas({project}: CanvasProps) {
             // recursive drawAstNode call — treemap rects stay file-absolute
             // (so descendants of each member still translate correctly with
             // the member as a rigid body).
-            function drawAstContainer(node: TreemapNode, x: number, y: number, container: ContainerForceLayout, fileId: string, tree: TreemapLayout, selection: string | null): void {
+            function drawAstContainer(node: TreemapNode, x: number, y: number, container: ContainerForceLayout, fileId: string, tree: TreemapLayout, selectionSet: ReadonlySet<string>): void {
                 const cx = x + node.rect.w / 2;
                 const cy = y + node.rect.h / 2;
                 const radius = node.rect.w / 2;
 
-                const isSelected = selection === node.id;
+                const isSelected = selectionSet.has(node.id);
                 // Interface = always dashed green (TypeScript interfaces are
                 // abstract by nature, no `abstract` keyword needed). Abstract
                 // class = dashed; concrete class = solid. Same colour grammar
@@ -1899,7 +1870,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     // We want that top-left to equal (memberCx - k.rect.w/2, memberCy - k.rect.h/2).
                     const baseXk = memberCx - k.rect.w / 2 - k.rect.x;
                     const baseYk = memberCy - k.rect.h / 2 - k.rect.y;
-                    drawAstNode(k, baseXk, baseYk, fileId, tree, selection);
+                    drawAstNode(k, baseXk, baseYk, fileId, tree, selectionSet);
                 }
             }
 
@@ -1916,7 +1887,7 @@ export function PixiCanvas({project}: CanvasProps) {
             // calls land in the priority hit list. The collapse handle in
             // the top-left lives on this list too — re-clicking it (or
             // anywhere in the overlay's chrome) toggles the block off.
-            function drawOverlay(blockId: string, cell: {x: number; y: number; w: number; h: number}, selection: string | null): void {
+            function drawOverlay(blockId: string, cell: {x: number; y: number; w: number; h: number}, selectionSet: ReadonlySet<string>): void {
                 const overlayTree = getOverlayLayout(blockId);
                 if (!overlayTree) return;
                 const blockNode = overlayTree.byId.get(blockId);
@@ -1995,7 +1966,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     const kids = overlayTree.childrenByParent.get(blockId);
                     if (kids) {
                         for (const k of kids) {
-                            drawAstNode(k, x, y, fileId, overlayTree, selection);
+                            drawAstNode(k, x, y, fileId, overlayTree, selectionSet);
                         }
                     }
                 }
@@ -2032,7 +2003,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 }
             }
 
-            function drawAstNode(node: TreemapNode, baseX: number, baseY: number, fileId: string, tree: TreemapLayout, selection: string | null): void {
+            function drawAstNode(node: TreemapNode, baseX: number, baseY: number, fileId: string, tree: TreemapLayout, selectionSet: ReadonlySet<string>): void {
                 // Per-pass target shadowing — see drawAstContainer / drawOverlay
                 // for the rationale. Every `worldGfx.*` / `labelPool.put` below
                 // routes to the active layer (main during main pass, overlay
@@ -2061,7 +2032,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 const force = activeForce(fileId);
                 const container = force?.containers.get(node.id);
                 if (container) {
-                    drawAstContainer(node, x, y, container, fileId, tree, selection);
+                    drawAstContainer(node, x, y, container, fileId, tree, selectionSet);
                     return;
                 }
 
@@ -2073,7 +2044,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // clicking toggles it via handleClick.
                 if (node.collapsed) {
                     const stroke = KIND_OUTLINE[node.syntaxKind] ?? COLORS.astBorder;
-                    const isSelectedLeaf = selection === node.id;
+                    const isSelectedLeaf = selectionSet.has(node.id);
                     const isHovered = hoveredHit?.id === node.id;
                     worldGfx
                         .rect(x, y, node.rect.w, node.rect.h)
@@ -2141,7 +2112,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // labels — keep only real names.
                 const simplified = cameraScale < SIMPLIFY_BELOW;
 
-                const isSelected = selection === node.id;
+                const isSelected = selectionSet.has(node.id);
                 const tint = depthTint(node.depth);
                 const fillColor = tint; // selection is shown via the outline, not fill
                 // A call/new argument is a "parameter block for a call" — style it
@@ -2459,7 +2430,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 const kids = tree.childrenByParent.get(node.id);
                 if (!kids) return;
                 for (const k of kids) {
-                    drawAstNode(k, baseX, baseY, fileId, tree, selection);
+                    drawAstNode(k, baseX, baseY, fileId, tree, selectionSet);
                 }
                 // (Expanded-Block collapse handle now lives on the overlay,
                 // top-left — see drawOverlay above. Main-scene Block cells
@@ -2531,29 +2502,11 @@ export function PixiCanvas({project}: CanvasProps) {
             // fetch's async tail completes well after that pan has already
             // settled and released the camera — so by the time we land
             // here, no follow is in flight.
-            function fitFileInViewport(fileId: string): void {
-                const simNode = layout.byId.get(fileId);
-                if (!simNode) return;
-                const TARGET_OCCUPANCY = 0.75; // 75% of the viewport on the tighter axis
-                const fitW = (app.screen.width * TARGET_OCCUPANCY) / simNode.width;
-                const fitH = (app.screen.height * TARGET_OCCUPANCY) / simNode.height;
-                const fitScale = Math.min(fitW, fitH);
-                // Re-engage the follow so the camera centres on the file as
-                // it zooms. Reset followAt so it captures the file's CURRENT
-                // sim position (which may have shifted from its collapsed-time
-                // location when applyExpansion restarted the sim).
-                followId = fileId;
-                followAt = null;
-                followStartAt = 0;
-                // Only ever zoom OUT to fit. If the file already fits at the
-                // user's current zoom, leave their zoom alone — the follow
-                // re-engaged above is enough.
-                if (fitScale >= world.scale.x) return;
-                zoomFit = {
-                    targetScale: fitScale,
-                    pivot: {x: simNode.x, y: simNode.y},
-                };
-            }
+            // (fitFileInViewport was removed alongside the click-driven
+            // expansion path — clicks no longer expand or auto-fit a file.
+            // The zoomFit lerp mechanism below is dormant for now; we leave
+            // it in place so an "auto-fit selection on Cmd-K navigation" or
+            // similar can re-engage it later.)
 
             // Lerp world.scale toward zoomFit.targetScale, pivoting around
             // zoomFit.pivot (a fixed world point). Compensating world.x/y
@@ -2820,11 +2773,15 @@ export function PixiCanvas({project}: CanvasProps) {
             }
 
             const tickerCb = () => {
-                // updateZoomFit BEFORE stepLayout so rigidness() reads this
-                // frame's already-lerped scale. stepLayout BEFORE draw so
+                // updateZoomFit BEFORE syncExpansion so the latter sees the
+                // zoom we're heading to (a zoom-fit in progress shouldn't be
+                // ignored when deciding whether to expand). syncExpansion
+                // BEFORE stepLayout so any expand/collapse that bumped sim
+                // alpha takes effect this frame. stepLayout BEFORE draw so
                 // draw sees the interpolated positions. updateFollow AFTER
                 // draw so it can read visibleById.
                 updateZoomFit();
+                syncExpansion();
                 stepLayout();
                 draw();
                 updateFollow();
@@ -2981,24 +2938,6 @@ export function PixiCanvas({project}: CanvasProps) {
                     return;
                 }
 
-                // Shift-click + existing selection = trace shortest path from
-                // selection's file to the clicked target's file through the
-                // currently-visible edges. The path overlay is drawn on top
-                // of focus dimming, so the user can see exactly which files
-                // bridge their two endpoints.
-                const stShift = useGraphStore.getState();
-                if (shiftHeld && stShift.selection != null && stShift.selection !== target.id) {
-                    const sourceFile = stShift.selection.includes("#") ? fileIdOfAstId(stShift.selection) : stShift.selection;
-                    const targetFile = target.fileId;
-                    const path = shortestPath(sourceFile, targetFile);
-                    stShift.setTracedPath(path);
-                    // Skip the normal selection / follow / focus updates so the
-                    // shift-click doesn't drag the camera around mid-path-trace.
-                    return;
-                }
-                // Any non-shift click clears any active path trace; the user
-                // is moving on to a new question.
-                if (stShift.tracedPath) stShift.setTracedPath(null);
                 // Default: follow this node immediately. The Block-toggle path
                 // below overrides `followStartAt` so the pan waits until the
                 // grow/shrink animation completes — otherwise the camera
@@ -3014,17 +2953,20 @@ export function PixiCanvas({project}: CanvasProps) {
                     followStartAt = 0;
                     followAt = null;
                 }
-                if (target.kind === "file") {
-                    void onFileClick(target.fileId);
-                    return;
-                }
+
                 const state = useGraphStore.getState();
-                // Don't reset selection when the click was on a Block's
-                // top-right handle — the user is collapsing the block, not
-                // selecting it; preserving the existing selection means an
-                // accidental handle click doesn't jump the editor pane.
+                // Don't change selection when the click is on a Block's
+                // top-right collapse handle — preserve whatever was selected.
                 if (target.kind !== "ast-toggle") {
-                    state.setSelection(target.id);
+                    // Shift-click toggles the target in the multi-select
+                    // set (additive). Plain click replaces the set with
+                    // just this target. File expansion is no longer a
+                    // click action — it's zoom-driven (see syncExpansion).
+                    if (shiftHeld) {
+                        state.toggleSelection(target.id);
+                    } else {
+                        state.setSelection(target.id);
+                    }
                     // Focus mode follows selection: clicking a thing makes
                     // its file's neighbourhood the "live set" and dims the
                     // rest. Hops are preserved across clicks so the user can
@@ -3082,25 +3024,44 @@ export function PixiCanvas({project}: CanvasProps) {
                 }
             }
 
-            async function onFileClick(fileId: string): Promise<void> {
-                const state = useGraphStore.getState();
-                // Selection updates synchronously so the editor pane starts loading
-                // this file's source immediately. The AST/expansion work below can
-                // run in the background — it doesn't block the editor.
-                state.setSelection(fileId);
-                // Focus mode tracks the click target — same pattern as
-                // handleClick above so a file-area click and a node click
-                // both pull the rest of the scene into focus around what
-                // the user just chose.
-                state.setFocus(fileId);
+            // --- Selection-driven, zoom-driven file expansion ----------------
+            //
+            // The user's mental model: clicking a file SELECTS it; the file
+            // expands when you zoom in past the connectivity transition (and
+            // collapses again when you zoom back out). No click action toggles
+            // expansion. syncExpansion runs each frame from the ticker and
+            // diffs the desired expansion set against the store.
+            //
+            // Multipliers on fitScale — selected files expand at fitScale ×
+            // FILE_EXPAND_AT_MUL and collapse at fitScale × FILE_COLLAPSE_BELOW_MUL.
+            // The band between them is the hysteresis zone: a file that's
+            // already expanded only collapses when zoom drops past the LOWER
+            // bound, and vice versa. Stops the file flickering open/closed when
+            // the user pauses near the threshold.
+            const FILE_EXPAND_AT_MUL = 6;
+            const FILE_COLLAPSE_BELOW_MUL = 5;
+            // Per-frame state of the expansion regime, holding through the
+            // hysteresis band.
+            let expansionRegimeOn = false;
 
-                if (state.expandedFiles.has(fileId)) {
-                    state.collapseFile(fileId);
-                    dropSubtreeLayout(fileId);
-                    applyExpansionToSim();
-                    return;
-                }
-                if (!state.asts.has(fileId) && !fetching.has(fileId)) {
+            function selectionExpansionEnabled(): boolean {
+                const ratio = cameraScale / Math.max(fitScale, 1e-4);
+                if (ratio >= FILE_EXPAND_AT_MUL) expansionRegimeOn = true;
+                else if (ratio < FILE_COLLAPSE_BELOW_MUL) expansionRegimeOn = false;
+                return expansionRegimeOn;
+            }
+
+            // Expand a single file: fetch its AST if we don't have it, then
+            // expand in the store and rebuild its subtree layout.
+            //
+            // syncExpansion re-fires this every frame until the store reflects
+            // the expansion; the in-flight guard at the top prevents a second
+            // call from racing past the (still-pending) fetch and trying to
+            // build a subtree layout before the AST has arrived.
+            async function expandFileForSelection(fileId: string): Promise<void> {
+                if (fetching.has(fileId)) return;
+                const state = useGraphStore.getState();
+                if (!state.asts.has(fileId)) {
                     fetching.add(fileId);
                     try {
                         const ast = await getFileAst(project.projectId, fileId);
@@ -3112,14 +3073,58 @@ export function PixiCanvas({project}: CanvasProps) {
                     }
                     fetching.delete(fileId);
                 }
-                useGraphStore.getState().expandFile(fileId);
+                const cur = useGraphStore.getState();
+                if (cur.expandedFiles.has(fileId)) return;
+                cur.expandFile(fileId);
                 applyExpansionToSim();
                 buildSubtreeLayout(fileId);
-                // After expansion the file's sim footprint is its real size
-                // (applyExpansion writes sim.width/height from expandedSizeFor).
-                // If that footprint exceeds the viewport at the current zoom,
-                // ease the camera out so it fits.
-                fitFileInViewport(fileId);
+            }
+
+            // Reconcile expandedFiles with (selectionSet × zoom). Called each
+            // frame from the ticker; cheap when nothing changed (set compare
+            // + an early-return).
+            function syncExpansion(): void {
+                const state = useGraphStore.getState();
+                const enabled = selectionExpansionEnabled();
+                const want = new Set<string>();
+                if (enabled) {
+                    for (const id of state.selectionSet) {
+                        const fileId = id.includes("#") ? fileIdOfAstId(id) : id;
+                        // Only file ids that exist in the layout (skip stale
+                        // ids from a previous project).
+                        if (layout.byId.has(fileId)) want.add(fileId);
+                    }
+                }
+                const current = state.expandedFiles;
+                // Cheap shortcut: same membership → no diff to apply.
+                if (want.size === current.size) {
+                    let same = true;
+                    for (const id of want) {
+                        if (!current.has(id)) {
+                            same = false;
+                            break;
+                        }
+                    }
+                    if (same) return;
+                }
+                // Collapse first (frees layout space the new expansions may
+                // want), then expand. applyExpansionToSim once at the end
+                // covers both sides.
+                let touched = false;
+                for (const id of current) {
+                    if (!want.has(id)) {
+                        useGraphStore.getState().collapseFile(id);
+                        dropSubtreeLayout(id);
+                        touched = true;
+                    }
+                }
+                for (const id of want) {
+                    if (!current.has(id)) {
+                        void expandFileForSelection(id);
+                        touched = true;
+                    }
+                }
+                if (touched) applyExpansionToSim();
             }
 
             cleanup = () => {
@@ -3491,7 +3496,7 @@ function drawSemanticEdges(
     visibleById: Map<string, HitRect>,
     treeLookup: (fileId: string) => TreemapLayout | undefined,
     cameraScale: number,
-    selection: string | null,
+    selectionSet: ReadonlySet<string>,
     expandedFiles: ReadonlySet<string>,
     // Rebuilt here each frame: directional `${fromFile} ${toFile}` keys for
     // every edge actually drawn, so drawEdges can suppress redundant imports.
@@ -3586,8 +3591,8 @@ function drawSemanticEdges(
         // shown at full strength. Match the raw endpoints and the resolved
         // visible anchors (the callee may have lifted to an ancestor/file you'd
         // actually click).
-        const callerSelected = selection !== null && (selection === edge.fromId || selection === from.id);
-        const calleeSelected = selection !== null && (selection === edge.toId || selection === to.id);
+        const callerSelected = selectionSet.has(edge.fromId) || selectionSet.has(from.id);
+        const calleeSelected = selectionSet.has(edge.toId) || selectionSet.has(to.id);
         // "Caller or callee selected" — drives the 50%↔full dim and the callee
         // outline.
         const callSelected = callerSelected || calleeSelected;
@@ -3624,7 +3629,7 @@ function drawSemanticEdges(
             // when that node itself is selected.
             const h = edge.fromId.lastIndexOf("#");
             const srcFile = h > 0 ? edge.fromId.slice(0, h) : edge.fromId;
-            const srcSelected = selection === edge.fromId || selection === from.id;
+            const srcSelected = selectionSet.has(edge.fromId) || selectionSet.has(from.id);
             dashed = !srcSelected;
             edgeAlpha = srcSelected || expandedFiles.has(srcFile) ? 1 : 0.5;
         }

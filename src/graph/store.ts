@@ -13,7 +13,15 @@ export interface EdgeFilter {
 
 export interface GraphStore {
   project: ProjectResponse | null;
-  selection: string | null; // node id (file or AST node)
+  // PRIMARY selection — the last-clicked id (file or AST node).
+  // Drives single-target UI (source pane, focus mode, camera follow).
+  selection: string | null;
+  // Every currently-selected id. Always includes `selection` when
+  // non-null. Plain click resets to {id}; Shift-click toggles a
+  // single id. Drives the selection outline on every selected node;
+  // `selection` is just "the last one." Selection-driven file
+  // expansion (see PixiCanvas's syncExpansion) reads this set.
+  selectionSet: ReadonlySet<string>;
   expandedFiles: ReadonlySet<string>;
   // AST node IDs the user has manually expanded. Today these are Block
   // nodes (the magenta sequential-code cells): a Block defaults to a
@@ -68,6 +76,10 @@ export interface GraphStore {
   setProject: (p: ProjectResponse | null) => void;
   refreshProject: (p: ProjectResponse) => void;
   setSelection: (id: string | null) => void;
+  // Multi-select: toggle a single id in selectionSet. If id is
+  // already selected → remove it (primary clears when it was the
+  // removed one). Otherwise → add it and make it the new primary.
+  toggleSelection: (id: string) => void;
   setFileAst: (fileId: string, ast: FileAstResponse) => void;
   expandFile: (fileId: string) => void;
   collapseFile: (fileId: string) => void;
@@ -88,6 +100,7 @@ const ALL_EDGES_ON: EdgeFilter = { imports: true, calls: true, extends: true };
 export const useGraphStore = create<GraphStore>((set) => ({
   project: null,
   selection: null,
+  selectionSet: new Set<string>(),
   expandedFiles: new Set<string>(),
   expandedAstNodes: new Set<string>(),
   asts: new Map<string, FileAstResponse>(),
@@ -103,6 +116,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
     set((s) => ({
       project,
       selection: null,
+      selectionSet: new Set(),
       expandedFiles: new Set(),
       expandedAstNodes: new Set(),
       asts: new Map(),
@@ -125,11 +139,33 @@ export const useGraphStore = create<GraphStore>((set) => ({
     set((s) => ({
       project,
       selection: null,
+      selectionSet: new Set(),
       asts: new Map(),
       expandedFiles: filterToKnownFiles(s.expandedFiles, project),
       expandedAstNodes: new Set(),
     })),
-  setSelection: (selection) => set({ selection }),
+  // Plain click: selection becomes JUST this id (or empty when null).
+  setSelection: (selection) =>
+    set({
+      selection,
+      selectionSet: selection ? new Set([selection]) : new Set(),
+    }),
+  toggleSelection: (id) =>
+    set((s) => {
+      const next = new Set(s.selectionSet);
+      if (next.has(id)) {
+        next.delete(id);
+        // If the removed id was the primary, primary clears — the
+        // remaining selected ids don't get auto-promoted (the user's
+        // pointer of attention was the one they removed).
+        return {
+          selectionSet: next,
+          selection: s.selection === id ? null : s.selection,
+        };
+      }
+      next.add(id);
+      return { selectionSet: next, selection: id };
+    }),
   setFileAst: (fileId, ast) =>
     set((s) => {
       const next = new Map(s.asts);

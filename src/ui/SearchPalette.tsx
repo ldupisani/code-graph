@@ -119,21 +119,13 @@ export function SearchPalette({ open, onClose }: { open: boolean; onClose: () =>
 
   function selectResult(e: SearchEntry): void {
     const state = useGraphStore.getState();
-    if (e.kind === 'file') {
-      // Mirror onFileClick's behaviour: select + expand + focus.
-      // PixiCanvas's useEffect on `expandedFiles` + camera follow
-      // will fly there automatically.
-      state.setSelection(e.id);
-      state.expandFile(e.id);
-      state.setFocus(e.id);
-    } else {
-      // For an AST node: select it; expand its containing file if
-      // it isn't already; focus the file's neighbourhood.
-      const fileId = e.id.includes('#') ? e.id.slice(0, e.id.lastIndexOf('#')) : e.id;
-      state.setSelection(e.id);
-      if (!state.expandedFiles.has(fileId)) state.expandFile(fileId);
-      state.setFocus(e.id);
-    }
+    // File expansion is now zoom-driven (see PixiCanvas's
+    // syncExpansion): a selected file expands when the user zooms
+    // past the connectivity transition. The palette no longer
+    // toggles expandFile itself — it would just get undone on the
+    // next frame at the current zoom. The user zooms in to reveal.
+    state.setSelection(e.id);
+    state.setFocus(e.id);
     onClose();
   }
 

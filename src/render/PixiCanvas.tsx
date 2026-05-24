@@ -901,9 +901,15 @@ export function PixiCanvas({project}: CanvasProps) {
 
             // Cached live set + the inputs that produced it; recomputed in
             // the ticker when any of them change. liveFiles === null means
-            // "no focus mode active, render everything at full brightness".
+            // "no focus mode active". draw() promotes this to a non-null
+            // empty set when nothing is selected — see AMBIENT_EMPTY_LIVE_SET
+            // — so the ambient/default state fades everything by reusing
+            // the focus-mode dim path.
             let liveFiles: Set<string> | null = null;
             let liveFilesKey = "";
+            // Shared empty live set for the ambient (no-selection) case —
+            // a single allocation so we don't make a new Set each frame.
+            const AMBIENT_EMPTY_LIVE_SET: ReadonlySet<string> = new Set();
 
             // Directory-boundary rendering. Each frame, for every directory
             // with ≥2 files, compute the convex hull of its members' current
@@ -1370,6 +1376,19 @@ export function PixiCanvas({project}: CanvasProps) {
                 // and by drawEdges + drawSemanticEdges via per-edge alpha.
                 maybeRecomputeLiveFiles();
 
+                // Ambient / "nothing selected" state: with no selection
+                // there's no focal point, so the default is to fade
+                // EVERYTHING. We piggyback on the focus-mode dimming
+                // machinery — supplying an empty live set means no node is
+                // "in focus", so every file + edge passes through the same
+                // dim path that non-neighbours already use under focus mode.
+                // Selecting a file repopulates the live set and that file
+                // (and its neighbourhood) pops back out.
+                const ambient = state.selectionSet.size === 0;
+                const effectiveLiveFiles: ReadonlySet<string> | null = ambient
+                    ? AMBIENT_EMPTY_LIVE_SET
+                    : liveFiles;
+
                 // Active cluster grouping for this frame — drives hulls,
                 // intra-cluster edge gate, AND file-icon coloring so they
                 // all read consistently. At low zoom this is coarse
@@ -1419,7 +1438,7 @@ export function PixiCanvas({project}: CanvasProps) {
                         worldGfx,
                         cameraScale,
                         visibleSemanticPairs,
-                        liveFiles,
+                        effectiveLiveFiles,
                         pathEdgeKeys,
                         hideSupportForEdges ? supportFileIds : null,
                         // Use the ACTIVE cluster grouping (zoom-adaptive depth)
@@ -1451,7 +1470,10 @@ export function PixiCanvas({project}: CanvasProps) {
                 // multiplier, so file + directory names stay readable.
                 for (const sim of layout.nodes) {
                     if (hideSupport && supportFileIds.has(sim.id)) continue;
-                    const dimmed = liveFiles != null && !liveFiles.has(sim.id) && !pathFileSet.has(sim.id);
+                    const dimmed =
+                        effectiveLiveFiles != null &&
+                        !effectiveLiveFiles.has(sim.id) &&
+                        !pathFileSet.has(sim.id);
                     drawFile(sim, selectionSet, dimmed ? 0.22 : 1);
                 }
                 // 2c. Path overlay: thin yellow outline around every file
@@ -1558,7 +1580,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     state.expandedFiles,
                     visibleSemanticPairs,
                     state.edgeFilter,
-                    liveFiles,
+                    effectiveLiveFiles,
                     pathEdgeKeys,
                     hideSupportForEdges ? supportFileIds : null,
                     // Same active-cluster grouping as drawEdges (above).

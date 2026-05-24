@@ -781,7 +781,31 @@ function rawFriendlyName(node: Node, inlined: Set<Node>): string | null {
   // ts-morph uses structural typing for "named" nodes — many declarations
   // expose a getName() method but it's not part of the base Node API. We
   // duck-type and fall back gracefully.
-  const candidate = node as unknown as { getName?: () => string | undefined };
+  const candidate = node as unknown as {
+    getName?: () => string | undefined;
+    getNameNode?: () => Node | undefined;
+  };
+  // If the node's own name slot is a binding pattern (`{ a, b }` or `[a, b]`),
+  // ts-morph's getName() returns the pattern's full source text — but we also
+  // emit that pattern as a separate child rect (see isParentsNameSlot above),
+  // so using the pattern as this node's label too would render every binding
+  // twice: once flattened into a wide Parameter label, once inside the small
+  // expandable `{}` cell. Suppress the label here; the child pattern carries
+  // the visible representation.
+  if (typeof candidate.getNameNode === 'function') {
+    try {
+      const nameNode = candidate.getNameNode();
+      if (
+        nameNode &&
+        (nameNode.getKind() === ts.SyntaxKind.ObjectBindingPattern ||
+          nameNode.getKind() === ts.SyntaxKind.ArrayBindingPattern)
+      ) {
+        return null;
+      }
+    } catch {
+      // Some node types throw if no name node is present — fall through.
+    }
+  }
   if (typeof candidate.getName === 'function') {
     try {
       const n = candidate.getName();

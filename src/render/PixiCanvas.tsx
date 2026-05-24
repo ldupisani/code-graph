@@ -33,10 +33,13 @@ const COLORS = {
     // Directional colours for import links that TOUCH a selected file.
     // Reads as: 'this file imports those' = yellow (outgoing from
     // selection), 'this file is imported by those' = blue (incoming
-    // into selection). When the edge doesn't touch any selected file,
-    // the renderer falls back to the plain `edge` grey.
+    // into selection). An edge whose BOTH endpoints are selected is
+    // green — the relationship is meaningful in both directions and
+    // shouldn't have to pick a side. Edges that don't touch any
+    // selected file fall back to the plain `edge` grey.
     edgeImporting: 0xe8c84a, // yellow — outgoing import from a selected file
     edgeImported: 0x6cb6ff, // light blue — incoming import to a selected file
+    edgeBidirectional: 0x6acf6a, // green — both endpoints selected
 } as const;
 
 const SEMANTIC_EDGE_STYLE: Record<SemanticEdgeKind, {color: number; width: number; alpha: number; arrowSize: number}> = {
@@ -3374,16 +3377,19 @@ function drawEdges(
         // Directional colour. If the IMPORTING file (edge.fromId) is
         // selected the line goes OUT from it → yellow. If the
         // IMPORTED file (edge.toId) is selected the line points IN to
-        // it → blue. Edges between two selected files prefer the
-        // outgoing colour (yellow) — the importer's perspective.
+        // it → blue. If BOTH endpoints are selected the relationship
+        // is bidirectional from the user's perspective → green.
         // Edges that don't touch any selection keep the default grey.
         const fromSel = selectionSet.has(edge.fromId);
         const toSel = selectionSet.has(edge.toId);
-        const edgeColor = fromSel
-            ? COLORS.edgeImporting
-            : toSel
-              ? COLORS.edgeImported
-              : COLORS.edge;
+        const edgeColor =
+            fromSel && toSel
+                ? COLORS.edgeBidirectional
+                : fromSel
+                  ? COLORS.edgeImporting
+                  : toSel
+                    ? COLORS.edgeImported
+                    : COLORS.edge;
         gfx.moveTo(sx, sy)
             .lineTo(tx, ty)
             .stroke({

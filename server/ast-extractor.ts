@@ -134,31 +134,66 @@ function synthesizeCallLabel(node: Node, inlined: Set<Node>): string | null {
   if (!callee) return null;
   const prefix = kind === ts.SyntaxKind.NewExpression ? 'new ' : '▷ ';
 
-  // Bare identifier callee: inline the single Identifier child.
-  if (callee.getKind() === ts.SyntaxKind.Identifier) {
-    inlined.add(callee);
-    return prefix + callee.getText();
-  }
+  // Build the call's HEAD (callee text only). Type arguments append below.
+  let head: string | null = null;
 
-  // Member-access chain callee: walk it, then inline every captured node so
-  // none of them re-emit as their own rect. Inlining the immediate callee
-  // child alone would suffice (forEachChild won't recurse past a skipped
-  // node), but tracking all of them is cheap and defensive against future
-  // traversal changes.
-  const ck = callee.getKind();
-  if (
-    ck === ts.SyntaxKind.PropertyAccessExpression ||
-    ck === ts.SyntaxKind.ElementAccessExpression
-  ) {
-    const segments: ChainSegment[] = [];
-    const captured: Node[] = [];
-    if (collectAccessChain(callee, segments, captured)) {
-      for (const n of captured) inlined.add(n);
-      return prefix + formatChain(segments);
+  if (callee.getKind() === ts.SyntaxKind.Identifier) {
+    // Bare identifier callee: inline the single Identifier child.
+    inlined.add(callee);
+    head = callee.getText();
+  } else {
+    // Member-access chain callee: walk it, then inline every captured node so
+    // none of them re-emit as their own rect. Inlining the immediate callee
+    // child alone would suffice (forEachChild won't recurse past a skipped
+    // node), but tracking all of them is cheap and defensive against future
+    // traversal changes.
+    const ck = callee.getKind();
+    if (
+      ck === ts.SyntaxKind.PropertyAccessExpression ||
+      ck === ts.SyntaxKind.ElementAccessExpression
+    ) {
+      const segments: ChainSegment[] = [];
+      const captured: Node[] = [];
+      if (collectAccessChain(callee, segments, captured)) {
+        for (const n of captured) inlined.add(n);
+        head = formatChain(segments);
+      }
+    }
+  }
+  if (head === null) return null;
+
+  // Type arguments fold into the head: `forwardRef<HTMLInputElement,
+  // Props>` reads as one label instead of three separate rects (the
+  // callee + two wide type-arg boxes). We inline the type-arg subtrees
+  // so they don't emit. The bail-out mirrors synthesizeFlatTypeLabel:
+  // if any type arg contains an inline TypeLiteral (`<{a: string}>`),
+  // we'd lose the ability to drill into it — keep those as separate
+  // rects.
+  const argsHost = node as unknown as { getTypeArguments?: () => Node[] };
+  if (typeof argsHost.getTypeArguments === 'function') {
+    const typeArgs = argsHost.getTypeArguments();
+    if (typeArgs.length > 0) {
+      let canInline = true;
+      for (const t of typeArgs) {
+        for (const d of t.getDescendants()) {
+          if (d.getKind() === ts.SyntaxKind.TypeLiteral) {
+            canInline = false;
+            break;
+          }
+        }
+        if (!canInline) break;
+      }
+      if (canInline) {
+        head += `<${typeArgs.map((t) => t.getText()).join(', ')}>`;
+        for (const t of typeArgs) {
+          inlined.add(t);
+          for (const d of t.getDescendants()) inlined.add(d);
+        }
+      }
     }
   }
 
-  return null;
+  return prefix + head;
 }
 
 // True when the node is an import binding for a type — covers three

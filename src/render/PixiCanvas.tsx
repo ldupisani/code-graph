@@ -155,6 +155,13 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
     // out (because it contains an inline TypeLiteral). Plain
     // `Pulse[]` keeps its flattened text label.
     ArrayType: "[]",
+    // Destructured parameter / variable patterns — `({ a, b }: T)`,
+    // `const [x, y] = …`. The object form is the typical React props
+    // pattern; both render as a brace/bracket cell that drills into
+    // its bindings the same way ObjectLiteralExpression / TypeLiteral
+    // do (object form is expandable; array form just gets a label).
+    ObjectBindingPattern: "{}",
+    ArrayBindingPattern: "[]",
     ImportDeclaration: "import",
     ExportDeclaration: "export",
     ImportClause: "imports",
@@ -206,6 +213,11 @@ const KIND_OUTLINE: Record<string, number> = {
     // Same outline as ObjectLiteralExpression — TypeLiteral reads as
     // an "object shape" too, just in type position.
     TypeLiteral: COLORS.astOutlineObject,
+    // Destructured parameter pattern (`({ id, size }: Props)`) — the
+    // React component prop-definition shape. Same yellow as
+    // ObjectLiteralExpression / TypeLiteral so the brace cells across
+    // value, type, and binding positions all read as one visual idiom.
+    ObjectBindingPattern: COLORS.astOutlineObject,
     Parameter: COLORS.astOutlineParam,
 };
 
@@ -234,7 +246,18 @@ function isSignificant(node: {name: string | null; syntaxKind: string}): boolean
 // (`ObjectLiteralExpression`). Sharing the predicate keeps the
 // main layout, overlay layout, click handler and hover affordances
 // in sync.
-const EXPANDABLE_KINDS = new Set(["Block", "ObjectLiteralExpression", "TypeLiteral"]);
+const EXPANDABLE_KINDS = new Set([
+    "Block",
+    "ObjectLiteralExpression",
+    "TypeLiteral",
+    // React component prop definitions: a destructured object
+    // parameter pattern. Drills the same way Block / Object literal
+    // do — collapsed brace cell, click to spawn an overlay of the
+    // bindings inside. (Array binding patterns are labelled but
+    // not expandable — they're rare and the bracket cell is small
+    // enough to read inline.)
+    "ObjectBindingPattern",
+]);
 function isExpandableKind(kind: string): boolean {
     return EXPANDABLE_KINDS.has(kind);
 }

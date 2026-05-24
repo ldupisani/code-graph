@@ -450,6 +450,21 @@ function isParentsNameSlot(node: Node): boolean {
   // `Dog` in `import Dog from './x'` would vanish entirely (the ImportClause
   // declaring the name is gone, and so would be its name Identifier).
   if (PASSTHROUGH_KINDS.has(parent.getKind())) return false;
+  // Binding patterns ({ a, b } or [a, b]) are STRUCTURED names, not
+  // plain identifiers. ts-morph's getName() helpfully returns the
+  // pattern's source text on the parent (Parameter / VariableDeclaration),
+  // which would normally tell us to absorb the pattern into the parent's
+  // label and drop it. But a React component's props parameter IS the
+  // pattern — the user wants to drill into it like a code block. Keep
+  // the pattern as its own emitted rect; the client treats it as an
+  // expandable cell (see EXPANDABLE_KINDS in PixiCanvas.tsx).
+  const k = node.getKind();
+  if (
+    k === ts.SyntaxKind.ObjectBindingPattern ||
+    k === ts.SyntaxKind.ArrayBindingPattern
+  ) {
+    return false;
+  }
   const candidate = parent as unknown as {
     getNameNode?: () => Node | undefined;
     getName?: () => string | undefined;

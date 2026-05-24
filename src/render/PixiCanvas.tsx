@@ -30,6 +30,13 @@ const COLORS = {
     text: 0xeeeeee,
     textDim: 0xb0b0b8,
     edge: 0x565a63, // import links: subdued but always visible
+    // Directional colours for import links that TOUCH a selected file.
+    // Reads as: 'this file imports those' = yellow (outgoing from
+    // selection), 'this file is imported by those' = blue (incoming
+    // into selection). When the edge doesn't touch any selected file,
+    // the renderer falls back to the plain `edge` grey.
+    edgeImporting: 0xe8c84a, // yellow — outgoing import from a selected file
+    edgeImported: 0x6cb6ff, // light blue — incoming import to a selected file
 } as const;
 
 const SEMANTIC_EDGE_STYLE: Record<SemanticEdgeKind, {color: number; width: number; alpha: number; arrowSize: number}> = {
@@ -1146,20 +1153,24 @@ export function PixiCanvas({project}: CanvasProps) {
                 }
                 const visited = new Set<string>(seeds);
                 let frontier: string[] = [...seeds];
-                // Direction picks WHICH side of the bidirectional adjacency
-                // to traverse: 'in' follows edges that POINT AT each node (so
-                // we walk toward the file's callers / importers — 'who calls
-                // this'); 'out' follows OUTGOING edges; 'both' traverses both.
-                const dir = st.focusDirection;
+                // The hop BFS is always bi-directional — both incoming
+                // edges (this file's importers / callers) and outgoing
+                // edges (what this file imports / calls) extend the
+                // neighbourhood. Direction is conveyed at the EDGE level
+                // via colour now (yellow = outgoing from selection, blue
+                // = incoming), so the BFS doesn't need a directional
+                // toggle. focusDirection in the store is no longer
+                // consulted; the field is kept for any future re-binding.
                 for (let hop = 0; hop < st.focusHops; hop++) {
                     const next: string[] = [];
                     for (const node of frontier) {
                         for (const kind of ["imports", "calls", "extends"] as const) {
                             if (!st.edgeFilter[kind]) continue;
                             const b = fileEdgesByKind[kind];
-                            const buckets: (Set<string> | undefined)[] = [];
-                            if (dir === "both" || dir === "in") buckets.push(b.in.get(node));
-                            if (dir === "both" || dir === "out") buckets.push(b.out.get(node));
+                            const buckets: (Set<string> | undefined)[] = [
+                                b.in.get(node),
+                                b.out.get(node),
+                            ];
                             for (const set of buckets) {
                                 if (!set) continue;
                                 for (const n of set) {
@@ -1178,7 +1189,7 @@ export function PixiCanvas({project}: CanvasProps) {
             };
             const maybeRecomputeLiveFiles = (): void => {
                 const st = useGraphStore.getState();
-                const key = `${st.focusHops}|${st.focusDirection}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}`;
+                const key = `${st.focusHops}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}`;
                 if (
                     st.selectionSet === liveFilesSelectionRef &&
                     key === liveFilesKey
@@ -1465,6 +1476,7 @@ export function PixiCanvas({project}: CanvasProps) {
                         worldGfx,
                         cameraScale,
                         visibleSemanticPairs,
+                        selectionSet,
                         effectiveLiveFiles,
                         pathEdgeKeys,
                         hideSupportForEdges ? supportFileIds : null,
@@ -3267,6 +3279,12 @@ function drawEdges(
     gfx: Graphics,
     cameraScale: number,
     visibleSemanticPairs: ReadonlySet<string>,
+    // Currently-selected ids. Drives directional COLOUR of an
+    // import line that touches a selected file: yellow when the
+    // selected file is the importer (line goes FROM it), blue when
+    // the selected file is the imported (line points TO it). Edges
+    // not touching the selection stay COLORS.edge (grey).
+    selectionSet: ReadonlySet<string>,
     // Focus-mode live set: import edges with at least one endpoint
     // outside it dim down to ~18% so they recede into the background.
     // null = focus off, render all edges at full strength.
@@ -3353,10 +3371,23 @@ function drawEdges(
         if (!onPath) {
             edgeAlpha *= edgeLengthAlphaMultiplier(sx, sy, tx, ty, cameraScale);
         }
+        // Directional colour. If the IMPORTING file (edge.fromId) is
+        // selected the line goes OUT from it → yellow. If the
+        // IMPORTED file (edge.toId) is selected the line points IN to
+        // it → blue. Edges between two selected files prefer the
+        // outgoing colour (yellow) — the importer's perspective.
+        // Edges that don't touch any selection keep the default grey.
+        const fromSel = selectionSet.has(edge.fromId);
+        const toSel = selectionSet.has(edge.toId);
+        const edgeColor = fromSel
+            ? COLORS.edgeImporting
+            : toSel
+              ? COLORS.edgeImported
+              : COLORS.edge;
         gfx.moveTo(sx, sy)
             .lineTo(tx, ty)
             .stroke({
-                color: COLORS.edge,
+                color: edgeColor,
                 width: 1.5 / cameraScale, // ~1.5px on screen, zoom-stable
                 alpha: edgeAlpha,
             });

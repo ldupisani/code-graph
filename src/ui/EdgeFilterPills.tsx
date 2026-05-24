@@ -82,10 +82,8 @@ export function EdgeFilterPills() {
           <span>
             focus {focusHops} hop{focusHops === 1 ? '' : 's'}
           </span>
-          <DirectionGlyph />
           <span>
-            <Kbd>+</Kbd>/<Kbd>-</Kbd> · <Kbd>R</Kbd> · <Kbd>⇧</Kbd>+click
-            path · <Kbd>Esc</Kbd>
+            <Kbd>+</Kbd>/<Kbd>-</Kbd> · <Kbd>⇧</Kbd>+click multi · <Kbd>Esc</Kbd>
           </span>
         </span>
       )}
@@ -102,27 +100,6 @@ export function EdgeFilterPills() {
         </span>
       )}
     </div>
-  );
-}
-
-function DirectionGlyph() {
-  const dir = useGraphStore((s) => s.focusDirection);
-  if (dir === 'both') return null;
-  // 'in' = arrow pointing AT the focused node (so '→ X').
-  // 'out' = arrow leaving the focused node ('X →').
-  const text = dir === 'in' ? '← in' : 'out →';
-  return (
-    <span
-      style={{
-        padding: '0.05rem 0.4rem',
-        borderRadius: 3,
-        background: 'rgba(60, 60, 70, 0.6)',
-        color: '#dcdcaa',
-        fontSize: '0.7rem',
-      }}
-    >
-      {text}
-    </span>
   );
 }
 

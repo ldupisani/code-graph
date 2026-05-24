@@ -3063,10 +3063,16 @@ export function PixiCanvas({project}: CanvasProps) {
                 if (target.kind !== "ast-toggle") {
                     // Shift-click toggles the target in the multi-select
                     // set (additive). Plain click replaces the set with
-                    // just this target. File expansion is no longer a
-                    // click action — it's zoom-driven (see syncExpansion).
+                    // just this target, EXCEPT when the target is an AST
+                    // node — those drill into the currently-selected
+                    // file(s), so a shift-selected file group should
+                    // survive the click rather than collapse to a single
+                    // block. File expansion is no longer a click action
+                    // — it's zoom-driven (see syncExpansion).
                     if (shiftHeld) {
                         state.toggleSelection(target.id);
+                    } else if (target.kind === "ast") {
+                        state.selectAstNode(target.id);
                     } else {
                         state.setSelection(target.id);
                     }

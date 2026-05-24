@@ -323,6 +323,47 @@ function synthesizeFlatTypeLabel(node: Node, inlined: Set<Node>): string | null 
   return node.getText();
 }
 
+// Synthesised label for JSX opening / closing / self-closing elements
+// and fragments. Surfaces the angle brackets so the diagram reads as
+// JSX source:
+//   * `<Foo>`     for the opening tag of a non-self-closing element
+//   * `</Foo>`    for the closing tag
+//   * `<Foo />`   for a self-closing element
+//   * `<>` / `</>`for fragment open / close
+// Without this, ts-morph's getName() would return just `Foo` for all
+// three element forms, so a JsxElement like `<Foo>...</Foo>` rendered
+// as two indistinguishable rects both labelled `Foo` — losing the
+// open/close distinction the user reads at a glance in source.
+//
+// The tag name node (Identifier, or PropertyAccessExpression for
+// `<Foo.Bar>`) is inlined so it doesn't surface as its own child rect
+// inside the opening/closing element's box. Attributes stay as kids:
+// they're separate JsxAttribute children of JsxOpeningElement /
+// JsxSelfClosingElement and aren't part of the tag-name subtree.
+function synthesizeJsxLabel(node: Node, inlined: Set<Node>): string | null {
+  const kind = node.getKind();
+  if (kind === ts.SyntaxKind.JsxOpeningFragment) return '<>';
+  if (kind === ts.SyntaxKind.JsxClosingFragment) return '</>';
+  if (
+    kind !== ts.SyntaxKind.JsxOpeningElement &&
+    kind !== ts.SyntaxKind.JsxClosingElement &&
+    kind !== ts.SyntaxKind.JsxSelfClosingElement
+  ) {
+    return null;
+  }
+  // ts-morph exposes getTagNameNode() on all three; duck-type to keep
+  // this code independent of which exact ts-morph subclass we're on.
+  const tagHost = node as unknown as { getTagNameNode?: () => Node | undefined };
+  const tagNode = tagHost.getTagNameNode?.();
+  if (!tagNode) return null;
+  inlined.add(tagNode);
+  for (const d of tagNode.getDescendants()) inlined.add(d);
+  const tag = tagNode.getText();
+  if (kind === ts.SyntaxKind.JsxClosingElement) return `</${tag}>`;
+  if (kind === ts.SyntaxKind.JsxSelfClosingElement) return `<${tag} />`;
+  return `<${tag}>`;
+}
+
 // Synthesised label for a standalone PropertyAccess/ElementAccess — one that
 // is *not* the callee of a Call/New whose label already inlined it (or one
 // whose Call couldn't be collapsed). Renders the dotted path as a single
@@ -766,6 +807,13 @@ function rawFriendlyName(node: Node, inlined: Set<Node>): string | null {
   }
 
   if (REFERENCE_KINDS_TO_SKIP.has(kind)) return null;
+
+  // JSX opening / closing / self-closing element labels — `<Foo>`,
+  // `</Foo>`, `<Foo />`. Must run BEFORE the generic getName() block
+  // below: ts-morph returns just `Foo` from getName() on all three,
+  // which would render open and close as visually identical rects.
+  const jsxLabel = synthesizeJsxLabel(node, inlined);
+  if (jsxLabel !== null) return jsxLabel;
 
   // JSX attribute (`ref={…}`, `className="…"`, namespaced `a:b`).
   // ts-morph's JsxAttribute exposes getNameNode() but NOT getName()

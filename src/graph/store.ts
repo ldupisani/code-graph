@@ -80,6 +80,13 @@ export interface GraphStore {
   // already selected → remove it (primary clears when it was the
   // removed one). Otherwise → add it and make it the new primary.
   toggleSelection: (id: string) => void;
+  // Plain-click on an AST node — like setSelection, but PRESERVES
+  // any currently-selected FILES so a multi-file shift-select
+  // survives drilling into one of those files. Replaces the AST
+  // half of the selection (every id containing '#') with just
+  // this id. File IDs are paths (no '#'); AST nodes are emitted
+  // as `<fileId>#<n>`.
+  selectAstNode: (id: string) => void;
   setFileAst: (fileId: string, ast: FileAstResponse) => void;
   expandFile: (fileId: string) => void;
   collapseFile: (fileId: string) => void;
@@ -162,6 +169,16 @@ export const useGraphStore = create<GraphStore>((set) => ({
           selectionSet: next,
           selection: s.selection === id ? null : s.selection,
         };
+      }
+      next.add(id);
+      return { selectionSet: next, selection: id };
+    }),
+  selectAstNode: (id) =>
+    set((s) => {
+      // Keep file selections, drop existing AST selections, add this one.
+      const next = new Set<string>();
+      for (const existing of s.selectionSet) {
+        if (!existing.includes('#')) next.add(existing);
       }
       next.add(id);
       return { selectionSet: next, selection: id };

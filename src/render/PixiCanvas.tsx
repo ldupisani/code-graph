@@ -27,6 +27,8 @@ const COLORS = {
     astOutlineParam: 0x6cb6ff, // light blue — Parameter
     astOutlineAbstract: 0x4ec9b0, // dashed — abstract/interface (editor type color)
     astOutlineAbstractFn: 0x808080, // dotted — abstract function (≈50% white)
+    astOutlineJsx: 0xff9466, // salmon — JsxElement / JsxFragment (HTML-like)
+    astOutlineControl: 0xc586c0, // pink — control-flow (if/for/while/switch/...)
     text: 0xeeeeee,
     textDim: 0xb0b0b8,
     edge: 0x565a63, // import links: subdued but always visible
@@ -203,7 +205,31 @@ function composeModifierPrefix(node: {static?: boolean; readonly?: boolean; acce
 // Kinds whose label is treated like a real name for LOD: it survives the
 // simplified tier and only drops when it no longer fits on screen (rather
 // than disappearing early with the other generic kind labels).
-const NAME_LIKE_KINDS = new Set(["ImportDeclaration", "ReturnStatement"]);
+// Control-flow keywords (if/for/while/…) are name-like because they're
+// what tells the user "this is a branch / loop / catch" — without them
+// the kind-outline alone identifies the rect's COLOUR but not its WORD,
+// and an `if` reads completely differently from a `while` even though
+// both wear the same pink. ThrowStatement / BreakStatement / etc.
+// belong here for the same reason: a `throw` rect with no `throw` label
+// is just an unlabelled box around an Error constructor.
+const NAME_LIKE_KINDS = new Set([
+    "ImportDeclaration",
+    "ReturnStatement",
+    "IfStatement",
+    "ForStatement",
+    "ForInStatement",
+    "ForOfStatement",
+    "WhileStatement",
+    "DoStatement",
+    "SwitchStatement",
+    "CaseClause",
+    "DefaultClause",
+    "TryStatement",
+    "CatchClause",
+    "ThrowStatement",
+    "BreakStatement",
+    "ContinueStatement",
+]);
 
 // Kinds shown as a colored outline instead of a text label. They carry no
 // label (decluttered) but stay visually identifiable by border color.
@@ -225,6 +251,25 @@ const KIND_OUTLINE: Record<string, number> = {
     // continuity. Click to drill into members.
     InterfaceDeclaration: COLORS.astOutlineAbstract,
     TypeAliasDeclaration: COLORS.astOutlineAbstract,
+    // JSX wrappers — `<Foo>…</Foo>` and `<>…</>`. The expandable cell
+    // shows the tag in its collapsed leaf; clicking spawns an overlay
+    // with the opening tag (and its attributes), children, and closing
+    // tag as separate rects.
+    JsxElement: COLORS.astOutlineJsx,
+    JsxFragment: COLORS.astOutlineJsx,
+    // Control-flow statements — pink border matches the `control`
+    // syntax category used for their labels (if/for/while/etc.). The
+    // border makes the statement's rect boundary unambiguous even at
+    // zooms where the small `if` / `for` text label would be easy to
+    // miss inside a larger surrounding Block.
+    IfStatement: COLORS.astOutlineControl,
+    ForStatement: COLORS.astOutlineControl,
+    ForInStatement: COLORS.astOutlineControl,
+    ForOfStatement: COLORS.astOutlineControl,
+    WhileStatement: COLORS.astOutlineControl,
+    DoStatement: COLORS.astOutlineControl,
+    SwitchStatement: COLORS.astOutlineControl,
+    TryStatement: COLORS.astOutlineControl,
 };
 
 // A node is "significant" — worth its own box, never collapsed as a
@@ -273,6 +318,13 @@ const EXPANDABLE_KINDS = new Set([
     // them.
     "InterfaceDeclaration",
     "TypeAliasDeclaration",
+    // JSX wrapper — `<Foo>…</Foo>` and `<>…</>`. Collapses by default
+    // so a render method full of nested JSX doesn't dominate the
+    // expanded function body; clicking drills into the element and
+    // shows the opening tag (with its attributes inside it),
+    // children, and closing tag as their own rects.
+    "JsxElement",
+    "JsxFragment",
 ]);
 function isExpandableKind(kind: string): boolean {
     return EXPANDABLE_KINDS.has(kind);
@@ -2296,7 +2348,20 @@ export function PixiCanvas({project}: CanvasProps) {
                         4 / cameraScale, // ~4px on screen — a gentle curve, not a pill
                         Math.min(node.rect.w, node.rect.h) / 2,
                     );
-                    worldGfx.roundRect(x, y, node.rect.w, node.rect.h, radius).fill({color: fillColor, alpha: 0.92}).stroke({color: borderColor, width: borderWidth, alpha: borderAlpha});
+                    worldGfx.roundRect(x, y, node.rect.w, node.rect.h, radius).fill({color: fillColor, alpha: 0.92});
+                    // Same outside-stroke trick as the default branch below —
+                    // the thick selection border would otherwise eat the label
+                    // inset.
+                    const outset = isSelected ? borderWidth / 2 : 0;
+                    worldGfx
+                        .roundRect(
+                            x - outset,
+                            y - outset,
+                            node.rect.w + outset * 2,
+                            node.rect.h + outset * 2,
+                            radius + outset,
+                        )
+                        .stroke({color: borderColor, width: borderWidth, alpha: borderAlpha});
                 } else if (abstractOutline) {
                     // Abstract definition: dashed/dotted box outline. Abstract
                     // functions get a fine dotted pattern; abstract classes/interfaces
@@ -2324,7 +2389,19 @@ export function PixiCanvas({project}: CanvasProps) {
                         alpha: borderAlpha,
                     });
                 } else {
-                    worldGfx.rect(x, y, node.rect.w, node.rect.h).fill({color: fillColor, alpha: 0.92}).stroke({color: borderColor, width: borderWidth, alpha: borderAlpha});
+                    worldGfx.rect(x, y, node.rect.w, node.rect.h).fill({color: fillColor, alpha: 0.92});
+                    // Selection's thick blue border (FILE_RIM/2 ≈ 5 world)
+                    // is centered on the edge by default — half outside, half
+                    // INSIDE the rect, which covers the label area (3px screen
+                    // inset). Outset the stroke so the entire border sits
+                    // OUTSIDE the rect, like a CSS `outline`. Other border
+                    // styles (kind outline at 1px, function/class etc.) are
+                    // thin enough that the centered stroke doesn't reach the
+                    // label, so they're drawn on the rect's edge as before.
+                    const outset = isSelected ? borderWidth / 2 : 0;
+                    worldGfx
+                        .rect(x - outset, y - outset, node.rect.w + outset * 2, node.rect.h + outset * 2)
+                        .stroke({color: borderColor, width: borderWidth, alpha: borderAlpha});
                 }
 
                 pushRect({

@@ -17,6 +17,12 @@ const PASSTHROUGH_KINDS = new Set<ts.SyntaxKind>([
   ts.SyntaxKind.NamedImports,
   ts.SyntaxKind.NamedExports,
   ts.SyntaxKind.VariableDeclarationList,
+  // JsxAttributes is just a syntactic wrapper around the list of JSX
+  // attributes; treat it as transparent so each JsxAttribute becomes a
+  // direct child of its JsxOpeningElement / JsxSelfClosingElement. The
+  // attributes then render INSIDE the `<div>` opening-tag rect, which
+  // is how the user reads the source.
+  ts.SyntaxKind.JsxAttributes,
 ]);
 
 export interface ExtractAstOptions {
@@ -323,6 +329,70 @@ function synthesizeFlatTypeLabel(node: Node, inlined: Set<Node>): string | null 
   return node.getText();
 }
 
+// Synthesised label for prefix / postfix unary expressions: `!id`,
+// `-x`, `++i`, `i--`. Without this every unary became a container
+// labelled `unary` with the operand as a single child rect — the
+// operator (`!` vs `-` vs `++`) was invisible AND a tiny one-name
+// unary doubled in size for no information gain. The inlined form
+// reads exactly like source.
+//
+// We only inline the operand when it's atomic enough that the
+// `${op}${text}` concatenation makes sense:
+//   * Identifier (`id`, `simulated`)
+//   * Literals (string / number / true / false / null)
+//   * `this` / `super`
+//   * Member-access chains (`obj.x`, `arr[0]`) — these already
+//     synthesise as a single dotted label, so prefixing with the
+//     operator keeps the one-rect read.
+// For anything else (a call, a binary, a nested expression) we keep
+// just the operator as the label and let the operand render as a
+// child — `! [▷ isValid]` reads better than `!▷ isValid()`.
+function synthesizeUnaryLabel(node: Node, inlined: Set<Node>): string | null {
+  const kind = node.getKind();
+  if (
+    kind !== ts.SyntaxKind.PrefixUnaryExpression &&
+    kind !== ts.SyntaxKind.PostfixUnaryExpression
+  ) {
+    return null;
+  }
+  const u = node as unknown as {
+    getOperatorToken: () => ts.SyntaxKind;
+    getOperand: () => Node | undefined;
+  };
+  const opText = ts.tokenToString(u.getOperatorToken());
+  if (!opText) return null;
+  const operand = u.getOperand();
+  if (!operand) return opText;
+  if (isInlinableUnaryOperand(operand)) {
+    inlined.add(operand);
+    for (const d of operand.getDescendants()) inlined.add(d);
+    const text = operand.getText();
+    return kind === ts.SyntaxKind.PrefixUnaryExpression
+      ? `${opText}${text}`
+      : `${text}${opText}`;
+  }
+  // Complex operand stays as a child rect; the operator alone is the
+  // label so the user can still see whether this is `!`, `-`, `++`…
+  return opText;
+}
+
+function isInlinableUnaryOperand(node: Node): boolean {
+  const k = node.getKind();
+  return (
+    k === ts.SyntaxKind.Identifier ||
+    k === ts.SyntaxKind.StringLiteral ||
+    k === ts.SyntaxKind.NumericLiteral ||
+    k === ts.SyntaxKind.NoSubstitutionTemplateLiteral ||
+    k === ts.SyntaxKind.TrueKeyword ||
+    k === ts.SyntaxKind.FalseKeyword ||
+    k === ts.SyntaxKind.NullKeyword ||
+    k === ts.SyntaxKind.ThisKeyword ||
+    k === ts.SyntaxKind.SuperKeyword ||
+    k === ts.SyntaxKind.PropertyAccessExpression ||
+    k === ts.SyntaxKind.ElementAccessExpression
+  );
+}
+
 // Synthesised label for JSX opening / closing / self-closing elements
 // and fragments. Surfaces the angle brackets so the diagram reads as
 // JSX source:
@@ -344,6 +414,24 @@ function synthesizeJsxLabel(node: Node, inlined: Set<Node>): string | null {
   const kind = node.getKind();
   if (kind === ts.SyntaxKind.JsxOpeningFragment) return '<>';
   if (kind === ts.SyntaxKind.JsxClosingFragment) return '</>';
+  if (kind === ts.SyntaxKind.JsxFragment) return '<>…</>';
+  // JsxElement is the wrapper around `<Foo>…</Foo>` (opening tag,
+  // children, closing tag). The wrapper itself is expandable on the
+  // client (see EXPANDABLE_KINDS) — collapsed it reads as `<Foo>…</Foo>`
+  // so the tag is still identifiable; expanded, the inner opening /
+  // children / closing emit as their own rects.
+  if (kind === ts.SyntaxKind.JsxElement) {
+    const opening = (node as unknown as {
+      getOpeningElement?: () => Node | undefined;
+    }).getOpeningElement?.();
+    if (!opening) return null;
+    const openingTagHost = opening as unknown as {
+      getTagNameNode?: () => Node | undefined;
+    };
+    const tagNode = openingTagHost.getTagNameNode?.();
+    if (!tagNode) return null;
+    return `<${tagNode.getText()}>…</${tagNode.getText()}>`;
+  }
   if (
     kind !== ts.SyntaxKind.JsxOpeningElement &&
     kind !== ts.SyntaxKind.JsxClosingElement &&
@@ -807,6 +895,14 @@ function rawFriendlyName(node: Node, inlined: Set<Node>): string | null {
   }
 
   if (REFERENCE_KINDS_TO_SKIP.has(kind)) return null;
+
+  // Prefix / postfix unary expressions — render `!id`, `-x`, `i++`
+  // inline as a single rect when the operand is simple. Must run
+  // before the generic getName() block (unary doesn't have getName(),
+  // so it'd otherwise fall through to the static `unary` label from
+  // SYNTAX_KIND_LABELS on the client, hiding which operator it is).
+  const unaryLabel = synthesizeUnaryLabel(node, inlined);
+  if (unaryLabel !== null) return unaryLabel;
 
   // JSX opening / closing / self-closing element labels — `<Foo>`,
   // `</Foo>`, `<Foo />`. Must run BEFORE the generic getName() block

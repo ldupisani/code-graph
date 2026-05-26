@@ -2,7 +2,7 @@ import {useEffect, useRef} from "react";
 import {Application, Container, FederatedPointerEvent, Graphics, Text} from "pixi.js";
 import {getFileAst} from "../api/client";
 import {applyExpansion, assignRigidPositions, buildFileLayout, EXPANDED_MAX, EXPANDED_MIN, type FileLayoutResult} from "../graph/layout";
-import {AST_LABEL_FONT, fileLabel, labelScreenBox, measureMono} from "../graph/labels";
+import {AST_LABEL_FONT, astLabelOnScreenFactor, astLabelScale, fileLabel, labelScreenBox, measureMono} from "../graph/labels";
 import {isSupportFile, useGraphStore} from "../graph/store";
 import {layoutAst, type TreemapLayout, type TreemapNode} from "../graph/treemap";
 import {buildAstForceLayout, type AstForceLayout, type ContainerForceLayout} from "../graph/astForce";
@@ -2247,7 +2247,8 @@ export function PixiCanvas({project}: CanvasProps) {
                     const collapsedLabel = labelFor(node);
                     if (collapsedLabel) {
                         const lb = labelScreenBox(collapsedLabel);
-                        if (wOnScreen >= lb.w && hOnScreen >= lb.h) {
+                        const f = astLabelOnScreenFactor(cameraScale);
+                        if (wOnScreen >= lb.w * f && hOnScreen >= lb.h * f) {
                             labelPool.put({
                                 text: collapsedLabel,
                                 worldX: x + node.rect.w / 2,
@@ -2256,7 +2257,7 @@ export function PixiCanvas({project}: CanvasProps) {
                                 size: 11,
                                 anchorX: 0.5,
                                 anchorY: 0.5,
-                                scale: 1 / cameraScale,
+                                scale: astLabelScale(cameraScale),
                             });
                         }
                     }
@@ -2266,6 +2267,16 @@ export function PixiCanvas({project}: CanvasProps) {
                 // Zoomed-out "simplified" tier: drop operators and generic kind
                 // labels — keep only real names.
                 const simplified = cameraScale < SIMPLIFY_BELOW;
+
+                // AST label scaling tier. Below the lock zoom, labels render
+                // at WORLD scale (shrink as you zoom out, grow as you zoom
+                // in); above the lock zoom, the label's on-screen size is
+                // capped at AST_LABEL_MAX_SCREEN_SIZE. `labelOnScreenFactor`
+                // converts a label's WORLD size (what labelScreenBox returns
+                // — they're equal at 1:1 zoom) into its on-screen size at the
+                // current zoom, for use in fits-on-screen gates.
+                const labelScale = astLabelScale(cameraScale);
+                const labelOnScreenFactor = astLabelOnScreenFactor(cameraScale);
 
                 const isSelected = selectionSet.has(node.id);
                 const tint = depthTint(node.depth);
@@ -2461,7 +2472,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // single-color put whenever the label needs more than one
                 // colour. Source order: "[private] [static] [readonly] Name
                 // [extends Base]".
-                const segScale = 1 / cameraScale;
+                const segScale = labelScale;
                 const modifierPrefix = composeModifierPrefix(node);
                 const drawHeaderSegments = (startX: number, midY: number, centered: boolean): void => {
                     const segs: {t: string; c: number}[] = [];
@@ -2515,7 +2526,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     // Relational left operand (e.g. `i` in `let i = j`): the name is
                     // drawn centered in its reserved chip, not as a top-of-box label.
                     const chip = node.labelChip;
-                    if (chip.w * cameraScale >= labelBox.w && chip.h * cameraScale >= labelBox.h) {
+                    if (chip.w * cameraScale >= labelBox.w * labelOnScreenFactor && chip.h * cameraScale >= labelBox.h * labelOnScreenFactor) {
                         labelPool.put({
                             text: labelText,
                             worldX: baseX + chip.x + chip.w / 2,
@@ -2524,7 +2535,7 @@ export function PixiCanvas({project}: CanvasProps) {
                             size: 11,
                             anchorX: 0.5,
                             anchorY: 0.5,
-                            scale: 1 / cameraScale,
+                            scale: labelScale,
                         });
                     }
                 } else if (
@@ -2535,7 +2546,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     // constructs (classes/interfaces/exports) keep their label even
                     // when zoomed out past the point it fits, so the structure stays
                     // readable while lower-level semantics drop out.
-                    (isHighLevel(node) || (wOnScreen >= labelBox.w && hOnScreen >= labelBox.h))
+                    (isHighLevel(node) || (wOnScreen >= labelBox.w * labelOnScreenFactor && hOnScreen >= labelBox.h * labelOnScreenFactor))
                 ) {
                     const parent = node.parentId ? tree.byId.get(node.parentId) : null;
                     const parentLabel = parent ? labelFor(parent) : null;
@@ -2559,7 +2570,7 @@ export function PixiCanvas({project}: CanvasProps) {
                                     size: 11,
                                     anchorX: 0,
                                     anchorY: 0,
-                                    scale: 1 / cameraScale,
+                                    scale: labelScale,
                                 });
                             }
                         } else if (useSegments) {
@@ -2577,7 +2588,7 @@ export function PixiCanvas({project}: CanvasProps) {
                                 size: 11,
                                 anchorX: 0.5,
                                 anchorY: 0.5,
-                                scale: 1 / cameraScale,
+                                scale: labelScale,
                             });
                         }
                     }
@@ -2593,7 +2604,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // generic kind labels was leaving "[i] [j]" hanging in mid-air.
                 if (node.op && node.opAnchor) {
                     const opBox = labelScreenBox(node.op);
-                    if (wOnScreen >= opBox.w && hOnScreen >= opBox.h) {
+                    if (wOnScreen >= opBox.w * labelOnScreenFactor && hOnScreen >= opBox.h * labelOnScreenFactor) {
                         labelPool.put({
                             text: node.op,
                             worldX: baseX + node.opAnchor.x,
@@ -2602,7 +2613,7 @@ export function PixiCanvas({project}: CanvasProps) {
                             size: 11,
                             anchorX: 0.5,
                             anchorY: 0.5,
-                            scale: 1 / cameraScale,
+                            scale: labelScale,
                         });
                     }
                 }
@@ -4242,52 +4253,58 @@ interface LabelRequest {
     stroke?: {color: number; width: number};
 }
 
-// Content-keyed Text cache (replaces the previous position-indexed
-// pool that mutated Text.text in place between frames). Pixi v8 has
-// a bug where mutating a Text's content causes its underlying canvas
-// texture to resize, and on a subsequent change the OLD texture's
-// width may not have a slot in TexturePool — the next render then
-// crashes at TexturePoolClass.returnTexture with "Cannot read
-// properties of undefined (reading 'push')". Keying by text content
-// means each unique string owns ONE stable Text instance with a
-// stable texture, so the buggy code path is never taken.
+// Per-key POOL of Text instances. Each key owns an array; each put()
+// during a frame consumes the next entry, creating one on demand. At
+// endFrame, any entry not consumed this frame is hidden.
 //
-// Style mutations (fontSize, fill) are still applied in place because
-// they don't resize the canvas (Pixi keeps the same canvas + repaints).
-// Position / scale / visibility are also safe to mutate per frame.
+// Why a pool per key, not a single Text per key: the same string is
+// often drawn at MANY rect positions in a single frame (e.g. nine
+// `''` string-literal values in a constructor, or every `i` /
+// `value` / `id` identifier). A one-Text-per-key cache made all of
+// them fight over the same instance — only the LAST put per key
+// survived, leaving the rest invisible.
 //
-// LRU eviction caps the cache so projects with very dynamic label
-// content (lots of unique strings over time) don't grow unbounded.
+// Style mutation is still avoided (Pixi v8 bug — see the original
+// returnTexture note below). Each Text in the pool is created with
+// its style at construction time; only position / scale / visibility
+// are touched per frame. New keys allocate a new pool array; growth
+// within an existing pool also allocates a fresh Text per entry.
+//
+// We don't LRU-evict pool entries individually — they're cheap to
+// hold onto, and freeing one mid-pool would just be re-allocated
+// next time the same string appears that many times. The whole pool
+// for a key can be dropped if the key hasn't been seen for many
+// frames (TODO if memory becomes a real concern).
 class LabelPool {
     private parent: Container;
-    // Text → its instance. Insertion order is iteration order; we
-    // re-set on use to refresh recency (Map.set bumps the key to end).
-    private cache: Map<string, Text> = new Map();
-    // Texts used THIS frame, in put-order. endFrame() hides every Text
-    // not in this set.
-    private active: Set<Text> = new Set();
-    private static readonly MAX_LABELS = 2000;
+    // Per-key list of all Text instances ever created for that key.
+    private pool: Map<string, Text[]> = new Map();
+    // Per-key index of the next slot to consume THIS frame. Reset at
+    // beginFrame. A put() reads the index, grabs (or creates) that
+    // slot, and bumps the index.
+    private cursor: Map<string, number> = new Map();
 
     constructor(parent: Container) {
         this.parent = parent;
     }
 
     beginFrame(): void {
-        this.active.clear();
+        this.cursor.clear();
     }
 
     put(req: LabelRequest): void {
         // Key on text + size + color + stroke so any combination of
-        // those gets its OWN stable Text instance. Style mutations
-        // (fontSize, fill, stroke) hit Pixi v8's broken returnTexture
-        // path when the canvas resizes — same bug as in-place text
-        // mutation. Treating each style combo as a distinct cache entry
-        // sidesteps the mutation entirely; only position / scale /
-        // visibility are touched per frame, none of which resize the
-        // canvas.
+        // those gets its OWN Text class (style mutations after
+        // construction hit Pixi v8's broken returnTexture path).
         const strokeKey = req.stroke ? `${req.stroke.color.toString(16)}/${req.stroke.width}` : "";
         const key = `${req.text}|${req.size}|${req.color.toString(16)}|${strokeKey}`;
-        let label = this.cache.get(key);
+        let bucket = this.pool.get(key);
+        if (!bucket) {
+            bucket = [];
+            this.pool.set(key, bucket);
+        }
+        const i = this.cursor.get(key) ?? 0;
+        let label = bucket[i];
         if (!label) {
             label = new Text({
                 text: req.text,
@@ -4308,54 +4325,36 @@ class LabelPool {
             });
             label.eventMode = "none";
             this.parent.addChild(label);
-            this.cache.set(key, label);
-            // Evict the LEAST-RECENTLY-USED label when the cache gets too
-            // big. We only evict labels that aren't active this frame so
-            // we don't yank something out of the current render.
-            while (this.cache.size > LabelPool.MAX_LABELS) {
-                const oldest = this.cache.keys().next().value;
-                if (oldest === undefined) break;
-                const victim = this.cache.get(oldest);
-                if (!victim || this.active.has(victim)) break;
-                this.cache.delete(oldest);
-                // removeChild detaches the Text from the scene; we DON'T
-                // explicitly call victim.destroy() because Pixi v8 has a
-                // bug in Text → returnTexture where pool[width] can be
-                // undefined. The orphaned Text instance gets GC'd by JS
-                // once we drop the reference (which we do by deleting the
-                // cache entry above), without going through the buggy
-                // texture-pool path.
-                this.parent.removeChild(victim);
-            }
-        } else {
-            // Refresh LRU position by re-inserting at the end of the Map.
-            // No style mutation needed — the key guarantees the cached
-            // Text already has the right size and color.
-            this.cache.delete(key);
-            this.cache.set(key, label);
+            bucket.push(label);
         }
+        this.cursor.set(key, i + 1);
         label.anchor.set(req.anchorX ?? 0.5, req.anchorY ?? 0.5);
         label.position.set(req.worldX, req.worldY);
         const s = req.scale ?? 1;
         label.scale.set(s);
         label.visible = true;
-        this.active.add(label);
     }
 
     endFrame(): void {
-        for (const t of this.cache.values()) {
-            if (!this.active.has(t)) t.visible = false;
+        // Hide every Text past the per-key consumed cursor — those are
+        // pool entries that existed but weren't claimed by any put()
+        // this frame, e.g. a key whose count dropped from 9 to 5.
+        for (const [key, bucket] of this.pool) {
+            const used = this.cursor.get(key) ?? 0;
+            for (let i = used; i < bucket.length; i++) {
+                bucket[i].visible = false;
+            }
         }
     }
 
     destroy(): void {
-        // Same workaround as the eviction path: don't call Text.destroy
-        // explicitly. The caller is always tearing down the whole Pixi
-        // app right after this (app.destroy(true, { children: true,
-        // texture: true })), which recursively destroys our parent
-        // container and every Text in it through a different code path
-        // that doesn't trip the v8 returnTexture pool bug.
-        this.cache.clear();
-        this.active.clear();
+        // Same workaround as before: don't call Text.destroy explicitly.
+        // The caller is always tearing down the whole Pixi app right
+        // after this (app.destroy(true, { children: true, texture: true
+        // })), which recursively destroys our parent container and every
+        // Text in it through a different code path that doesn't trip the
+        // v8 returnTexture pool bug.
+        this.pool.clear();
+        this.cursor.clear();
     }
 }

@@ -347,6 +347,14 @@ export function layoutAst(
   // child sizes as a small kind-outlined leaf (no recursion, kids
   // dropped from the layout entirely). Used by the zoom-driven detail
   // switch to shrink function bodies that contain no named descendants.
+  //
+  // Cell is sized to fit its label so a NAMED collapsible (e.g.
+  // `InterfaceDeclaration IUserPreferences`, `TypeAliasDeclaration`,
+  // `JsxElement <SomeComponent>…</SomeComponent>`) doesn't render as
+  // a blank box that loses its identity at-a-glance. Unnamed
+  // collapsibles (`Block`, ObjectBindingPattern's `{}`,
+  // ObjectLiteralExpression's `{}`) still land at the COLLAPSED_LEAF
+  // minimum because their labels are short enough to fit it.
   const sizeOrCollapse = (n: AstNode, parentKind: string): Sized => {
     if (
       collapseChildren &&
@@ -355,11 +363,13 @@ export function layoutAst(
         parentKind,
       )
     ) {
+      const label = opts.labelOf(n);
+      const lb = label ? opts.measure(label) : { w: 0, h: 0 };
       return {
         node: n,
         labelH: 0,
-        w: COLLAPSED_LEAF_W,
-        h: COLLAPSED_LEAF_H,
+        w: Math.max(COLLAPSED_LEAF_W, lb.w),
+        h: Math.max(COLLAPSED_LEAF_H, lb.h),
         kids: [],
         collapsed: true,
       };

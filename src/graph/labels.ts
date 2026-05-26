@@ -25,6 +25,47 @@ export function measureMono(text: string, fontSize: number): { w: number; h: num
 
 // AST label font + the screen-px inset the renderer draws it at (top-left).
 export const AST_LABEL_FONT = 11;
+// Maximum on-screen size (px) an AST label is allowed to reach. The renderer
+// lets labels GROW with the camera up to this cap, then locks them in place
+// — see `astLabelScale` below. Setting this above AST_LABEL_FONT means the
+// max display size is larger than the layout's intrinsic font size, so
+// zoomed-in detail reads bigger without changing the per-1:1 layout math.
+export const AST_LABEL_MAX_SCREEN_SIZE = 16;
+// The camera zoom at which an AST label hits its cap. Below this zoom, the
+// label is drawn at WORLD scale (it shrinks linearly as you zoom out, so
+// smaller rects can still host their label and the labels "appear sooner"
+// when zooming in from far). At or above this zoom, the label scale shrinks
+// proportionally with the camera so the on-screen size stays constant at
+// AST_LABEL_MAX_SCREEN_SIZE. Derived: MAX_SCREEN / FONT, so at lock zoom the
+// label's world size (FONT) renders at exactly MAX_SCREEN px on screen.
+export const AST_LABEL_LOCK_ZOOM = AST_LABEL_MAX_SCREEN_SIZE / AST_LABEL_FONT;
+
+// Scale factor to pass to a Pixi Text for AST labels. The result is the
+// `scale` parameter for `labelPool.put`; combined with the camera's
+// world→screen transform, it gives the behaviour described above:
+//   * zoom ≤ LOCK    → scale = 1 (label is full font-size in WORLD units,
+//                      so its on-screen size = FONT * cameraScale, growing
+//                      with zoom from tiny to MAX_SCREEN)
+//   * zoom > LOCK    → scale = LOCK / cameraScale (label's world size
+//                      shrinks just enough to keep the on-screen size
+//                      pinned to MAX_SCREEN)
+// File / directory / class-name-above-circle labels keep their old
+// `1 / cameraScale` (constant-screen) behaviour — those are spatial
+// anchors that should never grow or shrink with zoom.
+export function astLabelScale(cameraScale: number): number {
+  if (cameraScale <= AST_LABEL_LOCK_ZOOM) return 1;
+  return AST_LABEL_LOCK_ZOOM / cameraScale;
+}
+
+// The on-screen factor a label sized in WORLD units needs to be multiplied
+// by, to get its size on screen at the current zoom. Used by the renderer's
+// "does this label still fit in its rect on screen?" gate — which has to
+// compare a world-sized box against an on-screen rect dimension.
+//   * below LOCK: label is world-scaled, so on-screen = world * cameraScale
+//   * above LOCK: label is screen-locked at the LOCK ratio of world size
+export function astLabelOnScreenFactor(cameraScale: number): number {
+  return Math.min(cameraScale, AST_LABEL_LOCK_ZOOM);
+}
 // Generous inset so the names we keep get breathing room and adjacent
 // labels don't visually collide.
 export const LABEL_INSET_X = 9;

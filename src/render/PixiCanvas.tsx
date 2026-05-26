@@ -3059,17 +3059,20 @@ export function PixiCanvas({project}: CanvasProps) {
                 // Base zoom-driven rigid weight: 1 at zoom-out, 0 at zoom-in,
                 // scaled by rigidEnable.
                 const rWeight = rigidness(cameraScale) * rigidEnable;
-                // Floor on the rigid weight — caps how far the layout is
-                // allowed to lean toward connectivity. When nothing is
-                // expanded we keep at least half the rigid (folder) pull
-                // active even at max zoom-in: the folder grid stays the
-                // primary "where does it live" signal, and the user only
-                // gets the full connectivity arrangement by explicitly
-                // opening a file (rigidEnable eases down → floor falls
-                // toward 0, releasing the cap). Derived: rigidEnable=1 →
-                // floor 0.5; rigidEnable=RIGID_OPEN_BLEND → floor 0.
-                const rigidFloor = Math.max(0, rigidEnable - RIGID_OPEN_BLEND);
-                const t = Math.max(rWeight, rigidFloor);
+                // Unconditional floor on the rigid weight — the layout is
+                // never allowed to lean further than halfway toward the
+                // connectivity arrangement. The folder grid is the primary
+                // "where does it live" signal at every zoom, and opening a
+                // file isn't a reason to fully abandon it: the surrounding
+                // files only need to drift halfway toward their connected
+                // positions for the user to read the neighbourhood, and a
+                // bigger lurch makes the context jarring when files open
+                // or close. With this floor, the no-file regime spans
+                // t∈[0.5, 1] and the file-open regime sits at t=0.5 (the
+                // zoom-out endpoint of rWeight equals the floor exactly,
+                // since RIGID_OPEN_BLEND === RIGID_FLOOR).
+                const RIGID_FLOOR = 0.5;
+                const t = Math.max(rWeight, RIGID_FLOOR);
                 // 1. Tentative render position = interpolated base + the
                 //    decayed collision offset carried from last frame.
                 //    An EXPANDED file is exempt from the rigid pull (nt=0):
@@ -3243,23 +3246,47 @@ export function PixiCanvas({project}: CanvasProps) {
                     // so we don't fight their input.
                     zoomFit = null;
                 },
-                // While the cursor sits over a COLLAPSED file icon,
-                // anchor the wheel-zoom on the icon's centre so the
-                // file stays under the cursor as the user zooms in/out
-                // — a small icon would otherwise wander out of reach.
-                // For EXPANDED files the user is hovering specific
-                // content inside the file (a class member, an AST
-                // rect), not the file as a whole; zooming toward the
-                // file's centre would slide the cursor's actual target
-                // off screen, so fall back to the wheel handler's
-                // default cursor-pivot behaviour.
-                getZoomPivot: () => {
-                    if (!hoveredHit || hoveredHit.kind !== "file") return null;
-                    const expanded = useGraphStore.getState().expandedFiles.has(hoveredHit.fileId);
-                    if (expanded) return null;
-                    const sim = layout.byId.get(hoveredHit.fileId);
-                    if (!sim) return null;
-                    return {worldX: sim.x, worldY: sim.y};
+                // Pivot policy for wheel-zoom, by what the cursor is on:
+                //   * COLLAPSED file → anchor on the icon's centre so the
+                //     small icon doesn't wander out from under the cursor
+                //     as the user zooms in.
+                //   * EXPANDED file → cursor pivot (return null). The user
+                //     is reaching INTO the file toward specific content;
+                //     anchoring on the file centre would slide their
+                //     actual target off screen.
+                //   * AST hit inside an open file → same as expanded file:
+                //     cursor pivot so the specific content stays put.
+                //   * Empty space → anchor on the CLOSEST file's centre.
+                //     Zooming in over nothing in particular would otherwise
+                //     just amplify the surrounding emptiness; gravitating
+                //     to the nearest file means a wheel scroll always
+                //     heads somewhere useful.
+                getZoomPivot: (cursorWorld) => {
+                    if (hoveredHit) {
+                        if (hoveredHit.kind !== "file") return null;
+                        const expanded = useGraphStore.getState().expandedFiles.has(hoveredHit.fileId);
+                        if (expanded) return null;
+                        const sim = layout.byId.get(hoveredHit.fileId);
+                        if (!sim) return null;
+                        return {worldX: sim.x, worldY: sim.y};
+                    }
+                    // Empty space — pivot toward the closest file. Cheap
+                    // linear scan over layout.nodes; a project has on the
+                    // order of hundreds of files at most, and this runs
+                    // once per wheel event.
+                    let bestNode: SimFileNode | null = null;
+                    let bestDist2 = Infinity;
+                    for (const n of layout.nodes) {
+                        const dx = n.x - cursorWorld.x;
+                        const dy = n.y - cursorWorld.y;
+                        const d2 = dx * dx + dy * dy;
+                        if (d2 < bestDist2) {
+                            bestDist2 = d2;
+                            bestNode = n;
+                        }
+                    }
+                    if (!bestNode) return null;
+                    return {worldX: bestNode.x, worldY: bestNode.y};
                 },
             });
 
@@ -4289,12 +4316,16 @@ interface CameraDeps {
     // in-progress auto-pan/follow can bow out.
     onUserCameraMove: () => void;
     // World point the next wheel-zoom should keep ANCHORED at the
-    // cursor's screen position. Returning a point makes the hovered
-    // file stay centred under the cursor as the user scrolls —
-    // instead of the default 'whatever world point was under the
+    // cursor's screen position. Returning a point makes that point
+    // stay centred under the cursor as the user scrolls — instead of
+    // the default 'whatever world point was currently under the
     // cursor stays under the cursor'. Returning null falls back to
-    // the cursor-pivot behaviour.
-    getZoomPivot?: () => {worldX: number; worldY: number} | null;
+    // the cursor-pivot behaviour. The cursor's current world position
+    // is passed in so the host can pick a sensible pivot (e.g. the
+    // nearest file) when the cursor isn't on anything specific.
+    getZoomPivot?: (
+        cursorWorld: {x: number; y: number},
+    ) => {worldX: number; worldY: number} | null;
 }
 
 function wireCamera(deps: CameraDeps): () => void {
@@ -4374,7 +4405,8 @@ function wireCamera(deps: CameraDeps): () => void {
         const py = e.clientY - rect.top;
         const factor = Math.exp(-e.deltaY * 0.0015);
         const next = clamp(world.scale.x * factor, 0.05, 32);
-        const pivot = deps.getZoomPivot?.() ?? null;
+        const cursorWorld = screenToWorld(px, py);
+        const pivot = deps.getZoomPivot?.(cursorWorld) ?? null;
         if (pivot) {
             // Map this world point to the cursor's screen position at
             // the new scale — the hovered file (or whatever the host

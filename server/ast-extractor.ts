@@ -23,6 +23,14 @@ const PASSTHROUGH_KINDS = new Set<ts.SyntaxKind>([
   // attributes then render INSIDE the `<div>` opening-tag rect, which
   // is how the user reads the source.
   ts.SyntaxKind.JsxAttributes,
+  // JsxExpression is the `{…}` braces wrapping an attribute value or
+  // JSX child expression — purely syntactic, the EXPRESSION inside is
+  // what the user cares about. Without this, `ref={ref}` rendered as a
+  // JsxAttribute ('ref' header) containing a JsxExpression (empty
+  // rect) containing the Identifier ('ref') — three nested rects for
+  // one piece of information. Skipping the JsxExpression collapses to
+  // `[ref [ref]]`, matching how the source reads.
+  ts.SyntaxKind.JsxExpression,
 ]);
 
 export interface ExtractAstOptions {
@@ -918,8 +926,19 @@ function rawFriendlyName(node: Node, inlined: Set<Node>): string | null {
   // ends up nameless, is treated as insignificant, and gets
   // collapsed away entirely, so `ref` / `fill` / `width` never
   // appear in the diagram. Pull the name node's text directly.
+  //
+  // Inline the name node so it doesn't emit as its own child rect
+  // under the attribute. Otherwise `type="radio"` rendered as
+  // `[type [type] ["radio"]]` — and because the inner Identifier
+  // shared its parent's "type" label, the duplicate-label suppression
+  // rule blanked it out, leaving an empty rect: `[type [] ["radio"]]`.
+  // The attribute's label already carries the name; the Identifier
+  // adds no information.
   if (Node.isJsxAttribute(node)) {
-    return node.getNameNode().getText();
+    const nameNode = node.getNameNode();
+    inlined.add(nameNode);
+    for (const d of nameNode.getDescendants()) inlined.add(d);
+    return nameNode.getText();
   }
 
   // ts-morph uses structural typing for "named" nodes — many declarations

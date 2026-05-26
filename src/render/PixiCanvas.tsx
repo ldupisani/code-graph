@@ -229,6 +229,13 @@ const NAME_LIKE_KINDS = new Set([
     "ThrowStatement",
     "BreakStatement",
     "ContinueStatement",
+    // `=>` (ArrowFunction) is the only signal that a rect IS a
+    // function when the arrow is anonymous — there's no name to
+    // hold the simplified-tier survivability the way a named
+    // FunctionDeclaration / MethodDeclaration does. Keep it
+    // name-like so it shows up alongside its parameters even at
+    // lower zooms.
+    "ArrowFunction",
 ]);
 
 // Kinds shown as a colored outline instead of a text label. They carry no
@@ -733,6 +740,17 @@ export function PixiCanvas({project}: CanvasProps) {
             const directoryGfx = new Graphics();
             world.addChild(directoryGfx);
 
+            // Directory-name labels share the SPATIAL story of the
+            // boundary hulls and therefore sit at the same z as them —
+            // BEHIND worldGfx so expanded file blocks visually cover the
+            // cluster label they happen to overlap. Without this, the
+            // dim pink `[src/components/feedback]`-style cluster name
+            // bleeds across the white contents of any open file in its
+            // region (especially noticeable at low zoom where the hull
+            // is large but the label is fixed-screen-size).
+            const directoryLabelLayer = new Container();
+            world.addChild(directoryLabelLayer);
+
             const worldGfx = new Graphics();
             world.addChild(worldGfx);
 
@@ -863,6 +881,12 @@ export function PixiCanvas({project}: CanvasProps) {
             // churn. Each overlay pane has its OWN LabelPool — see the pane
             // pool above and the multi-pass loop in `draw()`.
             const labelPool = new LabelPool(labelLayer);
+            // Separate pool for directory-cluster labels — its container
+            // sits BEHIND worldGfx in the scene graph (see
+            // `directoryLabelLayer` above), so any expanded file block
+            // covers the cluster label it overlaps. Shares the same
+            // beginFrame/endFrame lifecycle as the main pool.
+            const directoryLabelPool = new LabelPool(directoryLabelLayer);
 
             // Active per-pass targets for the SHARED drawing helpers
             // (drawAstNode, drawAstContainer, drawOverlay). The main scene
@@ -1052,6 +1076,15 @@ export function PixiCanvas({project}: CanvasProps) {
                 // colour, not a muted variant readable only against the
                 // hull behind it.
                 hslToHex(hueForDirectory(dir), 65, 58);
+            const colourForDirectoryDim = (dir: string): number =>
+                // A few stops darker than `colourForDirectory` — used for
+                // FILE NAME labels so they read as members of their
+                // directory's colour family without competing with the
+                // (already-dim) directory-hull labels for visual weight.
+                // Same hue and saturation so the family tie is obvious;
+                // lower lightness so the file name sits a tier "below"
+                // its containing folder name.
+                hslToHex(hueForDirectory(dir), 38, 42);
             // Take the first `depth` components of a relative path. Used to
             // group deeply-nested files into a smaller number of meaningful
             // architectural clusters. `src/components/data-display/list/item.tsx`
@@ -1188,34 +1221,70 @@ export function PixiCanvas({project}: CanvasProps) {
                     for (let i = 1; i < hull.length; i++) {
                         directoryGfx.lineTo(hull[i].x, hull[i].y);
                     }
+                    // Quieter: very low fill alpha + subtler stroke so dense
+                    // projects with many overlapping hulls don't read as
+                    // chaos. The cluster + label do the spatial work; the
+                    // hull is just a hint.
+                    //
+                    // Stroke alpha drops to 0 once we're zoomed in enough
+                    // for file names to appear (FILE_LABEL_BELOW). At that
+                    // point the individual file labels carry the spatial
+                    // story; outlining each cluster on top would compete
+                    // for visual weight and clutter the canvas with
+                    // overlapping borders. The fill is kept (very faint)
+                    // so cluster regions still tint by hue, and the
+                    // hull's bracketed label stays as the cluster's
+                    // anchor.
+                    const strokeAlpha = cameraScale < FILE_LABEL_BELOW ? 0.28 : 0;
                     directoryGfx
                         .closePath()
-                        // Quieter: very low fill alpha + subtler stroke so dense
-                        // projects with many overlapping hulls don't read as
-                        // chaos. The cluster + label do the spatial work; the
-                        // hull is just a hint.
                         .fill({color: colour, alpha: 0.04})
                         .stroke({
                             color: colour,
                             width: 1 / cameraScale,
-                            alpha: 0.28,
+                            alpha: strokeAlpha,
                         });
-                    // Directory label at the hull's topmost point. Compute once
-                    // per directory; placement is below the topmost vertex so
-                    // the label sits INSIDE the hull rather than overlapping a
-                    // file above.
-                    let topI = 0;
+                    // Directory label centred on the hull's bounding box.
+                    // Wrapped in [square brackets] to make the cluster
+                    // boundary explicit at a glance — the hull stroke alone
+                    // is intentionally faint and easy to miss; the brackets
+                    // read as the cluster's "label marker" the way
+                    // `[scope]` reads as a section header in CLI /
+                    // build-tool output.
+                    //
+                    // When a member file is EXPANDED the centred placement
+                    // would sit on top of its (now-large) content, so we
+                    // shift the label to the top of the bounding box —
+                    // outside the file rects, still inside the hull. With
+                    // every file collapsed the bbox is roughly empty space
+                    // around small icons, so centred reads as the cluster's
+                    // visual centre.
+                    let minX = hull[0].x;
+                    let maxX = hull[0].x;
+                    let minY = hull[0].y;
+                    let maxY = hull[0].y;
                     for (let i = 1; i < hull.length; i++) {
-                        if (hull[i].y < hull[topI].y) topI = i;
+                        if (hull[i].x < minX) minX = hull[i].x;
+                        if (hull[i].x > maxX) maxX = hull[i].x;
+                        if (hull[i].y < minY) minY = hull[i].y;
+                        if (hull[i].y > maxY) maxY = hull[i].y;
                     }
-                    labelPool.put({
-                        text: dir,
-                        worldX: hull[topI].x,
-                        worldY: hull[topI].y + 14 / cameraScale,
+                    // Always centred — the directory label lives on its
+                    // OWN layer (`directoryLabelPool`) that sits behind
+                    // worldGfx in the scene graph, so any expanded file
+                    // covers the label where they overlap. Trying to
+                    // dodge expanded files by shifting the label's
+                    // position never quite worked: at low zoom the
+                    // hull's BOUNDARY_PAD wasn't enough to keep the
+                    // shifted label outside the file rect.
+                    directoryLabelPool.put({
+                        text: `[${dir}]`,
+                        worldX: (minX + maxX) / 2,
+                        worldY: (minY + maxY) / 2,
                         color: colour,
                         size: 12,
-                        anchorX: 0,
-                        anchorY: 0,
+                        anchorX: 0.5,
+                        anchorY: 0.5,
                         scale: 1 / cameraScale,
                     });
                 }
@@ -1502,6 +1571,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 visibleById.clear();
                 blockCellsThisFrame.clear();
                 labelPool.beginFrame();
+                directoryLabelPool.beginFrame();
 
                 // Focus-mode live set — recomputed only when focusId, focusHops
                 // or edgeFilter changes. Consumed by the dim overlay below
@@ -1684,6 +1754,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 //    overlay pane's pool was already begin/end-framed per
                 //    overlay above.
                 labelPool.endFrame();
+                directoryLabelPool.endFrame();
 
                 // 5. Semantic edges (calls / extends / implements) on the
                 //    dedicated semanticEdgeGfx layer. Scene-graph z puts that
@@ -1773,13 +1844,34 @@ export function PixiCanvas({project}: CanvasProps) {
                     // the basename — at typical zooms with many file icons
                     // packed close together, basename keeps the canvas
                     // readable while full path would crowd it.
-                    const text = expanded || isHovered ? sim.relativePath : fileLabel(sim.relativePath);
+                    const showFullPath = expanded || isHovered;
+                    const text = showFullPath ? sim.relativePath : fileLabel(sim.relativePath);
+                    // Basename labels tint to a slightly-darker shade of
+                    // their directory's hue, so the file reads as a member
+                    // of its folder cluster (and clusters of files are
+                    // visually grouped at a glance). Full-path mode
+                    // (hover / expanded / selected) and root-level files
+                    // (no cluster) keep the default white so the active
+                    // attention target stands out against the dimmer rest.
+                    const cluster = fileToActiveCluster.get(sim.id);
+                    const highlighted = showFullPath || isSelected;
+                    const color =
+                        highlighted || !cluster
+                            ? COLORS.text
+                            : colourForDirectoryDim(cluster);
+                    // Default: 75% of the directory-hull label's 12px so
+                    // file names sit a tier below their containing folder
+                    // name in the visual hierarchy. Highlighted state
+                    // (hover / expanded / selected) matches the folder's
+                    // 12px so the active attention target reads at the
+                    // same weight as its containing folder.
+                    const size = highlighted ? 12 : 9;
                     labelPool.put({
                         text,
                         worldX: sim.x,
                         worldY: topY - aboveGap,
-                        color: COLORS.text,
-                        size: 12,
+                        color,
+                        size,
                         anchorX: 0.5,
                         anchorY: 1, // text's bottom sits `aboveGap` above the node
                         scale: labelScale,
@@ -3337,6 +3429,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 window.removeEventListener("keydown", onShiftDown);
                 window.removeEventListener("keyup", onShiftUp);
                 labelPool.destroy();
+                directoryLabelPool.destroy();
                 for (const pane of overlayPanes) pane.labels.destroy();
                 app.ticker.remove(tickerCb);
                 app.destroy(true, {children: true, texture: true});

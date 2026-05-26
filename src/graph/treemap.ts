@@ -35,6 +35,12 @@ export interface TreemapNode {
   // instead of as the usual top-of-box label.
   op?: string;
   opAnchor?: { x: number; y: number };
+  // Second operator for the ternary `?:` case — drawn at `opAnchor2`
+  // between operands 1 and 2 the same way `op` is drawn between
+  // operands 0 and 1. Unused for plain BinaryExpression / typed-decl
+  // (op only) and unset on every other layout.
+  op2?: string;
+  opAnchor2?: { x: number; y: number };
   labelChip?: Rect;
   // True when this node was forced to a placeholder leaf by the layout
   // (children dropped from the tree). The renderer paints just the
@@ -132,6 +138,9 @@ interface Sized {
   // shape where the left operand is this node's own name.
   op?: string;
   opRel?: { x: number; y: number };
+  // Second operator (ternary `?:`) — see TreemapNode.op2.
+  op2?: string;
+  opRel2?: { x: number; y: number };
   labelChip?: Rect;
   // Set when `opts.collapseChildren(node)` fired. The node was sized as
   // a small kind-outlined leaf and its actual children are not in
@@ -219,6 +228,42 @@ export function layoutAst(
     };
   };
 
+  // Ternary `[cond] ? [whenTrue] : [whenFalse]` — same shape as
+  // `relational` but with TWO operator gaps. Used for
+  // ConditionalExpression so a ternary reads like the source instead
+  // of `?: [cond] [whenTrue] [whenFalse]` stacked under a header.
+  const ternary = (
+    node: AstNode,
+    k0: Sized,
+    op1: string,
+    k1: Sized,
+    op2: string,
+    k2: Sized,
+  ): Sized => {
+    const ob1 = opts.measure(op1);
+    const ob2 = opts.measure(op2);
+    const rowH = Math.max(k0.h, k1.h, k2.h, ob1.h, ob2.h);
+    const x_op1 = k0.w + GAP;
+    const x1 = x_op1 + ob1.w + GAP;
+    const x_op2 = x1 + k1.w + GAP;
+    const x2 = x_op2 + ob2.w + GAP;
+    return {
+      node,
+      labelH: 0,
+      w: x2 + k2.w + PAD * 2,
+      h: rowH + PAD * 2,
+      kids: [
+        { sized: k0, x: 0, y: (rowH - k0.h) / 2 },
+        { sized: k1, x: x1, y: (rowH - k1.h) / 2 },
+        { sized: k2, x: x2, y: (rowH - k2.h) / 2 },
+      ],
+      op: op1,
+      opRel: { x: x_op1 + ob1.w / 2, y: rowH / 2 },
+      op2,
+      opRel2: { x: x_op2 + ob2.w / 2, y: rowH / 2 },
+    };
+  };
+
   // ---- Phase 1: bottom-up intrinsic sizing ------------------------------
   const size = (node: AstNode): Sized => {
     const label = opts.labelOf(node);
@@ -232,6 +277,25 @@ export function layoutAst(
     const kids = (kidsOf.get(node.id) ?? [])
       .map(collapse)
       .filter((k) => !isPruned(k));
+
+    // ConditionalExpression `[cond] ? [whenTrue] : [whenFalse]` — laid
+    // out before the generic node.op branches because it doesn't carry
+    // a single operator from the server (the `?` and `:` are part of
+    // the grammar, not an `operatorToken`).
+    if (
+      node.syntaxKind === 'ConditionalExpression' &&
+      !label &&
+      kids.length === 3
+    ) {
+      return ternary(
+        node,
+        size(kids[0]),
+        '?',
+        size(kids[1]),
+        ':',
+        size(kids[2]),
+      );
+    }
 
     if (node.op) {
       // BinaryExpression: unlabeled, exactly two operands → [l] op [r].
@@ -414,6 +478,10 @@ export function layoutAst(
           h: s.labelChip.h,
         };
       }
+    }
+    if (s.op2 && s.opRel2) {
+      tn.op2 = s.op2;
+      tn.opAnchor2 = { x: cx + s.opRel2.x, y: cy + s.opRel2.y };
     }
     byId.set(s.node.id, tn);
     if (s.kids.length === 0) return;

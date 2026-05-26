@@ -127,7 +127,12 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
     ElementAccessExpression: "index",
     PrefixUnaryExpression: "unary",
     PostfixUnaryExpression: "unary",
-    ConditionalExpression: "?:",
+    // ConditionalExpression intentionally has NO static label: the
+    // treemap lays it out as `[cond] ? [whenTrue] : [whenFalse]` with
+    // the `?` and `:` drawn inline as operator glyphs between the
+    // operand boxes (same render path as BinaryExpression's op).
+    // Showing `?:` as a top-of-box label too would just duplicate
+    // information that the glyphs already convey.
     ArrowFunction: "=>",
     FunctionExpression: "fn",
     AwaitExpression: "await",
@@ -2709,6 +2714,24 @@ export function PixiCanvas({project}: CanvasProps) {
                         });
                     }
                 }
+                // Second operator (ternary `:` after `?`). Drawn the same
+                // way as op above; opAnchor2 was filled by the treemap's
+                // ternary layout. Unset for every non-ternary node.
+                if (node.op2 && node.opAnchor2) {
+                    const op2Box = labelScreenBox(node.op2);
+                    if (wOnScreen >= op2Box.w * labelOnScreenFactor && hOnScreen >= op2Box.h * labelOnScreenFactor) {
+                        labelPool.put({
+                            text: node.op2,
+                            worldX: baseX + node.opAnchor2.x,
+                            worldY: baseY + node.opAnchor2.y,
+                            color: SYNTAX.default,
+                            size: 11,
+                            anchorX: 0.5,
+                            anchorY: 0.5,
+                            scale: labelScale,
+                        });
+                    }
+                }
 
                 const kids = tree.childrenByParent.get(node.id);
                 if (!kids) return;
@@ -2732,13 +2755,23 @@ export function PixiCanvas({project}: CanvasProps) {
             function updateFollow(): void {
                 if (followId === null) return;
                 if (performance.now() < followStartAt) return;
-                if (followAt === null) {
-                    // First active frame — capture the current world position of
-                    // the target as the camera's fixed destination.
+                // File follows re-capture each frame while the sim is
+                // still settling — applyExpansion bumps the sim's alpha
+                // to 0.9, so collision forces push the freshly-expanded
+                // file around for many frames after the trigger.
+                // Snapshotting once would leave the camera lerping to a
+                // stale position while the file drifts away (the user
+                // saw expansions land bottom-right of centre). AST-node
+                // follows still snapshot once because their target's
+                // world position doesn't drift after the click.
+                const isFileFollow = !followId.includes("#");
+                const simSettling =
+                    layout.simulation.alpha() > layout.simulation.alphaMin();
+                if (followAt === null || (isFileFollow && simSettling)) {
                     const simNode = layout.byId.get(followId);
                     if (simNode) {
                         followAt = {x: simNode.x, y: simNode.y};
-                    } else {
+                    } else if (followAt === null) {
                         const r = visibleById.get(followId) ?? findVisibleAnchor(followId, visibleById, activeTree);
                         if (!r) return; // not resolvable yet — try again next frame
                         // Code blocks anchor at their TOP-LEFT, not their centre:
@@ -3023,7 +3056,20 @@ export function PixiCanvas({project}: CanvasProps) {
                 // slow enough to read as a transition, fast enough not to drag.
                 const anyFileOpen = useGraphStore.getState().expandedFiles.size > 0;
                 rigidEnable += ((anyFileOpen ? RIGID_OPEN_BLEND : 1) - rigidEnable) * 0.08;
-                const t = rigidness(cameraScale) * rigidEnable;
+                // Base zoom-driven rigid weight: 1 at zoom-out, 0 at zoom-in,
+                // scaled by rigidEnable.
+                const rWeight = rigidness(cameraScale) * rigidEnable;
+                // Floor on the rigid weight — caps how far the layout is
+                // allowed to lean toward connectivity. When nothing is
+                // expanded we keep at least half the rigid (folder) pull
+                // active even at max zoom-in: the folder grid stays the
+                // primary "where does it live" signal, and the user only
+                // gets the full connectivity arrangement by explicitly
+                // opening a file (rigidEnable eases down → floor falls
+                // toward 0, releasing the cap). Derived: rigidEnable=1 →
+                // floor 0.5; rigidEnable=RIGID_OPEN_BLEND → floor 0.
+                const rigidFloor = Math.max(0, rigidEnable - RIGID_OPEN_BLEND);
+                const t = Math.max(rWeight, rigidFloor);
                 // 1. Tentative render position = interpolated base + the
                 //    decayed collision offset carried from last frame.
                 //    An EXPANDED file is exempt from the rigid pull (nt=0):
@@ -3197,13 +3243,20 @@ export function PixiCanvas({project}: CanvasProps) {
                     // so we don't fight their input.
                     zoomFit = null;
                 },
-                // While the cursor sits over a file, anchor the wheel-
-                // zoom on that file's centre — so the file stays under
-                // the cursor as the user zooms in/out. Returns null for
-                // any non-file hover (or no hover); the wheel handler
-                // then falls back to the default cursor-pivot zoom.
+                // While the cursor sits over a COLLAPSED file icon,
+                // anchor the wheel-zoom on the icon's centre so the
+                // file stays under the cursor as the user zooms in/out
+                // — a small icon would otherwise wander out of reach.
+                // For EXPANDED files the user is hovering specific
+                // content inside the file (a class member, an AST
+                // rect), not the file as a whole; zooming toward the
+                // file's centre would slide the cursor's actual target
+                // off screen, so fall back to the wheel handler's
+                // default cursor-pivot behaviour.
                 getZoomPivot: () => {
                     if (!hoveredHit || hoveredHit.kind !== "file") return null;
+                    const expanded = useGraphStore.getState().expandedFiles.has(hoveredHit.fileId);
+                    if (expanded) return null;
                     const sim = layout.byId.get(hoveredHit.fileId);
                     if (!sim) return null;
                     return {worldX: sim.x, worldY: sim.y};
@@ -3327,8 +3380,8 @@ export function PixiCanvas({project}: CanvasProps) {
             // already expanded only collapses when zoom drops past the LOWER
             // bound, and vice versa. Stops the file flickering open/closed when
             // the user pauses near the threshold.
-            const FILE_EXPAND_AT_MUL = 6;
-            const FILE_COLLAPSE_BELOW_MUL = 5;
+            const FILE_EXPAND_AT_MUL = 3;
+            const FILE_COLLAPSE_BELOW_MUL = 2.5;
             // Per-frame state of the expansion regime, holding through the
             // hysteresis band.
             let expansionRegimeOn = false;
@@ -3367,6 +3420,30 @@ export function PixiCanvas({project}: CanvasProps) {
                 cur.expandFile(fileId);
                 applyExpansionToSim();
                 buildSubtreeLayout(fileId);
+                // Re-centre the camera on the freshly expanded file.
+                // SNAP (not lerp) so a wheel-driven expansion doesn't
+                // get clobbered by the wheel handler's onUserCameraMove,
+                // which fires on EVERY wheel event and clears followId.
+                //
+                // Additionally PIN the file's sim position so the d3
+                // alpha=0.9 rebalance can't push it around — without
+                // this, even a perfectly-centred snap drifts off-screen
+                // over the next few frames as collision forces
+                // reposition the (now-larger) file. Other files still
+                // re-balance freely around the pinned one, which is
+                // exactly what we want: the user's focal point stays
+                // put while neighbours move out of its way. The pin is
+                // released in syncExpansion when the file collapses.
+                const sim = layout.byId.get(fileId);
+                if (sim) {
+                    sim.fx = sim.x;
+                    sim.fy = sim.y;
+                    world.x = app.screen.width / 2 - sim.x * cameraScale;
+                    world.y = app.screen.height / 2 - sim.y * cameraScale;
+                }
+                followId = fileId;
+                followStartAt = 0;
+                followAt = null;
             }
 
             // Reconcile expandedFiles with (selectionSet × zoom). Called each
@@ -3404,6 +3481,14 @@ export function PixiCanvas({project}: CanvasProps) {
                     if (!want.has(id)) {
                         useGraphStore.getState().collapseFile(id);
                         dropSubtreeLayout(id);
+                        // Release the sim pin set when this file was
+                        // expanded — it's a small icon again and the
+                        // layout should treat it like any other.
+                        const sim = layout.byId.get(id);
+                        if (sim) {
+                            sim.fx = null;
+                            sim.fy = null;
+                        }
                         touched = true;
                     }
                 }

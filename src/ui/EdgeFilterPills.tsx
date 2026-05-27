@@ -29,6 +29,8 @@ export function EdgeFilterPills() {
   const tracedPath = useGraphStore((s) => s.tracedPath);
   const showSupportFiles = useGraphStore((s) => s.showSupportFiles);
   const setShowSupportFiles = useGraphStore((s) => s.setShowSupportFiles);
+  const hideUnlinkedAtZoom = useGraphStore((s) => s.hideUnlinkedAtZoom);
+  const setHideUnlinkedAtZoom = useGraphStore((s) => s.setHideUnlinkedAtZoom);
 
   // Hide when no project is open — there are no edges to filter.
   if (!project) return null;
@@ -66,6 +68,17 @@ export function EdgeFilterPills() {
         on={showSupportFiles}
         color={{ bg: '#9aa3a8', text: '#0e1216' }}
         onToggle={() => setShowSupportFiles(!showSupportFiles)}
+      />
+      {/* "isolate" — when on, files outside the selection's focus
+          neighbourhood are HIDDEN (not just dimmed) once the zoom
+          crosses the file-expand threshold. Different colour palette
+          (yellow-green) so it reads as another distinct axis from the
+          edge / support-file filters. */}
+      <Pill
+        label="isolate"
+        on={hideUnlinkedAtZoom}
+        color={{ bg: '#c4d97a', text: '#1a2010' }}
+        onToggle={() => setHideUnlinkedAtZoom(!hideUnlinkedAtZoom)}
       />
       {focusId && (
         <span

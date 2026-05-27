@@ -3,14 +3,39 @@ import type {FileNode, ProjectResponse, SemanticEdge} from "../api/types";
 import type {SimFileNode, SimImportLink} from "./types";
 import {fileLabel, measureMono} from "./labels";
 
+// Width tolerance the shape-check below uses to detect "still
+// circular but width is finishing its ease back to collapsedW". Must
+// be >= the renderer's WIDTH_SNAP (PixiCanvas.tsx) so the two never
+// disagree about when an animation has finished.
+const SHAPE_WIDTH_TOLERANCE = 0.5;
+
+// Is this file currently drawn (and treated by physics) as a circle?
+// True when:
+//   * currently expanded (drawn as a circle, AST contents inside), OR
+//   * animating TOWARD expanded (`targetExpanded` flipped before width
+//     reaches the expanded size), OR
+//   * animating AWAY FROM expanded (`expanded` and `targetExpanded`
+//     have both gone false but `width` is still in flight — the
+//     visible shape is still a shrinking circle).
+// The width tolerance catches the third case without needing yet
+// another boolean.
+export function isCircular(d: SimFileNode): boolean {
+    return (
+        d.expanded === true ||
+        d.targetExpanded === true ||
+        d.width > d.collapsedW + SHAPE_WIDTH_TOLERANCE
+    );
+}
+
 // Collision radius for a file rectangle. Uses ~half the diagonal plus a
 // constant padding so adjacent rects keep visible whitespace between them.
 function collisionRadius(d: SimFileNode): number {
-    // Expanded files render as a CIRCLE (see drawFile in PixiCanvas), with
-    // width === height === diameter. Use the true circular radius rather
-    // than the diagonal-derived value, which would over-allocate by ~55%
-    // and push files unnecessarily far apart.
-    if (d.expanded) return d.width / 2 + 14;
+    // Files that are drawn as circles (expanded steady-state OR mid-
+    // animation in either direction) use the true circular radius —
+    // matches the visible shape. Truly-collapsed files use the
+    // bounding-circle of their rectangular icon, which is snugger
+    // along the long axis (typical file icons are taller than wide).
+    if (isCircular(d)) return d.width / 2 + 14;
     return Math.hypot(d.width, d.height) * 0.55 + 14;
 }
 
@@ -321,7 +346,10 @@ function directoryClusterForce(strength: number) {
 function linkClearanceForce(links: readonly SimImportLink[], strength: number) {
     let nodes: SimFileNode[] = [];
     function force(alpha: number): void {
-        const obstacles = nodes.filter((n) => n.expanded);
+        // Treat both fully-expanded files AND files mid-expand-or-
+        // collapse animation as obstacles, so import lines keep
+        // routing around a circle that's still visibly present.
+        const obstacles = nodes.filter((n) => isCircular(n));
         if (obstacles.length === 0) return;
         for (const link of links) {
             const s = typeof link.source === "string" ? null : link.source;
@@ -554,6 +582,18 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
             collapsedW: cs.w,
             collapsedH: cs.h,
             expanded: false,
+            // Animation targets — start aligned with width/height so
+            // there's nothing to ease toward at init. The renderer's
+            // per-frame size-ease step picks these up after the first
+            // applyExpansion mutates them.
+            targetExpanded: false,
+            targetW: cs.w,
+            targetH: cs.h,
+            // Safe fallback so the collapse animation has a sensible
+            // "from" radius even if a file is collapsed without ever
+            // having opened (degenerate path that shouldn't happen in
+            // practice). First expand overwrites with the real value.
+            lastExpandedTargetW: cs.w,
             x: seedX,
             y: seedY,
             connX: seedX,
@@ -591,7 +631,16 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
                 .distance(linkDistance)
                 .strength(0.3),
         )
-        .force("charge", forceManyBody<SimFileNode>().strength(-650))
+        // distanceMin caps the inverse-square repulsion at close range:
+        // without it, two files that drift within ~10–20 px would feel a
+        // force several hundred times what they feel at the equilibrium
+        // separation, blowing them apart faster than velocityDecay can
+        // damp — the visible "jitter" in dense clusters. Capping at 40
+        // (well below typical collision radii, ~55–65) means the force
+        // is bounded inside the no-overlap shell the collide pass
+        // enforces anyway. The equilibrium positions don't change; the
+        // ringing around them does.
+        .force("charge", forceManyBody<SimFileNode>().strength(-650).distanceMin(40))
         .force("center", forceCenter(0, 0))
         .force("collide", forceCollide<SimFileNode>().radius(collisionRadius).strength(0.95).iterations(2))
         .force("callsX", directionalForce(callEdges, "x", CALLS_X_STRENGTH))
@@ -617,7 +666,16 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
         .force("leashX", forceX<SimFileNode>(0).strength(0.004))
         .force("leashY", forceY<SimFileNode>(0).strength(0.004))
         .alpha(1)
-        .alphaDecay(0.035);
+        .alphaDecay(0.035)
+        // Heavier damping than the d3 default of 0.4. In tight clusters
+        // — where many small-magnitude forces interact each tick — the
+        // default lets velocity accumulate just enough to overshoot the
+        // equilibrium, producing a visible per-frame jitter. 0.55 means
+        // velocity is multiplied by 0.45 each tick (vs the default
+        // 0.60), which reaches equilibrium faster AND with less ringing.
+        // Conservatively below 0.7 so the layout still settles in a
+        // reasonable number of frames after a reheat.
+        .velocityDecay(0.55);
     // Created stopped: the renderer drives .tick() manually so it
     // can restore connectivity positions before each tick and
     // interpolate toward the rigid layout after. With alphaTarget
@@ -643,27 +701,41 @@ export function applyExpansion(layout: FileLayoutResult, expandedFiles: Readonly
     for (const sim of layout.nodes) {
         const wantExpanded = expandedFiles.has(sim.id);
         sim.expanded = wantExpanded; // obstacle flag for the clearance force
+        sim.targetExpanded = wantExpanded;
         // Expanded → its solved exact-fit size (or, while the AST is still
         // loading, fall back to the collapsed size). Collapsed → content size.
         const expanded = wantExpanded ? expandedSizeFor(sim.id) : null;
         const targetW = expanded ? expanded.w : sim.collapsedW;
         const targetH = expanded ? expanded.h : sim.collapsedH;
-        if (sim.width !== targetW || sim.height !== targetH) {
-            sim.width = targetW;
-            sim.height = targetH;
+        // Set TARGETS only — the renderer's per-frame size-ease step
+        // (in stepLayout) animates the actual width/height toward
+        // these and refreshes the d3-force collide/link forces while
+        // sizes are in flight. This keeps the physical (collision)
+        // radius in lock-step with the visual radius, eliminating the
+        // jumpy "neighbours rush in through a still-visible
+        // shrinking circle" effect that the old instantaneous width
+        // mutation produced.
+        if (sim.targetW !== targetW || sim.targetH !== targetH) {
+            sim.targetW = targetW;
+            sim.targetH = targetH;
+            // Remember the expanded target so the collapse animation
+            // has a sensible "from" anchor after targetW resets to
+            // collapsedW. Only update on an actual expand (with a
+            // known expanded size — null while AST is loading).
+            if (wantExpanded && expanded) {
+                sim.lastExpandedTargetW = targetW;
+            }
             changed = true;
         }
     }
     if (!changed) return false;
 
-    layout.simulation.force("collide", forceCollide<SimFileNode>().radius(collisionRadius).strength(0.95).iterations(2));
-    layout.simulation.force(
-        "link",
-        forceLink<SimFileNode, SimImportLink>(layout.links)
-            .id((d) => d.id)
-            .distance(linkDistance)
-            .strength(0.3),
-    );
+    // No force-recreate here. The renderer's stepLayout watches for
+    // width/height changes each frame and refreshes forceCollide and
+    // forceLink while any size is still animating — they have to be
+    // refreshed every animating frame anyway, not just at the toggle
+    // moment.
+    //
     // High alpha so the rebalance is visibly animated rather than a
     // teleport. No .restart() — the sim is driven manually by the
     // renderer's ticker; restart() would re-enable d3's internal
@@ -672,4 +744,26 @@ export function applyExpansion(layout: FileLayoutResult, expandedFiles: Readonly
     // resumes ticking.
     layout.simulation.alpha(0.9);
     return true;
+}
+
+/**
+ * Refresh the d3-force `collide` and `link` forces so they re-read each
+ * node's current `width` / `height`. d3-force caches per-node radii and
+ * link distances when a force is initialized, so any change to the
+ * underlying sizes requires REPLACING the force (which triggers a fresh
+ * init). The renderer's per-frame size-ease loop calls this whenever
+ * any node's size moved this frame.
+ */
+export function refreshSizeForces(layout: FileLayoutResult): void {
+    layout.simulation.force(
+        "collide",
+        forceCollide<SimFileNode>().radius(collisionRadius).strength(0.95).iterations(2),
+    );
+    layout.simulation.force(
+        "link",
+        forceLink<SimFileNode, SimImportLink>(layout.links)
+            .id((d) => d.id)
+            .distance(linkDistance)
+            .strength(0.3),
+    );
 }

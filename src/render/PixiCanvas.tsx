@@ -1,7 +1,7 @@
 import {useEffect, useRef} from "react";
 import {Application, Container, FederatedPointerEvent, Graphics, Text} from "pixi.js";
 import {getFileAst} from "../api/client";
-import {applyExpansion, assignRigidPositions, buildFileLayout, EXPANDED_MAX, EXPANDED_MIN, type FileLayoutResult} from "../graph/layout";
+import {applyExpansion, assignRigidPositions, buildFileLayout, EXPANDED_MAX, EXPANDED_MIN, isCircular, refreshSizeForces, type FileLayoutResult} from "../graph/layout";
 import {AST_LABEL_FONT, astLabelOnScreenFactor, astLabelScale, fileLabel, labelScreenBox, measureMono} from "../graph/labels";
 import {isSupportFile, useGraphStore} from "../graph/store";
 import {layoutAst, type TreemapLayout, type TreemapNode} from "../graph/treemap";
@@ -67,13 +67,13 @@ const OUTLINE_BELOW = 0.5;
 // file must be expanded), so they can come back early too — otherwise
 // they're invisible until an expanded node fills the whole viewport.
 const CALLS_BELOW = 0.5;
-// File-name labels are constant-screen-size 12px text. In dense
-// projects (hundreds of files per directory) they overlap heavily at
-// low zoom. Below this threshold, file labels drop entirely — the
-// directory-hull labels carry the spatial story; zoom in to reveal
-// per-file names. Icons remain visible at every zoom so structure is
-// still readable.
-const FILE_LABEL_BELOW = 0.5;
+// File-name labels and the cluster-hull stroke fade are now gated on
+// `isolateRegimeEnabled()` instead of an absolute zoom — they appear
+// at the same moment the isolate-mode regime kicks in, which is
+// project-fit-relative (cameraScale / fitScale ≥ ISOLATE_AT_MUL).
+// Keeping these three transitions (labels, hull stroke, isolate
+// hiding) co-located gives the user one coherent "you're now in
+// detail mode" zoom landmark instead of three independent ones.
 // Intra-directory edges — imports / calls / extends between two files
 // in the SAME directory — are mostly local plumbing and dense to look
 // at. Below this zoom they're hidden entirely so only cross-directory
@@ -892,6 +892,17 @@ export function PixiCanvas({project}: CanvasProps) {
             // covers the cluster label it overlaps. Shares the same
             // beginFrame/endFrame lifecycle as the main pool.
             const directoryLabelPool = new LabelPool(directoryLabelLayer);
+            // Per-directory eased label position. The raw label centre is
+            // recomputed from the file-hull bbox each frame, so any
+            // residual file movement (overlap-relaxation nudges, sim
+            // ticks below the user's notice) showed up as visible label
+            // jitter — labels are screen-locked text on quiet
+            // backgrounds, so even sub-pixel motion reads. Easing the
+            // rendered position toward the raw bbox centre with the
+            // same 10%/frame low-pass we use for rigidCentre filters
+            // out the high-frequency wobble while still letting the
+            // label track real cluster movement.
+            const directoryLabelCentres = new Map<string, {x: number; y: number}>();
 
             // Active per-pass targets for the SHARED drawing helpers
             // (drawAstNode, drawAstContainer, drawOverlay). The main scene
@@ -1102,6 +1113,17 @@ export function PixiCanvas({project}: CanvasProps) {
                 return parts.slice(0, take).join("/");
             }
 
+            // Set of file ids the renderer is suppressing this frame —
+            // union of support files (when "tests" is off) and isolate-
+            // mode outsiders (when "isolate" is on and selection is
+            // active past the file-expand zoom). Single source of
+            // truth for "this file shouldn't render", consulted by the
+            // file-draw loop AND the cluster helpers below so the
+            // visible files, directory hulls, and edges all agree on
+            // what's on screen. Updated each frame at the top of
+            // draw(); read elsewhere via closure.
+            let frameHiddenFileIds: ReadonlySet<string> | null = null;
+
             // Pick the LARGEST cluster depth whose distinct-group count
             // still fits the current zoom's target window. The target
             // widens as the user zooms IN — more detail allowed. At
@@ -1121,13 +1143,12 @@ export function PixiCanvas({project}: CanvasProps) {
             // a typical React project's nested folders appear without
             // having to zoom most of the way in.
             function chooseClusterDepth(): number {
-                const hideSupport = !useGraphStore.getState().showSupportFiles;
                 const targetMax = Math.max(8, Math.min(40, Math.round(12 + cameraScale * 320)));
                 let chosen = 1;
                 for (let d = 1; d <= 6; d++) {
                     const set = new Set<string>();
                     for (const f of layout.nodes) {
-                        if (hideSupport && supportFileIds.has(f.id)) continue;
+                        if (frameHiddenFileIds && frameHiddenFileIds.has(f.id)) continue;
                         const c = clusterDirOf(f.relativePath, d);
                         if (c) set.add(c);
                     }
@@ -1185,7 +1206,6 @@ export function PixiCanvas({project}: CanvasProps) {
             // zooms, which the user preferred.)
 
             const drawDirectoryBoundaries = (): void => {
-                const hideSupport = !useGraphStore.getState().showSupportFiles;
                 // Same adaptive depth as the super-nodes — at low zoom we
                 // get a small number of broad architectural hulls
                 // ('src/components', 'src/partials'); zooming in resolves to
@@ -1194,7 +1214,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 const depth = chooseClusterDepth();
                 const byDir = new Map<string, SimFileNode[]>();
                 for (const sim of layout.nodes) {
-                    if (hideSupport && supportFileIds.has(sim.id)) continue;
+                    if (frameHiddenFileIds && frameHiddenFileIds.has(sim.id)) continue;
                     const dir = clusterDirOf(sim.relativePath, depth);
                     if (!dir) continue;
                     let list = byDir.get(dir);
@@ -1231,16 +1251,14 @@ export function PixiCanvas({project}: CanvasProps) {
                     // chaos. The cluster + label do the spatial work; the
                     // hull is just a hint.
                     //
-                    // Stroke alpha drops to 0 once we're zoomed in enough
-                    // for file names to appear (FILE_LABEL_BELOW). At that
-                    // point the individual file labels carry the spatial
-                    // story; outlining each cluster on top would compete
-                    // for visual weight and clutter the canvas with
-                    // overlapping borders. The fill is kept (very faint)
-                    // so cluster regions still tint by hue, and the
-                    // hull's bracketed label stays as the cluster's
-                    // anchor.
-                    const strokeAlpha = cameraScale < FILE_LABEL_BELOW ? 0.28 : 0;
+                    // Hull strokes fade out at the same zoom where file
+                    // names start appearing — beyond that point the
+                    // individual file labels carry the spatial story
+                    // and the hull outline would compete for attention.
+                    // Tied to the isolate regime so the cluster
+                    // boundary and the per-file labels switch together
+                    // with shared hysteresis.
+                    const strokeAlpha = isolateRegimeEnabled() ? 0 : 0.28;
                     directoryGfx
                         .closePath()
                         .fill({color: colour, alpha: 0.04})
@@ -1282,10 +1300,24 @@ export function PixiCanvas({project}: CanvasProps) {
                     // position never quite worked: at low zoom the
                     // hull's BOUNDARY_PAD wasn't enough to keep the
                     // shifted label outside the file rect.
+                    const targetX = (minX + maxX) / 2;
+                    const targetY = (minY + maxY) / 2;
+                    let eased = directoryLabelCentres.get(dir);
+                    if (!eased) {
+                        // First time we see this directory (or it just
+                        // reappeared after a depth change) — start at
+                        // the target so the label doesn't fly in from
+                        // wherever the previous eased position was.
+                        eased = {x: targetX, y: targetY};
+                        directoryLabelCentres.set(dir, eased);
+                    } else {
+                        eased.x += (targetX - eased.x) * 0.1;
+                        eased.y += (targetY - eased.y) * 0.1;
+                    }
                     directoryLabelPool.put({
                         text: `[${dir}]`,
-                        worldX: (minX + maxX) / 2,
-                        worldY: (minY + maxY) / 2,
+                        worldX: eased.x,
+                        worldY: eased.y,
                         color: colour,
                         size: 12,
                         anchorX: 0.5,
@@ -1596,6 +1628,74 @@ export function PixiCanvas({project}: CanvasProps) {
                     ? AMBIENT_EMPTY_LIVE_SET
                     : liveFiles;
 
+                // Path-trace lookup: a set of "${a}|${b}" keys for every
+                // CONSECUTIVE pair in state.tracedPath (both directions, so
+                // edge-direction independence is automatic). drawEdges /
+                // drawSemanticEdges check this to thicken and unblock the
+                // path overlay even when focus dimming would otherwise apply.
+                //
+                // Computed BEFORE the hidden-files set so isolate mode can
+                // exempt path-traced files from being hidden.
+                const pathEdgeKeys: Set<string> = new Set();
+                const pathFileSet: Set<string> = new Set();
+                if (state.tracedPath && state.tracedPath.length > 0) {
+                    for (const f of state.tracedPath) pathFileSet.add(f);
+                    for (let i = 0; i < state.tracedPath.length - 1; i++) {
+                        const a = state.tracedPath[i];
+                        const b = state.tracedPath[i + 1];
+                        pathEdgeKeys.add(`${a}|${b}`);
+                        pathEdgeKeys.add(`${b}|${a}`);
+                    }
+                }
+
+                const hideSupport = !state.showSupportFiles;
+                // "Isolate" mode: once the zoom crosses the isolate
+                // threshold AND a selection exists, hide files outside
+                // the focus neighbourhood (selectionSet × focusHops)
+                // entirely. The isolate threshold sits BELOW the file-
+                // expand threshold (ISOLATE_AT_MUL < FILE_EXPAND_AT_MUL)
+                // so the surrounding cluster fades out before the
+                // selected files start expanding — staging the two
+                // visual changes rather than firing them together.
+                // Each regime has its own hysteresis band. Path-traced
+                // files override the hide.
+                const isolateActive =
+                    state.hideUnlinkedAtZoom &&
+                    !ambient &&
+                    liveFiles != null &&
+                    isolateRegimeEnabled();
+                // Set of file ids to suppress completely from rendering
+                // this frame — union of support files (when "tests" is
+                // off) and isolate-mode outsiders (when isolate is
+                // active). Path-traced files are never hidden,
+                // regardless of the other flags.
+                //
+                // Assigned to the IIFE-scoped frameHiddenFileIds so
+                // chooseClusterDepth + drawDirectoryBoundaries (defined
+                // outside draw) see the same hidden set the file loop
+                // and edge passes use. Computed BEFORE chooseClusterDepth
+                // is called so the cluster grouping reflects the
+                // visible file set.
+                frameHiddenFileIds = (() => {
+                    if (!hideSupport && !isolateActive) return null;
+                    const out = new Set<string>();
+                    if (hideSupport) {
+                        for (const id of supportFileIds) out.add(id);
+                    }
+                    if (isolateActive && liveFiles) {
+                        for (const sim of layout.nodes) {
+                            if (
+                                !liveFiles.has(sim.id) &&
+                                !pathFileSet.has(sim.id)
+                            ) {
+                                out.add(sim.id);
+                            }
+                        }
+                    }
+                    return out;
+                })();
+                const hiddenFileIds = frameHiddenFileIds;
+
                 // Active cluster grouping for this frame — drives hulls,
                 // intra-cluster edge gate, AND file-icon coloring so they
                 // all read consistently. At low zoom this is coarse
@@ -1609,23 +1709,6 @@ export function PixiCanvas({project}: CanvasProps) {
                     if (c) fileToActiveCluster.set(sim.id, c);
                 }
 
-                // Path-trace lookup: a set of "${a}|${b}" keys for every
-                // CONSECUTIVE pair in state.tracedPath (both directions, so
-                // edge-direction independence is automatic). drawEdges /
-                // drawSemanticEdges check this to thicken and unblock the
-                // path overlay even when focus dimming would otherwise apply.
-                const pathEdgeKeys: Set<string> = new Set();
-                const pathFileSet: Set<string> = new Set();
-                if (state.tracedPath && state.tracedPath.length > 0) {
-                    for (const f of state.tracedPath) pathFileSet.add(f);
-                    for (let i = 0; i < state.tracedPath.length - 1; i++) {
-                        const a = state.tracedPath[i];
-                        const b = state.tracedPath[i + 1];
-                        pathEdgeKeys.add(`${a}|${b}`);
-                        pathEdgeKeys.add(`${b}|${a}`);
-                    }
-                }
-
                 // Single render path — file icons + adaptive-depth hulls at
                 // every zoom level. The hulls themselves do the architectural
                 // summarisation as the user zooms out (chooseClusterDepth
@@ -1633,8 +1716,6 @@ export function PixiCanvas({project}: CanvasProps) {
                 // super-node "all directories become a circle" mode was too
                 // discrete a tier — the user preferred the smooth depth
                 // ramp.
-                const hideSupport = !state.showSupportFiles;
-                const hideSupportForEdges = hideSupport;
 
                 // 1. Import edges (under rects).
                 if (state.edgeFilter.imports) {
@@ -1648,7 +1729,7 @@ export function PixiCanvas({project}: CanvasProps) {
                         selectionSet,
                         effectiveLiveFiles,
                         pathEdgeKeys,
-                        hideSupportForEdges ? supportFileIds : null,
+                        hiddenFileIds,
                         // Use the ACTIVE cluster grouping (zoom-adaptive depth)
                         // so the intra-cluster edge gate matches what the hulls
                         // group into. Otherwise edges between same-cluster but
@@ -1677,7 +1758,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // drawn through labelPool on a layer that ignores this
                 // multiplier, so file + directory names stay readable.
                 for (const sim of layout.nodes) {
-                    if (hideSupport && supportFileIds.has(sim.id)) continue;
+                    if (hiddenFileIds && hiddenFileIds.has(sim.id)) continue;
                     const dimmed =
                         effectiveLiveFiles != null &&
                         !effectiveLiveFiles.has(sim.id) &&
@@ -1791,7 +1872,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     state.edgeFilter,
                     effectiveLiveFiles,
                     pathEdgeKeys,
-                    hideSupportForEdges ? supportFileIds : null,
+                    hiddenFileIds,
                     // Same active-cluster grouping as drawEdges (above).
                     fileToActiveCluster,
                 );
@@ -1835,12 +1916,14 @@ export function PixiCanvas({project}: CanvasProps) {
                 const labelScale = 1 / cameraScale;
                 const aboveGap = 8 / cameraScale; // screen-constant gap above the node
                 const putName = (topY: number): void => {
-                    // LOD gate: hide individual file names at low zoom so the
-                    // directory-hull labels carry the spatial story. The
+                    // LOD gate: hide individual file names below the
+                    // isolate-regime zoom so the directory-hull labels
+                    // carry the spatial story until the user has zoomed
+                    // in enough to commit to per-file detail. The
                     // SELECTED file AND any currently HOVERED file are
                     // exceptions — they're the user's anchor and the user's
                     // current point of attention; both must stay readable.
-                    if (cameraScale < FILE_LABEL_BELOW && !isSelected && !isHovered) {
+                    if (!isolateRegimeEnabled() && !isSelected && !isHovered) {
                         return;
                     }
                     // Expanded files AND hovered files show the FULL
@@ -1883,31 +1966,74 @@ export function PixiCanvas({project}: CanvasProps) {
                     });
                 };
 
-                // Collapsed files are ALWAYS a small, constant-size "closed file"
-                // icon (a dog-eared page) at every zoom level — never a sized box or
-                // a dot. The filename floats above it.
-                if (!expanded) {
-                    // World-fixed icon size with a screen cap, multiplied by
-                    // popularity. Icons shrink with the world as you zoom
-                    // OUT (so dense clusters stop overlapping themselves),
-                    // but never grow past popFactor × 16×20 screen-px when
-                    // you zoom IN. Popular files (many incoming references)
-                    // get a proportionally larger cap, so architectural hubs
-                    // stand out at every zoom level.
-                    //
-                    // The min(WORLD, SCREEN/cameraScale) formulation:
-                    //   * cameraScale ≤ 1 → world_iw = 16×popFactor (fixed
-                    //     world), so on_screen = 16 × popFactor × cameraScale.
-                    //   * cameraScale > 1 → world_iw = 16×popFactor /
-                    //     cameraScale, so on_screen = 16 × popFactor (capped).
-                    const baseW = 16 * popFactor;
-                    const baseH = 20 * popFactor;
-                    const baseFold = 6 * popFactor;
-                    const iw = Math.min(baseW, baseW / cameraScale);
-                    const ih = Math.min(baseH, baseH / cameraScale);
-                    const fold = Math.min(baseFold, baseFold / cameraScale);
-                    const ix = sim.x - iw / 2;
-                    const iy = sim.y - ih / 2;
+                // Expand/collapse visual progress, DERIVED from the
+                // live sim width. 0 = icon, 1 = full circle + AST.
+                // Width is the single source of truth — d3-force's
+                // collide and link forces use it directly (via
+                // refreshSizeForces in stepLayout), and the renderer
+                // reads it for the circle radius below — so deriving
+                // `t` from the same value guarantees the alpha
+                // crossfade can't drift out of sync with the physical
+                // collision disc.
+                //
+                // For an expanding file, denominator is the in-flight
+                // target. For a collapsing file (targetExpanded false,
+                // width still in flight), denominator is the file's
+                // last-known expanded size, recorded by applyExpansion.
+                // Math.max(1, ...) guards against the degenerate case
+                // where neither has ever been set above collapsedW.
+                const refW = sim.targetExpanded
+                    ? sim.targetW
+                    : sim.lastExpandedTargetW;
+                const tRaw = (sim.width - sim.collapsedW) / Math.max(1, refW - sim.collapsedW);
+                const t = tRaw < 0 ? 0 : tRaw > 1 ? 1 : tRaw;
+
+                // World-fixed icon size with a screen cap, multiplied by
+                // popularity. Icons shrink with the world as you zoom
+                // OUT (so dense clusters stop overlapping themselves),
+                // but never grow past popFactor × 16×20 screen-px when
+                // you zoom IN. Popular files (many incoming references)
+                // get a proportionally larger cap, so architectural hubs
+                // stand out at every zoom level.
+                //
+                // Hoisted above the if/else so the icon-radius can serve
+                // as the FROM endpoint of the icon→circle radius interp
+                // during expansion animation.
+                const baseW = 16 * popFactor;
+                const baseH = 20 * popFactor;
+                const baseFold = 6 * popFactor;
+                const iw = Math.min(baseW, baseW / cameraScale);
+                const ih = Math.min(baseH, baseH / cameraScale);
+                const fold = Math.min(baseFold, baseFold / cameraScale);
+                const ix = sim.x - iw / 2;
+                const iy = sim.y - ih / 2;
+
+                // The icon's bounding-circle radius — what the expanded
+                // circle's radius interpolates UP FROM when t goes 0 → 1
+                // (and DOWN TO when collapsing). Picking the larger of
+                // half-w / half-h keeps the icon fully inside its
+                // bounding circle, so the visual transition is
+                // monotonically growing.
+                const iconR = Math.max(iw, ih) / 2;
+                // `sim.width` is now eased on the sim side itself by
+                // stepLayout (was: instantly reset to collapsedW the
+                // moment a file collapsed, leaving the renderer's
+                // visual ease chasing a dead value via the old
+                // lastExpandedRByFile cache). So `sim.width / 2` is
+                // always the live, accurate "outer" radius — same
+                // value d3-force's collide reads.
+                const fullR = sim.width / 2;
+                // Linear interp; the eased t already provides the
+                // smoothing — adding smoothstep here would compound and
+                // feel rubbery.
+                const animatedR = iconR + (fullR - iconR) * t;
+
+                // 1. ICON — drawn whenever t < 1, fading out as t → 1.
+                //    When the file is fully expanded (t === 1, common case
+                //    after the animation has settled) we skip the icon
+                //    pass entirely.
+                if (t < 1) {
+                    const iconAlpha = (1 - t) * dimAlpha;
                     // Colour the page body by the file's current cluster
                     // (zoom-adaptive — same map the hulls and intra-cluster
                     // edge gate use). The 'strong' variant of the directory
@@ -1919,73 +2045,76 @@ export function PixiCanvas({project}: CanvasProps) {
                     const cluster = fileToActiveCluster.get(sim.id);
                     const dirColour = cluster ? colourForDirectoryStrong(cluster) : COLORS.file;
                     const body = isSelected ? COLORS.fileSelected : dirColour;
-                    // Border in the same hue but darker (muted variant) for a
-                    // subtle outline; selected file gets the standard white
-                    // override.
                     const line = isSelected ? COLORS.fileBorderSelected : cluster ? colourForDirectory(cluster) : COLORS.fileBorder;
-                    // Stroke width also caps at 1 screen-px (same min() shape
-                    // as the icon dimensions — shrink with world below 1:1,
-                    // cap at 1 above).
                     const strokeW = Math.min(1, 1 / cameraScale);
                     worldGfx
                         .poly([ix, iy, ix + iw - fold, iy, ix + iw, iy + fold, ix + iw, iy + ih, ix, iy + ih])
-                        .fill({color: body, alpha: 1 * dimAlpha})
-                        .stroke({color: line, width: strokeW, alpha: 1 * dimAlpha});
+                        .fill({color: body, alpha: iconAlpha})
+                        .stroke({color: line, width: strokeW, alpha: iconAlpha});
                     // The folded corner, slightly distinct so it reads as a page.
-                    worldGfx.poly([ix + iw - fold, iy, ix + iw, iy + fold, ix + iw - fold, iy + fold]).fill({color: line, alpha: 0.6 * dimAlpha});
-                    // Anchor to the ICON's bounds, not the (invisible) sim footprint —
-                    // otherwise connectors terminate in empty space far from the icon,
-                    // and the click target wouldn't match what's drawn.
+                    worldGfx
+                        .poly([ix + iw - fold, iy, ix + iw, iy + fold, ix + iw - fold, iy + fold])
+                        .fill({color: line, alpha: 0.6 * iconAlpha});
+                }
+
+                // 2. CIRCLE — drawn whenever t > 0, fading in and growing
+                //    from icon-radius to fullR. At t === 1 this is the
+                //    only thing rendered (icon path above skipped).
+                if (t > 0) {
+                    const circleAlpha = t * dimAlpha;
+                    worldGfx
+                        .circle(sim.x, sim.y, animatedR)
+                        .fill({color: COLORS.fileExpanded, alpha: 0.7 * circleAlpha});
+                    if (isSelected) {
+                        worldGfx.circle(sim.x, sim.y, animatedR).stroke({
+                            color: COLORS.fileSelected,
+                            width: FILE_RIM / 2,
+                            alpha: circleAlpha,
+                        });
+                    }
+                }
+
+                // 3. Hit rect: pick the shape that's currently MORE
+                //    visible. The cutover at t = 0.5 matches where the
+                //    crossfade also tips over to the circle. The
+                //    circle branch uses the ANIMATED radius (not
+                //    sim.width) so the hit area shrinks/grows with the
+                //    visual during the transition — sim.width has
+                //    already been reset to collapsedW when collapsing,
+                //    so using it would give a tiny hit rect while the
+                //    user still sees a big circle.
+                if (t < 0.5) {
+                    pushRect({id: sim.id, fileId: sim.id, kind: "file", x: ix, y: iy, w: iw, h: ih, area: iw * ih});
+                } else {
+                    const r2 = animatedR;
                     pushRect({
                         id: sim.id,
                         fileId: sim.id,
                         kind: "file",
-                        x: ix,
-                        y: iy,
-                        w: iw,
-                        h: ih,
-                        area: iw * ih,
-                    });
-                    putName(iy);
-                    return;
-                }
-
-                // Expanded files: a translucent CIRCLE encompassing the cluster.
-                // sim.width === sim.height by construction (see ensureExpandedLayout)
-                // so radius = half the footprint. Selection thickens the stroke.
-                const fileRadius = sim.width / 2;
-                worldGfx.circle(sim.x, sim.y, fileRadius).fill({color: COLORS.fileExpanded, alpha: 0.7 * dimAlpha});
-                if (isSelected) {
-                    worldGfx.circle(sim.x, sim.y, fileRadius).stroke({
-                        color: COLORS.fileSelected,
-                        width: FILE_RIM / 2,
-                        alpha: 1 * dimAlpha,
+                        x: sim.x - r2,
+                        y: sim.y - r2,
+                        w: r2 * 2,
+                        h: r2 * 2,
+                        area: r2 * r2 * 4,
                     });
                 }
 
-                // Hit rect is the bounding square of the circle. Two reasons:
-                //   (1) HitRect is an AABB by design — the smallest-area containing
-                //       rect wins, which is the same answer for clicks anywhere on
-                //       the visible circle (and the four "corner" pixels outside the
-                //       circle but inside the square are visually empty, so a click
-                //       there is unambiguously about this file).
-                //   (2) The edge-port logic (callConnector) probes the four edge-
-                //       midpoints of this rect — which sit exactly on the circle
-                //       boundary, so semantic connectors land cleanly.
-                pushRect({
-                    id: sim.id,
-                    fileId: sim.id,
-                    kind: "file",
-                    x,
-                    y,
-                    w: sim.width,
-                    h: sim.height,
-                    area: sim.width * sim.height,
-                });
+                // 4. Name label, positioned just above the currently-
+                //    visible shape. Top of the animated circle is at
+                //    sim.y - animatedR; at t=0 that equals iy, at t=1 it
+                //    equals y, so the label slides smoothly upward as
+                //    the file grows.
+                putName(sim.y - animatedR);
 
-                putName(y);
-
-                if (expanded) {
+                // 5. AST contents — only when fully expanded (t === 1
+                //    after the snap-to-target threshold). Drawing them
+                //    during the transition would be misleading: the
+                //    treemap is sized for fullR, so at smaller radii the
+                //    contents would spill outside the visible circle.
+                //    The brief pop-in at the end of the transition is
+                //    acceptable because by that point the file's circle
+                //    is already at its final size.
+                if (sim.expanded && t >= 1) {
                     let tree = activeTree(sim.id);
                     if (!tree) {
                         buildSubtreeLayout(sim.id);
@@ -2955,15 +3084,103 @@ export function PixiCanvas({project}: CanvasProps) {
             // rate-limited, so a file emerging from under a big box
             // animates out over a few frames instead of teleporting.
             const OVERLAP_PUSH_CAP = 250;
+            // Under-relaxation factor for the Jacobi solver below: each
+            // iteration applies this fraction of the accumulated push.
+            // 0.7 is a standard SOR-style choice — fast enough that 6
+            // iterations resolve simple overlaps to <0.1% residual,
+            // damped enough that infeasible configurations (a small
+            // file squeezed between two overlapping expanded blocks,
+            // for example) stop oscillating per-iteration. Lower values
+            // settle even more smoothly but take longer to push files
+            // out of newly-expanded blocks.
+            const RELAX_DAMP = 0.7;
 
+            // Buffers for the Jacobi solver — sized to layout.nodes.length
+            // at startup. Re-used across frames so we don't allocate in
+            // the hot path.
+            let relaxPushX: Float64Array = new Float64Array(layout.nodes.length);
+            let relaxPushY: Float64Array = new Float64Array(layout.nodes.length);
+
+            // Jacobi-style overlap relaxation. Each iteration:
+            //   1. Accumulate the desired push for every node based on
+            //      CURRENT positions (no in-place writes during the
+            //      sweep).
+            //   2. Apply the accumulated push, scaled by RELAX_DAMP.
+            // The previous Gauss-Seidel version applied each pair's
+            // push immediately, which is fine when overlaps are
+            // resolvable but oscillates when a node is squeezed
+            // between two-or-more obstacles whose constraints can't
+            // all be satisfied: each iteration shoved the node back
+            // and forth as pairs were processed in order. Jacobi sums
+            // opposing pushes so the net movement reflects the
+            // node's REAL escape direction — and is zero (stable!)
+            // when constraints are perfectly antisymmetric, instead
+            // of order-dependent jitter.
             function relaxOverlaps(nodes: SimFileNode[]): boolean {
-                let moved = false;
-                for (let i = 0; i < nodes.length; i++) {
+                const n = nodes.length;
+                // The buffers were sized for the initial node count;
+                // re-grow them if the simulation ever adds nodes.
+                if (relaxPushX.length < n) {
+                    relaxPushX = new Float64Array(n);
+                    relaxPushY = new Float64Array(n);
+                }
+                relaxPushX.fill(0, 0, n);
+                relaxPushY.fill(0, 0, n);
+
+                for (let i = 0; i < n; i++) {
                     const a = nodes[i];
-                    const aHalfW = a.width / 2;
-                    const aHalfH = a.height / 2;
-                    for (let j = i + 1; j < nodes.length; j++) {
+                    for (let j = i + 1; j < n; j++) {
                         const b = nodes[j];
+                        // Expanded files are IMMOVABLE here: the user is
+                        // working INSIDE one, and a shifting expanded file
+                        // makes its small interior nodes impossible to
+                        // click. The other node in the pair absorbs the
+                        // whole separation. Two expanded files: skip — no
+                        // push is useful (both are pinned at sim level).
+                        const aMov = a.expanded ? 0 : 1;
+                        const bMov = b.expanded ? 0 : 1;
+                        const tot = aMov + bMov;
+                        if (tot === 0) continue;
+                        const aShare = aMov / tot;
+                        const bShare = bMov / tot;
+
+                        if (isCircular(a) || isCircular(b)) {
+                            // At least one side is currently drawn as a
+                            // CIRCLE — either fully expanded OR animating
+                            // through an expand/collapse. d3-force's
+                            // collide uses circle-vs-circle in the same
+                            // condition (see collisionRadius in
+                            // layout.ts), so the two systems agree on
+                            // where the boundary is.
+                            const ra = circleRadiusFor(a);
+                            const rb = circleRadiusFor(b);
+                            const dx = b.x - a.x;
+                            const dy = b.y - a.y;
+                            const dist2 = dx * dx + dy * dy;
+                            const minD = ra + rb + OVERLAP_PAD;
+                            if (dist2 >= minD * minD) continue;
+                            // Tiny dist guard so the unit vector is finite
+                            // when two circles are exactly concentric.
+                            const dist = Math.sqrt(dist2) || 0.001;
+                            const sep = minD - dist;
+                            const ux = dx / dist;
+                            const uy = dy / dist;
+                            const am = sep * aShare;
+                            const bm = sep * bShare;
+                            relaxPushX[i] -= ux * am;
+                            relaxPushY[i] -= uy * am;
+                            relaxPushX[j] += ux * bm;
+                            relaxPushY[j] += uy * bm;
+                            continue;
+                        }
+
+                        // Both collapsed: AABB collision is the snugger fit
+                        // for their rectangular visible shape, lets them
+                        // pack tighter than a circular approximation would,
+                        // and there's no expanded-circle corner to worry
+                        // about.
+                        const aHalfW = a.width / 2;
+                        const aHalfH = a.height / 2;
                         const dx = b.x - a.x;
                         const padX = aHalfW + b.width / 2 + OVERLAP_PAD;
                         // Cheap early-out: most pairs are far apart on X.
@@ -2971,43 +3188,58 @@ export function PixiCanvas({project}: CanvasProps) {
                         const dy = b.y - a.y;
                         const padY = aHalfH + b.height / 2 + OVERLAP_PAD;
                         if (dy > padY || dy < -padY) continue;
-                        // Boxes intersect — separate along the axis of least
-                        // penetration so they part the short way.
-                        //
-                        // Expanded files are IMMOVABLE here: the user is
-                        // working INSIDE one, and a shifting expanded file
-                        // makes its small interior nodes impossible to
-                        // click. The other node in the pair absorbs the
-                        // whole separation; two expanded files (rare) fall
-                        // back to an even split.
-                        const aMov = a.expanded ? 0 : 1;
-                        const bMov = b.expanded ? 0 : 1;
-                        const tot = aMov + bMov;
-                        const aShare = tot === 0 ? 0.5 : aMov / tot;
-                        const bShare = tot === 0 ? 0.5 : bMov / tot;
+                        // Separate along the axis of least penetration so
+                        // they part the short way.
                         const ox = padX - Math.abs(dx);
                         const oy = padY - Math.abs(dy);
                         if (ox < oy) {
                             const dir = dx < 0 ? -1 : 1;
-                            let am = ox * aShare;
-                            let bm = ox * bShare;
-                            if (am > OVERLAP_PUSH_CAP) am = OVERLAP_PUSH_CAP;
-                            if (bm > OVERLAP_PUSH_CAP) bm = OVERLAP_PUSH_CAP;
-                            a.x -= dir * am;
-                            b.x += dir * bm;
+                            relaxPushX[i] -= dir * ox * aShare;
+                            relaxPushX[j] += dir * ox * bShare;
                         } else {
                             const dir = dy < 0 ? -1 : 1;
-                            let am = oy * aShare;
-                            let bm = oy * bShare;
-                            if (am > OVERLAP_PUSH_CAP) am = OVERLAP_PUSH_CAP;
-                            if (bm > OVERLAP_PUSH_CAP) bm = OVERLAP_PUSH_CAP;
-                            a.y -= dir * am;
-                            b.y += dir * bm;
+                            relaxPushY[i] -= dir * oy * aShare;
+                            relaxPushY[j] += dir * oy * bShare;
                         }
-                        moved = true;
                     }
                 }
+
+                // Apply accumulated pushes with under-relaxation damping
+                // and a magnitude cap so a deep multi-overlap can't
+                // teleport. The magnitude cap (not per-axis) keeps the
+                // push direction faithful — clipping x and y
+                // independently would bend a diagonal escape into an
+                // axis-aligned one.
+                let moved = false;
+                for (let i = 0; i < n; i++) {
+                    let dx = relaxPushX[i] * RELAX_DAMP;
+                    let dy = relaxPushY[i] * RELAX_DAMP;
+                    if (dx === 0 && dy === 0) continue;
+                    const mag = Math.hypot(dx, dy);
+                    if (mag > OVERLAP_PUSH_CAP) {
+                        const k = OVERLAP_PUSH_CAP / mag;
+                        dx *= k;
+                        dy *= k;
+                    }
+                    nodes[i].x += dx;
+                    nodes[i].y += dy;
+                    moved = true;
+                }
                 return moved;
+            }
+
+            // Collision radius mirroring d3-force's collisionRadius() in
+            // layout.ts. Kept local because it's only called in the
+            // overlap-relaxation hot path and lifting it would mean
+            // crossing the module boundary on every pair. The shape
+            // branch is shared with layout.ts via the `isCircular`
+            // helper so the two systems never disagree about whether a
+            // file is currently a circle or a rectangle (the source of
+            // a previous "stuck in the corner of an expanded block"
+            // jitter bug).
+            function circleRadiusFor(d: SimFileNode): number {
+                if (isCircular(d)) return d.width / 2 + 14;
+                return Math.hypot(d.width, d.height) * 0.55 + 14;
             }
 
             // Fraction of the zoom-derived rigidness still applied while a
@@ -3023,6 +3255,59 @@ export function PixiCanvas({project}: CanvasProps) {
             // toward RIGID_OPEN_BLEND while any file is open.
             let rigidEnable = 1;
 
+            // Centre the rigid folder layout is currently anchored on. The
+            // connectivity layout's centroid drifts slowly as the sim
+            // settles (forceCenter only soft-pulls the centroid toward
+            // 0), so the rigid layout must follow it or the two
+            // diverge. Previously this only re-anchored at the instant
+            // the sim crossed alphaMin — a single-frame snap of every
+            // file's rigidX/rigidY, which (now that t has a floor of
+            // 0.5) showed up as a visible "pop" reorienting the whole
+            // cluster the moment things stopped. Easing rigidCentre
+            // toward connCentre each frame instead distributes that
+            // travel over ~30 frames: while the sim ticks the centre
+            // chases the drifting centroid; once the sim settles the
+            // centre eases the last remaining distance with no abrupt
+            // jump anyone can see.
+            const initialCentre = connCentre();
+            const rigidCentre = {x: initialCentre.x, y: initialCentre.y};
+
+            // Was the sim active (alpha > alphaMin) the previous frame?
+            // Lets stepLayout detect the just-settled transition and run
+            // one-shot cleanup at that moment — currently used to
+            // release any expansion pins once the post-expand rebalance
+            // has finished.
+            let simWasActive = false;
+
+            // How fast each file's actual `width`/`height` ease toward
+            // their targets (set by applyExpansion). Asymmetric:
+            // expansion is snappy (~500 ms), collapse is slower (~1 s)
+            // so the user has more time to register "the thing I was
+            // looking at is going away" — common UX pattern (menus
+            // open fast, close slowly). Math: residual after N frames
+            // is (1 - rate)^N; ~96% complete is residual 0.04, so rate
+            // 0.1 hits that at 30 frames (500 ms @ 60fps), rate 0.05
+            // at 60 frames (1 s @ 60fps).
+            //
+            // Width is the SINGLE source of truth — d3-force's collide
+            // and link forces read it (via collisionRadius /
+            // linkDistance, refreshed each frame by refreshSizeForces
+            // while any size is animating), and drawFile reads it
+            // directly for the rendered circle radius. The previous
+            // design ran a separate per-file `t` map for the visual
+            // alone, which let the visible circle drift out of sync
+            // with d3's collision disc — the source of the jumpy-
+            // collapse complaint. Width-as-truth keeps them aligned.
+            const WIDTH_EASE_OPEN = 0.1;
+            const WIDTH_EASE_CLOSE = 0.05;
+            // Half-pixel snap threshold. Below this difference the
+            // animation is below visible resolution at any zoom, and
+            // we snap to target so future frames can early-exit the
+            // ease step. Must match `SHAPE_WIDTH_TOLERANCE` in
+            // layout.ts so the shape-check helpers agree about when
+            // the animation has finished.
+            const WIDTH_SNAP = 0.5;
+
             // Drives the sim one tick (while it still has energy), then
             // interpolates every node toward the rigid layout and relaxes
             // any resulting overlaps. The sim's forces must compute from
@@ -3035,7 +3320,51 @@ export function PixiCanvas({project}: CanvasProps) {
             // expand/collapse still re-blend cleanly.
             function stepLayout(): void {
                 const sim = layout.simulation;
-                if (sim.alpha() > sim.alphaMin()) {
+
+                // 1. Ease per-file width/height toward their targets.
+                //    Runs BEFORE the sim tick so the tick's forces
+                //    operate on freshly-eased sizes. d3-force caches
+                //    radii / link distances when its forces are
+                //    initialized, so any frame where sizes moved we
+                //    refresh those forces (refreshSizeForces is just a
+                //    pair of `sim.force("collide", ...)` /
+                //    `sim.force("link", ...)` assignments that trigger
+                //    a fresh init on the next tick). The single boolean
+                //    `sizesAnimating` keeps the work O(1) in the steady
+                //    state — outside the brief open/close window the
+                //    loop is one comparison per node, no force churn.
+                let sizesAnimating = false;
+                for (const n of layout.nodes) {
+                    const rate = n.targetW > n.width ? WIDTH_EASE_OPEN : WIDTH_EASE_CLOSE;
+                    if (n.width !== n.targetW) {
+                        n.width += (n.targetW - n.width) * rate;
+                        if (Math.abs(n.targetW - n.width) < WIDTH_SNAP) {
+                            n.width = n.targetW;
+                        } else {
+                            sizesAnimating = true;
+                        }
+                    }
+                    if (n.height !== n.targetH) {
+                        n.height += (n.targetH - n.height) * rate;
+                        if (Math.abs(n.targetH - n.height) < WIDTH_SNAP) {
+                            n.height = n.targetH;
+                        } else {
+                            sizesAnimating = true;
+                        }
+                    }
+                }
+                if (sizesAnimating) {
+                    refreshSizeForces(layout);
+                    // Defensive top-up: applyExpansion's alpha(0.9) bump
+                    // decays over ~3 s and normally covers the ~1 s
+                    // animation, but if anything else mutates targets
+                    // without reheating, keep the sim alive so the
+                    // forces continue applying while sizes change.
+                    if (sim.alpha() <= sim.alphaMin()) sim.alpha(0.05);
+                }
+
+                const simActive = sim.alpha() > sim.alphaMin();
+                if (simActive) {
                     for (const n of layout.nodes) {
                         n.x = n.connX;
                         n.y = n.connY;
@@ -3045,12 +3374,42 @@ export function PixiCanvas({project}: CanvasProps) {
                         n.connX = n.x;
                         n.connY = n.y;
                     }
-                    if (sim.alpha() <= sim.alphaMin()) {
-                        // Sim just settled — re-anchor the rigid layout on the
-                        // FINAL connectivity centroid so the two stay co-located.
-                        assignRigidPositions(layout, connCentre());
+                } else if (simWasActive) {
+                    // Sim just settled this frame. Release any pins that
+                    // were holding expanded files in place during the
+                    // post-expand rebalance — the rebalance has finished,
+                    // the file is where it ended up, and keeping it
+                    // pinned would block the next expansion / collide
+                    // pass from pushing it out of the new file's way.
+                    // (See expandFileForSelection — pins are designed to
+                    // be transient.)
+                    for (const n of layout.nodes) {
+                        if (n.expanded && n.fx != null) {
+                            n.fx = null;
+                            n.fy = null;
+                        }
                     }
                 }
+                simWasActive = simActive;
+
+                // (The previous per-file `t` ease was here — replaced
+                // by the width-ease step at the top of stepLayout.
+                // drawFile now derives its visual `t` from
+                // (width - collapsedW) / (lastExpandedTargetW -
+                // collapsedW), so width is the single source of truth
+                // for both the rendered circle radius and the
+                // icon/circle alpha crossfade.)
+
+                // Ease rigidCentre toward the current connectivity centroid
+                // and re-anchor the rigid layout each frame. The easing
+                // rate is low enough that per-tick centroid jitter (while
+                // the sim is settling) is filtered out, and once the sim
+                // is settled (centroid static) the centre converges to it
+                // in ~30 frames — well within "noticed but not jarring."
+                const targetCentre = connCentre();
+                rigidCentre.x += (targetCentre.x - rigidCentre.x) * 0.1;
+                rigidCentre.y += (targetCentre.y - rigidCentre.y) * 0.1;
+                assignRigidPositions(layout, rigidCentre);
                 // Ease rigidEnable toward RIGID_OPEN_BLEND while any file is
                 // open, back to 1 when none are. 0.08/frame ≈ a ~0.4s fade —
                 // slow enough to read as a transition, fast enough not to drag.
@@ -3409,15 +3768,33 @@ export function PixiCanvas({project}: CanvasProps) {
             // the user pauses near the threshold.
             const FILE_EXPAND_AT_MUL = 3;
             const FILE_COLLAPSE_BELOW_MUL = 2.5;
-            // Per-frame state of the expansion regime, holding through the
+            // Isolation kicks in BEFORE expansion — at a lower zoom — so
+            // the user sees the surrounding cluster fade out before the
+            // selected files start expanding into their AST view. Gives
+            // the eye a moment to settle on what's about to be the
+            // focus instead of two large visual changes (hide + grow)
+            // happening simultaneously. Own hysteresis band, narrower
+            // than expansion's because the isolate transition is less
+            // dramatic and the user doesn't need as much dead-zone.
+            const ISOLATE_AT_MUL = 2;
+            const ISOLATE_BELOW_MUL = 1.7;
+            // Per-frame state of each regime, holding through its
             // hysteresis band.
             let expansionRegimeOn = false;
+            let isolateRegimeOn = false;
 
             function selectionExpansionEnabled(): boolean {
                 const ratio = cameraScale / Math.max(fitScale, 1e-4);
                 if (ratio >= FILE_EXPAND_AT_MUL) expansionRegimeOn = true;
                 else if (ratio < FILE_COLLAPSE_BELOW_MUL) expansionRegimeOn = false;
                 return expansionRegimeOn;
+            }
+
+            function isolateRegimeEnabled(): boolean {
+                const ratio = cameraScale / Math.max(fitScale, 1e-4);
+                if (ratio >= ISOLATE_AT_MUL) isolateRegimeOn = true;
+                else if (ratio < ISOLATE_BELOW_MUL) isolateRegimeOn = false;
+                return isolateRegimeOn;
             }
 
             // Expand a single file: fetch its AST if we don't have it, then
@@ -3445,6 +3822,21 @@ export function PixiCanvas({project}: CanvasProps) {
                 const cur = useGraphStore.getState();
                 if (cur.expandedFiles.has(fileId)) return;
                 cur.expandFile(fileId);
+                // RELEASE any pins on previously-expanded files. Pins
+                // are a transient "hold this file still during the
+                // post-expand alpha rebalance" device — leaving them
+                // set across multiple expansions stops d3-force from
+                // separating expanded circles that overlap, so the
+                // user sees two-or-three big blue rings stacked on top
+                // of each other. Releasing the prior pins lets the
+                // freshly-expanded file's alpha=0.9 reheat push the
+                // older ones out of its way as it claims its position.
+                for (const n of layout.nodes) {
+                    if (n.id !== fileId && n.expanded) {
+                        n.fx = null;
+                        n.fy = null;
+                    }
+                }
                 applyExpansionToSim();
                 buildSubtreeLayout(fileId);
                 // Re-centre the camera on the freshly expanded file.
@@ -3460,7 +3852,8 @@ export function PixiCanvas({project}: CanvasProps) {
                 // re-balance freely around the pinned one, which is
                 // exactly what we want: the user's focal point stays
                 // put while neighbours move out of its way. The pin is
-                // released in syncExpansion when the file collapses.
+                // released when the sim next settles (see stepLayout)
+                // or when the file is collapsed (see syncExpansion).
                 const sim = layout.byId.get(fileId);
                 if (sim) {
                     sim.fx = sim.x;
@@ -3686,10 +4079,16 @@ function drawEdges(
             }
         }
 
-        // Target point: clip to circle if expanded.
+        // Target point: clip to the circle whenever the target is
+        // currently drawn as one (expanded OR animating). Using
+        // `isCircular` instead of just `expanded` keeps the line end
+        // pinned to the visible boundary throughout a collapse — without
+        // this, the line would un-clip the moment `expanded` flips and
+        // shoot to the (still off-centre) sim coords inside the
+        // still-visible shrinking circle.
         let tx = t.x;
         let ty = t.y;
-        if (t.expanded) {
+        if (isCircular(t)) {
             const r = t.width / 2;
             const dx = tx - sx;
             const dy = ty - sy;

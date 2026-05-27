@@ -47,8 +47,34 @@ export interface SimFileNode {
   collapsedW: number;
   collapsedH: number;
   // True while this file is open (drawn as a big box) — used by the
-  // link-clearance force to treat it as an obstacle.
+  // link-clearance force to treat it as an obstacle. Resolved CURRENT
+  // state: flips immediately when the user clicks, gates AST-content
+  // drawing, overlay hit-testing, and the linkClearanceForce obstacle
+  // filter.
   expanded?: boolean;
+  // What `expanded` is BECOMING. Stays in sync with `expanded` after
+  // any transition has been REQUESTED — used by the shape-check
+  // helpers so a file that is animating its width can still be
+  // treated as a circle by the force / overlap-relaxation passes.
+  // Conceptually: `expanded` answers "what does the user see right
+  // now?" while `targetExpanded` answers "what is the geometry
+  // animating toward?". On collapse the two agree (both false) but
+  // `width` is still in flight, so the width-tolerance fallback in
+  // the isCircular helper catches that case too.
+  targetExpanded?: boolean;
+  // The size `width` / `height` are easing toward. `applyExpansion`
+  // sets these; `stepLayout` in the renderer eases the actual
+  // `width` / `height` each frame and refreshes the d3-force
+  // `collide` / `link` forces while sizes are still in flight.
+  targetW: number;
+  targetH: number;
+  // The expanded-state target width the LAST time this file was open.
+  // The collapse animation interpolates from this value back down to
+  // `collapsedW`, so the visual `t` (alpha crossfade, animated
+  // radius) needs a "from" anchor that survives `targetW` being
+  // reset to `collapsedW` on collapse. Initialised to `collapsedW`
+  // as a safe fallback.
+  lastExpandedTargetW: number;
   relativePath: string;
 }
 

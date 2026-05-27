@@ -73,15 +73,29 @@ export interface GraphStore {
   // by count in a React project and dominate the visual without
   // adding to the architectural story.
   showSupportFiles: boolean;
-  // When true, once the zoom has crossed the file-expand threshold
-  // AND there is a non-empty selection, files OUTSIDE the focus
-  // neighbourhood (selectionSet × focusHops, the same set the
-  // dimming uses) are hidden entirely rather than rendered at low
-  // alpha. Lets the user drill into a feature and see ONLY the
-  // files that participate in it without the surrounding cluster
-  // competing for attention. Defaults to true — the workflow this
-  // supports (zoom + select to isolate) is the common case.
-  hideUnlinkedAtZoom: boolean;
+  // "Isolate" mode is split into two direction toggles. Once the
+  // zoom has crossed the file-expand threshold AND there is a
+  // non-empty selection, files OUTSIDE the focus neighbourhood are
+  // hidden entirely rather than rendered at low alpha. The two
+  // toggles control which DIRECTIONS the BFS from the selection
+  // follows when computing that neighbourhood:
+  //
+  //   isolateImports — include files the selection IMPORTS (the
+  //     BFS follows outgoing edges from the seed: "what this depends
+  //     on"). Answers "what does this need?".
+  //
+  //   isolateExports — include files that import (depend on) the
+  //     selection (the BFS follows incoming edges: "what depends on
+  //     this"). Answers "where is this used?".
+  //
+  // Both default to true (bidirectional reach = the original
+  // isolate behaviour). With only one on, the user gets a
+  // directional lens: outgoing-only is a dependency drill-down,
+  // incoming-only is impact analysis. With BOTH off the isolate
+  // behaviour is disabled and the dim path takes over (everything
+  // visible at low alpha).
+  isolateImports: boolean;
+  isolateExports: boolean;
   setProject: (p: ProjectResponse | null) => void;
   refreshProject: (p: ProjectResponse) => void;
   setSelection: (id: string | null) => void;
@@ -109,7 +123,8 @@ export interface GraphStore {
   setFocusDirection: (d: 'both' | 'in' | 'out') => void;
   setTracedPath: (ids: readonly string[] | null) => void;
   setShowSupportFiles: (show: boolean) => void;
-  setHideUnlinkedAtZoom: (hide: boolean) => void;
+  setIsolateImports: (on: boolean) => void;
+  setIsolateExports: (on: boolean) => void;
 }
 
 const ALL_EDGES_ON: EdgeFilter = { imports: true, calls: true, extends: true };
@@ -129,7 +144,8 @@ export const useGraphStore = create<GraphStore>((set) => ({
   focusDirection: 'both',
   tracedPath: null,
   showSupportFiles: false,
-  hideUnlinkedAtZoom: true,
+  isolateImports: true,
+  isolateExports: true,
   setProject: (project) =>
     set((s) => ({
       project,
@@ -145,10 +161,12 @@ export const useGraphStore = create<GraphStore>((set) => ({
       tracedPath: null,
       // Keep the user's support-file preference across project
       // switches — it's a "how I like to look at code" setting,
-      // not a per-project one. hideUnlinkedAtZoom is treated the
-      // same way (UX preference, not project-scoped state).
+      // not a per-project one. The two isolate direction toggles
+      // are treated the same way (UX preference, not project-
+      // scoped state).
       showSupportFiles: s.showSupportFiles,
-      hideUnlinkedAtZoom: s.hideUnlinkedAtZoom,
+      isolateImports: s.isolateImports,
+      isolateExports: s.isolateExports,
     })),
   // Used after a filesystem-driven re-walk: file-level identity is stable so
   // we keep expansion state, but AST node IDs may have shifted (sequential
@@ -241,7 +259,8 @@ export const useGraphStore = create<GraphStore>((set) => ({
   setFocusDirection: (focusDirection) => set({ focusDirection }),
   setTracedPath: (tracedPath) => set({ tracedPath }),
   setShowSupportFiles: (showSupportFiles) => set({ showSupportFiles }),
-  setHideUnlinkedAtZoom: (hideUnlinkedAtZoom) => set({ hideUnlinkedAtZoom }),
+  setIsolateImports: (isolateImports) => set({ isolateImports }),
+  setIsolateExports: (isolateExports) => set({ isolateExports }),
 }));
 
 // Test / story / spec / __tests__ / __mocks__: typically the majority

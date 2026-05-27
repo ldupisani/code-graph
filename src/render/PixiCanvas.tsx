@@ -1353,24 +1353,27 @@ export function PixiCanvas({project}: CanvasProps) {
                 }
                 const visited = new Set<string>(seeds);
                 let frontier: string[] = [...seeds];
-                // The hop BFS is always bi-directional — both incoming
-                // edges (this file's importers / callers) and outgoing
-                // edges (what this file imports / calls) extend the
-                // neighbourhood. Direction is conveyed at the EDGE level
-                // via colour now (yellow = outgoing from selection, blue
-                // = incoming), so the BFS doesn't need a directional
-                // toggle. focusDirection in the store is no longer
-                // consulted; the field is kept for any future re-binding.
+                // BFS direction is gated by the two isolate toggles:
+                //   isolateImports → follow OUT edges  ("what does this
+                //     depend on?" — outgoing imports/calls/extends).
+                //   isolateExports → follow IN edges   ("what depends
+                //     on this?" — incoming consumers).
+                // Both default ON for the original bidirectional reach.
+                // With neither on, the BFS still runs but expands
+                // nothing — only the seeds themselves stay live, and
+                // (later) the isolate-active check turns isolate off
+                // anyway so this branch isn't usually exercised.
+                const followOut = st.isolateImports;
+                const followIn = st.isolateExports;
                 for (let hop = 0; hop < st.focusHops; hop++) {
                     const next: string[] = [];
                     for (const node of frontier) {
                         for (const kind of ["imports", "calls", "extends"] as const) {
                             if (!st.edgeFilter[kind]) continue;
                             const b = fileEdgesByKind[kind];
-                            const buckets: (Set<string> | undefined)[] = [
-                                b.in.get(node),
-                                b.out.get(node),
-                            ];
+                            const buckets: (Set<string> | undefined)[] = [];
+                            if (followIn) buckets.push(b.in.get(node));
+                            if (followOut) buckets.push(b.out.get(node));
                             for (const set of buckets) {
                                 if (!set) continue;
                                 for (const n of set) {
@@ -1389,7 +1392,7 @@ export function PixiCanvas({project}: CanvasProps) {
             };
             const maybeRecomputeLiveFiles = (): void => {
                 const st = useGraphStore.getState();
-                const key = `${st.focusHops}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}`;
+                const key = `${st.focusHops}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}|${st.isolateImports}|${st.isolateExports}`;
                 if (
                     st.selectionSet === liveFilesSelectionRef &&
                     key === liveFilesKey
@@ -1660,7 +1663,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // Each regime has its own hysteresis band. Path-traced
                 // files override the hide.
                 const isolateActive =
-                    state.hideUnlinkedAtZoom &&
+                    (state.isolateImports || state.isolateExports) &&
                     !ambient &&
                     liveFiles != null &&
                     isolateRegimeEnabled();
@@ -3354,17 +3357,31 @@ export function PixiCanvas({project}: CanvasProps) {
                     }
                 }
                 if (sizesAnimating) {
+                    // Refresh d3's cached radii / link distances even
+                    // though we won't tick this frame — applyExpansion's
+                    // alpha bump survives the freeze, and the FIRST tick
+                    // after sizes settle must see the final widths so
+                    // the rebalance pushes neighbours into their new
+                    // resting positions. Refreshing every frame during
+                    // animation is also the simplest way to guarantee
+                    // the snap-frame's tick (which DOES run, since
+                    // sizesAnimating goes false that frame) uses fresh
+                    // values.
                     refreshSizeForces(layout);
-                    // Defensive top-up: applyExpansion's alpha(0.9) bump
-                    // decays over ~3 s and normally covers the ~1 s
-                    // animation, but if anything else mutates targets
-                    // without reheating, keep the sim alive so the
-                    // forces continue applying while sizes change.
-                    if (sim.alpha() <= sim.alphaMin()) sim.alpha(0.05);
                 }
 
+                // FREEZE positions during the size animation. The
+                // expand/collapse motion is meant to read as a pure
+                // size change in place — letting d3-force's tick and
+                // the overlap-relaxation pass move neighbours WHILE
+                // the size is changing adds visual noise (files
+                // drifting AS the focal file grows / shrinks). Instead
+                // we hold every position still during the animation
+                // and let the post-animation tick burst (alpha didn't
+                // decay during the freeze, so it's still ~0.9) do the
+                // rebalance in one clean phase.
                 const simActive = sim.alpha() > sim.alphaMin();
-                if (simActive) {
+                if (simActive && !sizesAnimating) {
                     for (const n of layout.nodes) {
                         n.x = n.connX;
                         n.y = n.connY;
@@ -3374,7 +3391,7 @@ export function PixiCanvas({project}: CanvasProps) {
                         n.connX = n.x;
                         n.connY = n.y;
                     }
-                } else if (simWasActive) {
+                } else if (simWasActive && !sizesAnimating) {
                     // Sim just settled this frame. Release any pins that
                     // were holding expanded files in place during the
                     // post-expand rebalance — the rebalance has finished,
@@ -3432,32 +3449,76 @@ export function PixiCanvas({project}: CanvasProps) {
                 // since RIGID_OPEN_BLEND === RIGID_FLOOR).
                 const RIGID_FLOOR = 0.5;
                 const t = Math.max(rWeight, RIGID_FLOOR);
+                // Per-file rigid-blend factor `nt`, by file state:
+                //
+                //   * Expanded (or animating TOWARD expanded): nt=0.
+                //     The file renders at its connectivity position
+                //     (connX) so a click on it lands on the right
+                //     thing, and so its interior AST nodes are
+                //     reliably positioned. expandFileForSelection
+                //     aligns connX/offX with the rendered position at
+                //     click time, so flipping nt from t to 0 doesn't
+                //     move the file — the formula produces sim.x with
+                //     or without the rigid term, since connX IS sim.x
+                //     at that moment.
+                //
+                //   * Collapsing (animating AWAY from expanded): the
+                //     bias eases from 1 (fully expanded) to 0 (fully
+                //     collapsed) over the shrink animation, and we
+                //     blend (1 - bias) × t. nt smoothly eases from 0
+                //     to t, so the file's position transitions from
+                //     connX (its expanded resting place) to connX +
+                //     lerp×t (the rigid-blended collapsed position)
+                //     — a "going home to the cluster" motion that
+                //     reads naturally to the user.
+                //
+                //   * Collapsed steady state: targetExpanded=false,
+                //     bias=0, nt = (1-0)×t = t. Full rigid blend.
+                //
+                // The asymmetry mirrors UX intent: expanding is "stay
+                // where the user is looking", collapsing is "drift
+                // back to natural cluster position".
+                function biasFor(n: SimFileNode): number {
+                    const refW = n.targetExpanded ? n.targetW : n.lastExpandedTargetW;
+                    const raw = (n.width - n.collapsedW) / Math.max(1, refW - n.collapsedW);
+                    return raw < 0 ? 0 : raw > 1 ? 1 : raw;
+                }
+                function ntFor(n: SimFileNode): number {
+                    if (n.targetExpanded) return 0;
+                    return (1 - biasFor(n)) * t;
+                }
+
                 // 1. Tentative render position = interpolated base + the
                 //    decayed collision offset carried from last frame.
-                //    An EXPANDED file is exempt from the rigid pull (nt=0):
-                //    it renders at its stable connectivity position so the
-                //    user can reliably click the nodes inside it. The rigid
-                //    blend would otherwise drag the open file toward its
-                //    folder cell every frame — a moving target. Other files
-                //    still interpolate, so the surrounding folder structure
-                //    is preserved (the RIGID_OPEN_BLEND intent).
                 for (const n of layout.nodes) {
                     n.offX *= OVERLAP_DECAY;
                     n.offY *= OVERLAP_DECAY;
-                    const nt = n.expanded ? 0 : t;
+                    const nt = ntFor(n);
                     n.x = n.connX + (n.rigidX - n.connX) * nt + n.offX;
                     n.y = n.connY + (n.rigidY - n.connY) * nt + n.offY;
                 }
-                // 2. Relax overlaps — early-exit once a pass moves nothing.
-                for (let i = 0; i < OVERLAP_ITERS; i++) {
-                    if (!relaxOverlaps(layout.nodes)) break;
+                // 2. Relax overlaps — early-exit once a pass moves
+                //    nothing. Skipped while sizes are animating: the
+                //    expanding file's growing radius would otherwise
+                //    push neighbours out during the animation, while
+                //    we want the freeze to read as a pure-in-place
+                //    size change. Brief visual overlap is acceptable;
+                //    the post-animation sim tick (alpha didn't decay
+                //    during the freeze) immediately resolves it.
+                if (!sizesAnimating) {
+                    for (let i = 0; i < OVERLAP_ITERS; i++) {
+                        if (!relaxOverlaps(layout.nodes)) break;
+                    }
                 }
                 // 3. Record net displacement from the interpolated base as
                 //    the new offset (carried, decayed, into the next frame).
-                //    Same nt-exemption as step 1 so an expanded file's
-                //    offset is measured against connX, not its rigid cell.
+                //    Same per-file `ntFor` as step 1 so the offset is
+                //    measured against the same blend the renderer
+                //    produced — keeps relaxation pushes from being
+                //    mis-recorded against the "wrong" base when a file
+                //    is mid-collapse animation.
                 for (const n of layout.nodes) {
-                    const nt = n.expanded ? 0 : t;
+                    const nt = ntFor(n);
                     n.offX = n.x - (n.connX + (n.rigidX - n.connX) * nt);
                     n.offY = n.y - (n.connY + (n.rigidY - n.connY) * nt);
                 }
@@ -3858,8 +3919,29 @@ export function PixiCanvas({project}: CanvasProps) {
                 if (sim) {
                     sim.fx = sim.x;
                     sim.fy = sim.y;
-                    world.x = app.screen.width / 2 - sim.x * cameraScale;
-                    world.y = app.screen.height / 2 - sim.y * cameraScale;
+                    // Critical: align connX/connY (and zero offX/offY)
+                    // with the pinned position. The pin (sim.fx) only
+                    // takes effect when d3-force ticks — which is
+                    // PRECISELY what's skipped during the size
+                    // animation freeze. The per-frame interpolation
+                    // formula reads `connX`, not `fx`. Without this
+                    // alignment, `connX` stays at its pre-click value
+                    // (the pure connectivity position, NOT the
+                    // user's focal point); as the per-file bias eases
+                    // from 0 → 1 the formula `n.x = connX + lerp ×
+                    // (1−bias) × t + offX` drifts the file from P
+                    // (rendered position) toward connX over the
+                    // animation, and the first post-animation tick
+                    // then yanks it back to fx — the visible "file
+                    // hops to a different spot during expansion, then
+                    // pops back when the animation ends" effect.
+                    // Snapping connX = sim.x means the formula
+                    // produces sim.x throughout the animation, with
+                    // or without bias.
+                    sim.connX = sim.x;
+                    sim.connY = sim.y;
+                    sim.offX = 0;
+                    sim.offY = 0;
                 }
                 followId = fileId;
                 followStartAt = 0;

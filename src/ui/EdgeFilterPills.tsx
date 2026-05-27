@@ -29,8 +29,10 @@ export function EdgeFilterPills() {
   const tracedPath = useGraphStore((s) => s.tracedPath);
   const showSupportFiles = useGraphStore((s) => s.showSupportFiles);
   const setShowSupportFiles = useGraphStore((s) => s.setShowSupportFiles);
-  const hideUnlinkedAtZoom = useGraphStore((s) => s.hideUnlinkedAtZoom);
-  const setHideUnlinkedAtZoom = useGraphStore((s) => s.setHideUnlinkedAtZoom);
+  const isolateImports = useGraphStore((s) => s.isolateImports);
+  const isolateExports = useGraphStore((s) => s.isolateExports);
+  const setIsolateImports = useGraphStore((s) => s.setIsolateImports);
+  const setIsolateExports = useGraphStore((s) => s.setIsolateExports);
 
   // Hide when no project is open — there are no edges to filter.
   if (!project) return null;
@@ -69,16 +71,32 @@ export function EdgeFilterPills() {
         color={{ bg: '#9aa3a8', text: '#0e1216' }}
         onToggle={() => setShowSupportFiles(!showSupportFiles)}
       />
-      {/* "isolate" — when on, files outside the selection's focus
-          neighbourhood are HIDDEN (not just dimmed) once the zoom
-          crosses the file-expand threshold. Different colour palette
-          (yellow-green) so it reads as another distinct axis from the
-          edge / support-file filters. */}
+      {/* Isolate-mode direction toggles. When EITHER is on AND the
+          zoom has crossed the file-expand threshold AND there's a
+          selection, files outside the BFS neighbourhood are HIDDEN
+          (not just dimmed). The two toggles independently gate the
+          BFS direction:
+            ↓ imports — follow outgoing edges (this depends on…)
+            ↑ exports — follow incoming edges (…depends on this)
+          Colours match the directional EDGE colours from
+          COLORS.edgeImporting (yellow) / COLORS.edgeImported (blue)
+          in PixiCanvas.tsx so the pill that includes "files this
+          imports" reads in the same hue as the import lines drawn
+          OUT of a selected file, and likewise for exports/imported-
+          by lines. Arrow prefixes differentiate visually from the
+          "imports" edge-kind pill earlier in the row (which controls
+          whether import LINES are drawn at all). */}
       <Pill
-        label="isolate"
-        on={hideUnlinkedAtZoom}
-        color={{ bg: '#c4d97a', text: '#1a2010' }}
-        onToggle={() => setHideUnlinkedAtZoom(!hideUnlinkedAtZoom)}
+        label="↓ imports"
+        on={isolateImports}
+        color={{ bg: '#e8c84a', text: '#1c1c08' }}
+        onToggle={() => setIsolateImports(!isolateImports)}
+      />
+      <Pill
+        label="↑ exports"
+        on={isolateExports}
+        color={{ bg: '#6cb6ff', text: '#0e1a30' }}
+        onToggle={() => setIsolateExports(!isolateExports)}
       />
       {focusId && (
         <span

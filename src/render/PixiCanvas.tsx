@@ -169,7 +169,10 @@ const SYNTAX_KIND_LABELS: Record<string, string> = {
     // do (object form is expandable; array form just gets a label).
     ObjectBindingPattern: "{}",
     ArrayBindingPattern: "[]",
-    ImportDeclaration: "import",
+    // ImportDeclaration intentionally has NO label here — the imported
+    // names already convey "this is an import" visually, and the
+    // background tint (see KIND_FILL_TINT below) signals the kind.
+    // Adding "import" as a header just duplicates information.
     ExportDeclaration: "export",
     ImportClause: "imports",
     NamedImports: "named",
@@ -263,6 +266,17 @@ const KIND_OUTLINE: Record<string, number> = {
     // continuity. Click to drill into members.
     InterfaceDeclaration: COLORS.astOutlineAbstract,
     TypeAliasDeclaration: COLORS.astOutlineAbstract,
+    // Classes share the green with interfaces / type aliases — same
+    // colour the EXPANDED class circle uses (see `classOutline` below
+    // in drawAstNode). Visual continuity across the collapsed-cell ↔
+    // expanded-circle toggle.
+    ClassDeclaration: COLORS.astOutlineAbstract,
+    // Top-level `const/let/var x = ...` statements collapse to a
+    // single labelled cell. Yellow matches the object/array brace
+    // colour since most non-trivial top-level vars are object or
+    // array initializers — the colour signals "value-bearing
+    // container, click to drill in" the same way the brace cells do.
+    VariableStatement: COLORS.astOutlineObject,
     // JSX wrappers — `<Foo>…</Foo>` and `<>…</>`. The expandable cell
     // shows the tag in its collapsed leaf; clicking spawns an overlay
     // with the opening tag (and its attributes), children, and closing
@@ -284,6 +298,55 @@ const KIND_OUTLINE: Record<string, number> = {
     TryStatement: COLORS.astOutlineControl,
 };
 
+// Per-kind background tint applied to the AST cell's fill. Each entry
+// gets BLENDED with the normal depth-derived fill so the kind reads at
+// a glance from the background hue alone — no extra label needed. The
+// number is a target colour; `blend` is the proportion (0–1) mixed
+// with the base fill.
+const KIND_FILL_TINT: Record<string, {color: number; blend: number}> = {
+    // Imports get a slight blue wash — same hue family as the
+    // edgeImported blue used for incoming-import lines, so a block
+    // labelled with imported names + a blue background reads as
+    // "this brings stuff in" at a glance, replacing the previous
+    // explicit "import" header label.
+    ImportDeclaration: {color: 0x4a6ac5, blend: 0.35},
+};
+
+// Exported nodes (anything carrying `exported = true`, plus the
+// dedicated ExportDeclaration / ExportAssignment statements) get a
+// SEMI-TRANSPARENT amber-tinted background. Three reasons:
+//
+//   * Amber matches the directional language: imports are blue
+//     (something coming IN to this file), exports are amber
+//     (something going OUT from this file).
+//   * The tint signals "this rect is part of the module's public
+//     surface" without an explicit text label.
+//   * The reduced alpha (vs DEFAULT_FILL_ALPHA) lets the file's
+//     circle boundary show THROUGH the part of the rect that sits
+//     on the boundary — so the user can see the rect IS on the
+//     boundary instead of the rect's opaque fill hiding that
+//     geometry. Makes "exports sit on the boundary" visible at a
+//     glance even when the cell straddles the edge.
+const EXPORT_FILL_COLOR = 0xc59a4a;
+const EXPORT_FILL_BLEND = 0.35;
+const EXPORT_FILL_ALPHA = 0.6;
+const DEFAULT_FILL_ALPHA = 0.92;
+
+// Mix `base` with `tint` by `t` (0 = base, 1 = tint). Used to apply
+// KIND_FILL_TINT entries on top of the depth-derived fill.
+function blendColor(base: number, tint: number, t: number): number {
+    const br = (base >> 16) & 0xff;
+    const bg = (base >> 8) & 0xff;
+    const bb = base & 0xff;
+    const tr = (tint >> 16) & 0xff;
+    const tg = (tint >> 8) & 0xff;
+    const tb = tint & 0xff;
+    const r = Math.round(br * (1 - t) + tr * t);
+    const g = Math.round(bg * (1 - t) + tg * t);
+    const b = Math.round(bb * (1 - t) + tb * t);
+    return (r << 16) | (g << 8) | b;
+}
+
 // A node is "significant" — worth its own box, never collapsed as a
 // pass-through — if it shows a label OR carries a kind outline. (A magenta
 // `block` or yellow `object` must survive even as a single-child wrapper,
@@ -294,7 +357,13 @@ function isSignificant(node: {name: string | null; syntaxKind: string}): boolean
         KIND_OUTLINE[node.syntaxKind] !== undefined ||
         // Constructor has no label but its own box (white outline + wrench
         // badge), so it must never collapse as a single-child pass-through.
-        node.syntaxKind === "Constructor"
+        node.syntaxKind === "Constructor" ||
+        // Nodes carrying a kind-specific fill tint (e.g. the blue
+        // background for ImportDeclaration) are significant for the
+        // SAME reason kind-outlined nodes are — the visual treatment
+        // IS the kind signal, so the rect must survive even as a
+        // single-child wrapper.
+        KIND_FILL_TINT[node.syntaxKind] !== undefined
     );
 }
 
@@ -330,6 +399,24 @@ const EXPANDABLE_KINDS = new Set([
     // them.
     "InterfaceDeclaration",
     "TypeAliasDeclaration",
+    // Classes — same expand-circle treatment as interfaces. When
+    // collapsed the class is a labelled green cell (the class name);
+    // clicking spawns the overlay with the class's solid green
+    // circle around its members. Especially useful for big classes
+    // like Angular pages / services where the member list dominates
+    // an expanded file even though the user often just wants to see
+    // "yes this file defines class Foo" without drilling into Foo's
+    // members.
+    "ClassDeclaration",
+    // Top-level `const/let/var x = ...` statements. Collapsing the
+    // whole statement to a single labelled cell (the variable name,
+    // provided by the server's rawFriendlyName for VariableStatement)
+    // gives a compact summary for files that define large object
+    // literals or arrays as module-level constants — without this
+    // the const's initializer renders inline as a big content block
+    // that dominates the file's interior. Click drills into the
+    // statement to see the value.
+    "VariableStatement",
     // JSX wrapper — `<Foo>…</Foo>` and `<>…</>`. Collapses by default
     // so a render method full of nested JSX doesn't dominate the
     // expanded function body; clicking drills into the element and
@@ -1393,10 +1480,7 @@ export function PixiCanvas({project}: CanvasProps) {
             const maybeRecomputeLiveFiles = (): void => {
                 const st = useGraphStore.getState();
                 const key = `${st.focusHops}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}|${st.isolateImports}|${st.isolateExports}`;
-                if (
-                    st.selectionSet === liveFilesSelectionRef &&
-                    key === liveFilesKey
-                ) {
+                if (st.selectionSet === liveFilesSelectionRef && key === liveFilesKey) {
                     return;
                 }
                 liveFilesSelectionRef = st.selectionSet;
@@ -1534,7 +1618,26 @@ export function PixiCanvas({project}: CanvasProps) {
             }
 
             function expandedSizeFor(fileId: string): {w: number; h: number} | null {
-                return ensureExpandedLayout(fileId)?.size ?? null;
+                const result = ensureExpandedLayout(fileId);
+                if (!result) return null;
+                // Floor the expanded diameter at "collapsed footprint
+                // + ~40 px" so a file with very little content (a
+                // single small interface, for example) still visibly
+                // EXPANDS rather than shrinking to a circle smaller
+                // than its collapsed icon-plus-label footprint —
+                // which reads as "nothing happened" and matches the
+                // reported "never expands" bug for files like
+                // device-settings.ts.
+                const sim = layout.byId.get(fileId);
+                if (sim) {
+                    const collapsedFootprint = Math.max(sim.collapsedW, sim.collapsedH);
+                    const minDiameter = collapsedFootprint + 40;
+                    if (result.size.w < minDiameter || result.size.h < minDiameter) {
+                        const d = Math.max(result.size.w, result.size.h, minDiameter);
+                        return {w: d, h: d};
+                    }
+                }
+                return result.size;
             }
 
             // Accessors used throughout draw + edge anchoring code.
@@ -1627,9 +1730,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // Selecting a file repopulates the live set and that file
                 // (and its neighbourhood) pops back out.
                 const ambient = state.selectionSet.size === 0;
-                const effectiveLiveFiles: ReadonlySet<string> | null = ambient
-                    ? AMBIENT_EMPTY_LIVE_SET
-                    : liveFiles;
+                const effectiveLiveFiles: ReadonlySet<string> | null = ambient ? AMBIENT_EMPTY_LIVE_SET : liveFiles;
 
                 // Path-trace lookup: a set of "${a}|${b}" keys for every
                 // CONSECUTIVE pair in state.tracedPath (both directions, so
@@ -1662,11 +1763,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // visual changes rather than firing them together.
                 // Each regime has its own hysteresis band. Path-traced
                 // files override the hide.
-                const isolateActive =
-                    (state.isolateImports || state.isolateExports) &&
-                    !ambient &&
-                    liveFiles != null &&
-                    isolateRegimeEnabled();
+                const isolateActive = (state.isolateImports || state.isolateExports) && !ambient && liveFiles != null && isolateRegimeEnabled();
                 // Set of file ids to suppress completely from rendering
                 // this frame — union of support files (when "tests" is
                 // off) and isolate-mode outsiders (when isolate is
@@ -1687,10 +1784,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     }
                     if (isolateActive && liveFiles) {
                         for (const sim of layout.nodes) {
-                            if (
-                                !liveFiles.has(sim.id) &&
-                                !pathFileSet.has(sim.id)
-                            ) {
+                            if (!liveFiles.has(sim.id) && !pathFileSet.has(sim.id)) {
                                 out.add(sim.id);
                             }
                         }
@@ -1762,10 +1856,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // multiplier, so file + directory names stay readable.
                 for (const sim of layout.nodes) {
                     if (hiddenFileIds && hiddenFileIds.has(sim.id)) continue;
-                    const dimmed =
-                        effectiveLiveFiles != null &&
-                        !effectiveLiveFiles.has(sim.id) &&
-                        !pathFileSet.has(sim.id);
+                    const dimmed = effectiveLiveFiles != null && !effectiveLiveFiles.has(sim.id) && !pathFileSet.has(sim.id);
                     drawFile(sim, selectionSet, dimmed ? 0.22 : 1);
                 }
                 // 2c. Path overlay: thin yellow outline around every file
@@ -1946,10 +2037,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     // attention target stands out against the dimmer rest.
                     const cluster = fileToActiveCluster.get(sim.id);
                     const highlighted = showFullPath || isSelected;
-                    const color =
-                        highlighted || !cluster
-                            ? COLORS.text
-                            : colourForDirectoryDim(cluster);
+                    const color = highlighted || !cluster ? COLORS.text : colourForDirectoryDim(cluster);
                     // Default: 75% of the directory-hull label's 12px so
                     // file names sit a tier below their containing folder
                     // name in the visual hierarchy. Highlighted state
@@ -1983,12 +2071,13 @@ export function PixiCanvas({project}: CanvasProps) {
                 // target. For a collapsing file (targetExpanded false,
                 // width still in flight), denominator is the file's
                 // last-known expanded size, recorded by applyExpansion.
-                // Math.max(1, ...) guards against the degenerate case
-                // where neither has ever been set above collapsedW.
-                const refW = sim.targetExpanded
-                    ? sim.targetW
-                    : sim.lastExpandedTargetW;
-                const tRaw = (sim.width - sim.collapsedW) / Math.max(1, refW - sim.collapsedW);
+                // Robust to expanded < collapsed (degenerate but
+                // legal when the file's content is smaller than its
+                // icon+label footprint — though expandedSizeFor floors
+                // diameter to keep that case rare).
+                const refW = sim.targetExpanded ? sim.targetW : sim.lastExpandedTargetW;
+                const span = refW - sim.collapsedW;
+                const tRaw = Math.abs(span) < 1 ? 0 : (sim.width - sim.collapsedW) / span;
                 const t = tRaw < 0 ? 0 : tRaw > 1 ? 1 : tRaw;
 
                 // World-fixed icon size with a screen cap, multiplied by
@@ -2055,9 +2144,7 @@ export function PixiCanvas({project}: CanvasProps) {
                         .fill({color: body, alpha: iconAlpha})
                         .stroke({color: line, width: strokeW, alpha: iconAlpha});
                     // The folded corner, slightly distinct so it reads as a page.
-                    worldGfx
-                        .poly([ix + iw - fold, iy, ix + iw, iy + fold, ix + iw - fold, iy + fold])
-                        .fill({color: line, alpha: 0.6 * iconAlpha});
+                    worldGfx.poly([ix + iw - fold, iy, ix + iw, iy + fold, ix + iw - fold, iy + fold]).fill({color: line, alpha: 0.6 * iconAlpha});
                 }
 
                 // 2. CIRCLE — drawn whenever t > 0, fading in and growing
@@ -2065,9 +2152,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 //    only thing rendered (icon path above skipped).
                 if (t > 0) {
                     const circleAlpha = t * dimAlpha;
-                    worldGfx
-                        .circle(sim.x, sim.y, animatedR)
-                        .fill({color: COLORS.fileExpanded, alpha: 0.7 * circleAlpha});
+                    worldGfx.circle(sim.x, sim.y, animatedR).fill({color: COLORS.fileExpanded, alpha: 0.7 * circleAlpha});
                     if (isSelected) {
                         worldGfx.circle(sim.x, sim.y, animatedR).stroke({
                             color: COLORS.fileSelected,
@@ -2189,8 +2274,22 @@ export function PixiCanvas({project}: CanvasProps) {
                 const labelPool = currentLabelPool;
 
                 // Circle fill: same translucent dark as the file circle, so a
-                // class reads as a "smaller file" of related members.
-                worldGfx.circle(cx, cy, radius).fill({color: COLORS.fileExpanded, alpha: 0.55});
+                // class reads as a "smaller file" of related members. EXPORTED
+                // classes / interfaces get the amber export tint blended in
+                // (matching the EXPORT_FILL_COLOR used for rect-shaped exports
+                // in drawAstNode below), so the "this is part of the module's
+                // public surface" signal carries over to the circle-shaped
+                // member-container variants too. Already semi-transparent at
+                // 0.55 alpha, so the boundary-overlay behaviour falls out for
+                // free.
+                const isExportContainer =
+                    node.exported === true ||
+                    node.syntaxKind === "ExportDeclaration" ||
+                    node.syntaxKind === "ExportAssignment";
+                const containerFillColor = isExportContainer
+                    ? blendColor(COLORS.fileExpanded, EXPORT_FILL_COLOR, EXPORT_FILL_BLEND)
+                    : COLORS.fileExpanded;
+                worldGfx.circle(cx, cy, radius).fill({color: containerFillColor, alpha: 0.55});
 
                 if (dashed) {
                     // Sample the perimeter and dash it. Step count scales with
@@ -2430,13 +2529,32 @@ export function PixiCanvas({project}: CanvasProps) {
                     const stroke = KIND_OUTLINE[node.syntaxKind] ?? COLORS.astBorder;
                     const isSelectedLeaf = selectionSet.has(node.id);
                     const isHovered = hoveredHit?.id === node.id;
+                    // Collapsed exported cells (e.g. `export class Cat` when
+                    // class is in EXPANDABLE_KINDS and renders as a single
+                    // labelled cell) get the same amber export tint applied
+                    // to regular non-collapsed cells in the default branch
+                    // below. Without this, the cell renders with an effectively
+                    // transparent fill (the original `stroke × alpha 0`) and
+                    // the "this is exported" visual signal is lost.
+                    const isCollapsedExport =
+                        node.exported === true ||
+                        node.syntaxKind === "ExportDeclaration" ||
+                        node.syntaxKind === "ExportAssignment";
+                    const collapsedFillColor = isCollapsedExport
+                        ? blendColor(depthTint(node.depth), EXPORT_FILL_COLOR, EXPORT_FILL_BLEND)
+                        : stroke;
+                    const collapsedFillAlpha = isCollapsedExport
+                        ? EXPORT_FILL_ALPHA
+                        : isHovered ? 0.18 : 0;
                     worldGfx
                         .rect(x, y, node.rect.w, node.rect.h)
                         .fill({
-                            color: stroke,
+                            color: collapsedFillColor,
                             // Hover gets a soft tint of the outline color so the cell
                             // reads as a button without changing the visual grammar.
-                            alpha: isHovered ? 0.18 : 0,
+                            // (Exported cells use the amber background instead — the
+                            // hover affordance reads from the thicker outline below.)
+                            alpha: collapsedFillAlpha,
                         })
                         .stroke({
                             color: isSelectedLeaf ? COLORS.astSelected : stroke,
@@ -2509,7 +2627,35 @@ export function PixiCanvas({project}: CanvasProps) {
 
                 const isSelected = selectionSet.has(node.id);
                 const tint = depthTint(node.depth);
-                const fillColor = tint; // selection is shown via the outline, not fill
+                // Per-kind tint blend: gives certain kinds (imports
+                // today; could grow over time) a distinct background
+                // hue so the kind reads at a glance without needing an
+                // explicit text label. Selection is still shown via
+                // the outline, not the fill.
+                //
+                // Exported nodes (the `exported` flag is true for
+                // `export class/interface/const/...` and the
+                // ExportDeclaration / ExportAssignment statement
+                // kinds) get the amber export tint AND a reduced
+                // fill alpha — see EXPORT_FILL_* up top. The lower
+                // alpha is the "semi-transparent overlay" so the
+                // file's circle boundary stays visible THROUGH the
+                // part of the rect sitting on the border.
+                const kindTint = KIND_FILL_TINT[node.syntaxKind];
+                const isExportNode =
+                    !kindTint &&
+                    (node.exported === true ||
+                        node.syntaxKind === "ExportDeclaration" ||
+                        node.syntaxKind === "ExportAssignment");
+                let fillColor: number;
+                if (kindTint) {
+                    fillColor = blendColor(tint, kindTint.color, kindTint.blend);
+                } else if (isExportNode) {
+                    fillColor = blendColor(tint, EXPORT_FILL_COLOR, EXPORT_FILL_BLEND);
+                } else {
+                    fillColor = tint;
+                }
+                const fillAlpha = isExportNode ? EXPORT_FILL_ALPHA : DEFAULT_FILL_ALPHA;
                 // A call/new argument is a "parameter block for a call" — style it
                 // like a function `Parameter` (light-blue outline + rounded).
                 const argParent = node.parentId ? tree.byId.get(node.parentId) : undefined;
@@ -2588,19 +2734,13 @@ export function PixiCanvas({project}: CanvasProps) {
                         4 / cameraScale, // ~4px on screen — a gentle curve, not a pill
                         Math.min(node.rect.w, node.rect.h) / 2,
                     );
-                    worldGfx.roundRect(x, y, node.rect.w, node.rect.h, radius).fill({color: fillColor, alpha: 0.92});
+                    worldGfx.roundRect(x, y, node.rect.w, node.rect.h, radius).fill({color: fillColor, alpha: fillAlpha});
                     // Same outside-stroke trick as the default branch below —
                     // the thick selection border would otherwise eat the label
                     // inset.
                     const outset = isSelected ? borderWidth / 2 : 0;
                     worldGfx
-                        .roundRect(
-                            x - outset,
-                            y - outset,
-                            node.rect.w + outset * 2,
-                            node.rect.h + outset * 2,
-                            radius + outset,
-                        )
+                        .roundRect(x - outset, y - outset, node.rect.w + outset * 2, node.rect.h + outset * 2, radius + outset)
                         .stroke({color: borderColor, width: borderWidth, alpha: borderAlpha});
                 } else if (abstractOutline) {
                     // Abstract definition: dashed/dotted box outline. Abstract
@@ -2608,7 +2748,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     // the extends-style dash. Fill first, then stroke the perimeter.
                     const w = node.rect.w;
                     const h = node.rect.h;
-                    worldGfx.rect(x, y, w, h).fill({color: fillColor, alpha: 0.92});
+                    worldGfx.rect(x, y, w, h).fill({color: fillColor, alpha: fillAlpha});
                     const dash = (abstractFn ? 1.2 : 3.5) / cameraScale;
                     const dgap = (abstractFn ? 2.4 : 2.5) / cameraScale;
                     emitDashed(
@@ -2629,7 +2769,7 @@ export function PixiCanvas({project}: CanvasProps) {
                         alpha: borderAlpha,
                     });
                 } else {
-                    worldGfx.rect(x, y, node.rect.w, node.rect.h).fill({color: fillColor, alpha: 0.92});
+                    worldGfx.rect(x, y, node.rect.w, node.rect.h).fill({color: fillColor, alpha: fillAlpha});
                     // Selection's thick blue border (FILE_RIM/2 ≈ 5 world)
                     // is centered on the edge by default — half outside, half
                     // INSIDE the rect, which covers the label area (3px screen
@@ -2639,9 +2779,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     // thin enough that the centered stroke doesn't reach the
                     // label, so they're drawn on the rect's edge as before.
                     const outset = isSelected ? borderWidth / 2 : 0;
-                    worldGfx
-                        .rect(x - outset, y - outset, node.rect.w + outset * 2, node.rect.h + outset * 2)
-                        .stroke({color: borderColor, width: borderWidth, alpha: borderAlpha});
+                    worldGfx.rect(x - outset, y - outset, node.rect.w + outset * 2, node.rect.h + outset * 2).stroke({color: borderColor, width: borderWidth, alpha: borderAlpha});
                 }
 
                 pushRect({
@@ -2897,8 +3035,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // follows still snapshot once because their target's
                 // world position doesn't drift after the click.
                 const isFileFollow = !followId.includes("#");
-                const simSettling =
-                    layout.simulation.alpha() > layout.simulation.alphaMin();
+                const simSettling = layout.simulation.alpha() > layout.simulation.alphaMin();
                 if (followAt === null || (isFileFollow && simSettling)) {
                     const simNode = layout.byId.get(followId);
                     if (simNode) {
@@ -3480,12 +3617,71 @@ export function PixiCanvas({project}: CanvasProps) {
                 // back to natural cluster position".
                 function biasFor(n: SimFileNode): number {
                     const refW = n.targetExpanded ? n.targetW : n.lastExpandedTargetW;
-                    const raw = (n.width - n.collapsedW) / Math.max(1, refW - n.collapsedW);
+                    const span = refW - n.collapsedW;
+                    // No meaningful span — file's expanded and collapsed
+                    // sizes are the same. Treat as fully collapsed (0).
+                    if (Math.abs(span) < 1) return 0;
+                    // Same formula whether the span is positive (file
+                    // grows when expanded) or negative (degenerate case
+                    // where the AST is smaller than the icon+label
+                    // footprint — see expandedSizeFor's minDiameter
+                    // floor, which mostly prevents this, but the
+                    // formula stays robust). Both numerator and
+                    // denominator share the same sign so the ratio is
+                    // positive and reaches 1 when width = refW.
+                    const raw = (n.width - n.collapsedW) / span;
                     return raw < 0 ? 0 : raw > 1 ? 1 : raw;
                 }
+
+                // Build the polarity-neighbour map for THIS frame: every
+                // file that is a direct import or import-consumer of an
+                // expanded file gets a "polarity progress" equal to the
+                // expansion progress of its anchor (the max across all
+                // anchors if the file is connected to several expanded
+                // files). The renderer reads this to SUPPRESS the rigid-
+                // blend for these files so the layout.ts polarity force
+                // — which drives connX onto the arc — actually shows
+                // through in the rendered position. Without this
+                // suppression the rigid-blend at the RIGID_FLOOR=0.5
+                // minimum diluted the arc into a halfway-rigid-grid
+                // smear, which is what the user was seeing.
+                const polarityProgressByFile = new Map<string, number>();
+                for (const E of layout.nodes) {
+                    if (!E.expanded && !E.targetExpanded) continue;
+                    const eProgress = biasFor(E);
+                    if (eProgress <= 0) continue;
+                    const deps = fileEdgesByKind.imports.out.get(E.id);
+                    if (deps) {
+                        for (const id of deps) {
+                            const cur = polarityProgressByFile.get(id) ?? 0;
+                            if (eProgress > cur) polarityProgressByFile.set(id, eProgress);
+                        }
+                    }
+                    const consumers = fileEdgesByKind.imports.in.get(E.id);
+                    if (consumers) {
+                        for (const id of consumers) {
+                            const cur = polarityProgressByFile.get(id) ?? 0;
+                            if (eProgress > cur) polarityProgressByFile.set(id, eProgress);
+                        }
+                    }
+                }
+
                 function ntFor(n: SimFileNode): number {
                     if (n.targetExpanded) return 0;
-                    return (1 - biasFor(n)) * t;
+                    const base = (1 - biasFor(n)) * t;
+                    const polarityProgress = polarityProgressByFile.get(n.id);
+                    if (polarityProgress !== undefined && polarityProgress > 0) {
+                        // Scale down rigid blend by the anchor's expansion
+                        // progress: fully-expanded anchor → nt = 0 →
+                        // rendered position = connX (where the polarity
+                        // force put it). Easing in lock-step with the
+                        // anchor's width animation means the rendered
+                        // position transitions smoothly from rigid-blended
+                        // (pre-expansion) to arc-on-boundary (post-
+                        // expansion), no jump at animation end.
+                        return base * (1 - polarityProgress);
+                    }
+                    return base;
                 }
 
                 // 1. Tentative render position = interpolated base + the
@@ -3839,22 +4035,76 @@ export function PixiCanvas({project}: CanvasProps) {
             // dramatic and the user doesn't need as much dead-zone.
             const ISOLATE_AT_MUL = 2;
             const ISOLATE_BELOW_MUL = 1.7;
+            // ABSOLUTE cameraScale ceilings on the regime thresholds.
+            // The ratio-based thresholds (× fitScale) work well for
+            // medium-and-large projects, but `fitScale` is clamped to
+            // [0.05, 2] in fitProjectToViewport — so for SMALL projects
+            // (few files, naturally fitting at high zoom), fitScale
+            // saturates at 2 and the ratio thresholds become
+            // unreachable in practice (3 × 2 = cameraScale ≥ 6, which
+            // is way past the point where file icons have stopped
+            // visually growing — they cap at `baseW × popFactor`
+            // around cameraScale = 1). The user is left staring at
+            // saturated icons with no way to expand them.
+            //
+            // The absolute floors kick in when icons have CLEARLY
+            // saturated visually — past cameraScale ≈ 1, additional
+            // zoom adds no detail to the icons themselves; that's
+            // when expansion is meaningful regardless of how the
+            // project's fitScale compares. Effective threshold is
+            // `min(ratio × fitScale, absoluteFloor)` so whichever
+            // metric is more permissive wins:
+            //   * Tiny project (fitScale = 2 capped):
+            //       ratio = 3 × 2 = 6
+            //       absolute = 1.5
+            //       → effective expand = 1.5
+            //   * Big project (fitScale = 0.05):
+            //       ratio = 3 × 0.05 = 0.15
+            //       absolute = 1.5
+            //       → effective expand = 0.15 (big project keeps the
+            //         ratio-based "see the layout first, then drill"
+            //         behaviour).
+            // Absolute ceilings chosen to fire well BEFORE icon
+            // saturation (cameraScale = 1, where icons stop growing
+            // visually): even at cameraScale = 0.8 a moderately-
+            // popular file icon already takes 100+ screen px, which
+            // is enough screen real estate to host a useful expanded
+            // view. Original calibration was at the saturation point
+            // (1.5), which felt "too late" — content text inside the
+            // expanded file was already quite large by the time the
+            // threshold finally fired. The relative ordering matches
+            // the ratio constants (ISOLATE = 2/3 × EXPAND) so the
+            // staging — isolate first, then expand — is preserved.
+            const EXPAND_ABS_CEILING = 0.8;
+            const COLLAPSE_ABS_CEILING = 0.65;
+            const ISOLATE_ABS_CEILING = 0.55;
+            const ISOLATE_BELOW_ABS_CEILING = 0.45;
             // Per-frame state of each regime, holding through its
             // hysteresis band.
             let expansionRegimeOn = false;
             let isolateRegimeOn = false;
 
             function selectionExpansionEnabled(): boolean {
-                const ratio = cameraScale / Math.max(fitScale, 1e-4);
-                if (ratio >= FILE_EXPAND_AT_MUL) expansionRegimeOn = true;
-                else if (ratio < FILE_COLLAPSE_BELOW_MUL) expansionRegimeOn = false;
+                const fit = Math.max(fitScale, 1e-4);
+                // Effective thresholds: whichever is SMALLER between
+                // "ratio × fitScale" and "absolute ceiling" wins, so
+                // small projects (where ratio × fitScale is huge) get
+                // the absolute floor and big projects (where
+                // ratio × fitScale is tiny) keep their natural
+                // ratio-based behaviour.
+                const expandAt = Math.min(FILE_EXPAND_AT_MUL * fit, EXPAND_ABS_CEILING);
+                const collapseBelow = Math.min(FILE_COLLAPSE_BELOW_MUL * fit, COLLAPSE_ABS_CEILING);
+                if (cameraScale >= expandAt) expansionRegimeOn = true;
+                else if (cameraScale < collapseBelow) expansionRegimeOn = false;
                 return expansionRegimeOn;
             }
 
             function isolateRegimeEnabled(): boolean {
-                const ratio = cameraScale / Math.max(fitScale, 1e-4);
-                if (ratio >= ISOLATE_AT_MUL) isolateRegimeOn = true;
-                else if (ratio < ISOLATE_BELOW_MUL) isolateRegimeOn = false;
+                const fit = Math.max(fitScale, 1e-4);
+                const onAt = Math.min(ISOLATE_AT_MUL * fit, ISOLATE_ABS_CEILING);
+                const offBelow = Math.min(ISOLATE_BELOW_MUL * fit, ISOLATE_BELOW_ABS_CEILING);
+                if (cameraScale >= onAt) isolateRegimeOn = true;
+                else if (cameraScale < offBelow) isolateRegimeOn = false;
                 return isolateRegimeOn;
             }
 
@@ -4201,14 +4451,7 @@ function drawEdges(
         // Edges that don't touch any selection keep the default grey.
         const fromSel = selectionSet.has(edge.fromId);
         const toSel = selectionSet.has(edge.toId);
-        const edgeColor =
-            fromSel && toSel
-                ? COLORS.edgeBidirectional
-                : fromSel
-                  ? COLORS.edgeImporting
-                  : toSel
-                    ? COLORS.edgeImported
-                    : COLORS.edge;
+        const edgeColor = fromSel && toSel ? COLORS.edgeBidirectional : fromSel ? COLORS.edgeImporting : toSel ? COLORS.edgeImported : COLORS.edge;
         gfx.moveTo(sx, sy)
             .lineTo(tx, ty)
             .stroke({
@@ -4804,9 +5047,7 @@ interface CameraDeps {
     // the cursor-pivot behaviour. The cursor's current world position
     // is passed in so the host can pick a sensible pivot (e.g. the
     // nearest file) when the cursor isn't on anything specific.
-    getZoomPivot?: (
-        cursorWorld: {x: number; y: number},
-    ) => {worldX: number; worldY: number} | null;
+    getZoomPivot?: (cursorWorld: {x: number; y: number}) => {worldX: number; worldY: number} | null;
 }
 
 function wireCamera(deps: CameraDeps): () => void {

@@ -93,6 +93,23 @@ function collapsedSize(relativePath: string): {w: number; h: number} {
 const CALLS_X_STRENGTH = 0.16;
 const CALLS_Y_STRENGTH = 0.12;
 const INHERIT_Y_STRENGTH = 0.22;
+// Around each EXPANDED file, arrange the import neighbourhood
+// along the file's visible border:
+//   * dependencies (files the expanded file imports) are
+//     distributed evenly along the TOP HALF of the boundary
+//     (9 o'clock through 12 o'clock to 3 o'clock);
+//   * consumers (files that import the expanded file) are
+//     distributed evenly along the BOTTOM HALF (9 o'clock through
+//     6 o'clock to 3 o'clock).
+// Each file's centre is pulled toward an explicit slot ON the
+// visible circle — not just "the upper half" — so the result reads
+// as beads on a string rather than a loose cluster. Files unrelated
+// to this expanded file get no force from this and settle on the
+// sides via the other forces (charge / link / collide).
+// Implemented as a position-attraction force per slot: each tick,
+// for each (expanded file, neighbour-on-arc) pair, nudge the
+// neighbour's velocity toward its assigned slot.
+const IMPORT_POLARITY_STRENGTH = 0.15;
 // More calls between two files → a firmer pull, but sub-linear and capped so
 // one hot pair can't dominate the whole layout.
 const WEIGHT_CAP = 3;
@@ -171,6 +188,126 @@ function directionalForce(edges: readonly DirectionalEdge[], axis: "x" | "y", st
     }
     force.initialize = (nodes: SimFileNode[]): void => {
         lookup = new Map(nodes.map((n) => [n.id, n]));
+    };
+    return force;
+}
+
+// d3-force custom force: distribute the import neighbourhood of
+// each EXPANDED file along the visible boundary of its circle.
+// Pre-computes two per-file adjacency lists at initialize time:
+//
+//   outBy[E] = files E imports (its DEPENDENCIES)
+//   inBy[E]  = files that import E (its CONSUMERS)
+//
+// Each tick, for every expanded file E, walks its dependency list
+// and nudges each dependency toward an evenly-spaced SLOT on the
+// top arc of E's boundary; same for consumers on the bottom arc.
+// The list order is sorted by id at init time so slot assignment
+// is stable across ticks — files don't oscillate between angular
+// positions as their x-coords drift around.
+//
+// Slot maths:
+//   Visible radius r = E.width / 2 (the perimeter the user sees).
+//   Parametric position on E's circle: (E.x + r·cos(t), E.y + r·sin(t))
+//     with t = 0 at 3 o'clock, t = π/2 at 6 o'clock (bottom in
+//     screen coords where +y is down), t = π at 9 o'clock,
+//     t = 3π/2 at 12 o'clock (top).
+//   Top arc (deps): t ∈ (π, 2π), evenly distributed with margins
+//     from both endpoints so files don't crowd the side cluster.
+//   Bottom arc (consumers): t ∈ (0, π), same convention.
+//   The horizontal ordering (slot 0 on the left, slot N-1 on the
+//   right) is the same on both arcs so the user can read a
+//   dependency and its symmetric-positioned consumer pair across
+//   the file.
+//
+// Files unrelated to any expanded file get zero force from this
+// pass and settle on the horizontal sides via the other forces.
+function importPolarityForce(links: readonly SimImportLink[], strength: number) {
+    let lookup = new Map<string, SimFileNode>();
+    // E.id → files E imports (dependencies). Each file is the
+    // target of an import edge whose source is E.
+    let depsByExpanded = new Map<string, SimFileNode[]>();
+    // E.id → files that import E (consumers). Each file is the
+    // source of an import edge whose target is E.
+    let consumersByExpanded = new Map<string, SimFileNode[]>();
+
+    function force(alpha: number): void {
+        for (const E of lookup.values()) {
+            if (!E.expanded) continue;
+            const r = E.width / 2;
+
+            const deps = depsByExpanded.get(E.id);
+            if (deps && deps.length > 0) {
+                const N = deps.length;
+                for (let i = 0; i < N; i++) {
+                    // Top arc — slot k of N at angle π + (k+1)/(N+1)·π.
+                    // Margins from the side ports keep dependencies
+                    // from sitting where the side-cluster (unrelated
+                    // files) wants to gather.
+                    const t = Math.PI + ((i + 1) / (N + 1)) * Math.PI;
+                    const tx = E.x + r * Math.cos(t);
+                    const ty = E.y + r * Math.sin(t);
+                    const F = deps[i];
+                    F.vx = (F.vx ?? 0) + (tx - F.x) * alpha * strength;
+                    F.vy = (F.vy ?? 0) + (ty - F.y) * alpha * strength;
+                }
+            }
+
+            const consumers = consumersByExpanded.get(E.id);
+            if (consumers && consumers.length > 0) {
+                const N = consumers.length;
+                for (let i = 0; i < N; i++) {
+                    // Bottom arc — same left-to-right convention as
+                    // the top arc. t decreases from near-π (left) to
+                    // near-0 (right) so increasing i puts the slot
+                    // further right, matching the top arc's ordering.
+                    const t = Math.PI * (N - i) / (N + 1);
+                    const tx = E.x + r * Math.cos(t);
+                    const ty = E.y + r * Math.sin(t);
+                    const F = consumers[i];
+                    F.vx = (F.vx ?? 0) + (tx - F.x) * alpha * strength;
+                    F.vy = (F.vy ?? 0) + (ty - F.y) * alpha * strength;
+                }
+            }
+        }
+    }
+    force.initialize = (nodes: SimFileNode[]): void => {
+        lookup = new Map(nodes.map((n) => [n.id, n]));
+        depsByExpanded = new Map();
+        consumersByExpanded = new Map();
+        // Dedupe by (fromId, toId) so multiple import statements
+        // between the same pair of files don't produce duplicate
+        // slots — slot count must match the visible UNIQUE-neighbour
+        // count.
+        const seen = new Set<string>();
+        for (const link of links) {
+            const fromId = typeof link.source === "string" ? link.source : link.source.id;
+            const toId = typeof link.target === "string" ? link.target : link.target.id;
+            const key = `${fromId}>${toId}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const fromNode = lookup.get(fromId);
+            const toNode = lookup.get(toId);
+            if (!fromNode || !toNode) continue;
+            let deps = depsByExpanded.get(fromId);
+            if (!deps) {
+                deps = [];
+                depsByExpanded.set(fromId, deps);
+            }
+            deps.push(toNode);
+            let cons = consumersByExpanded.get(toId);
+            if (!cons) {
+                cons = [];
+                consumersByExpanded.set(toId, cons);
+            }
+            cons.push(fromNode);
+        }
+        // Stable slot assignment: sort by id so the angular position
+        // of each file is deterministic across ticks. Other orderings
+        // (by current x-position) would be more visually pleasing but
+        // would cause oscillation as files drift past one another.
+        for (const list of depsByExpanded.values()) list.sort((a, b) => a.id.localeCompare(b.id));
+        for (const list of consumersByExpanded.values()) list.sort((a, b) => a.id.localeCompare(b.id));
     };
     return force;
 }
@@ -646,6 +783,11 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
         .force("callsX", directionalForce(callEdges, "x", CALLS_X_STRENGTH))
         .force("callsY", directionalForce(callEdges, "y", CALLS_Y_STRENGTH))
         .force("inheritY", directionalForce(inheritEdges, "y", INHERIT_Y_STRENGTH))
+        // Polarises the neighbourhood of an expanded file vertically:
+        // its dependencies drift to the TOP half of its boundary,
+        // its consumers to the BOTTOM half. No-op for pairs where
+        // neither end is expanded.
+        .force("importPolarity", importPolarityForce(links, IMPORT_POLARITY_STRENGTH))
         // Modest directory cohesion for the CONNECTIVITY layout —
         // the one the user reads when zoomed IN, where connectivity
         // should dominate but a little folder grouping still aids

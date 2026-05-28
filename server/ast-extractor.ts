@@ -941,6 +941,28 @@ function rawFriendlyName(node: Node, inlined: Set<Node>): string | null {
     return nameNode.getText();
   }
 
+  // VariableStatement — `const/let/var x = ...`. The statement itself
+  // has no `getName()` (it's not a NamedDeclaration), but the variable
+  // it declares does. Use the first declaration's name (or join with
+  // commas for multi-decl statements like `const x = 1, y = 2`) so
+  // the statement renders with a meaningful label when collapsed
+  // (EXPANDABLE_KINDS turns the whole statement into a single
+  // labelled cell on the client). Without this the collapsed cell
+  // would be unnamed and indistinguishable from any other.
+  if (Node.isVariableStatement(node)) {
+    const declList = node.getDeclarationList();
+    const decls = declList.getDeclarations();
+    if (decls.length > 0) {
+      const names: string[] = [];
+      for (const d of decls) {
+        const n = d.getName();
+        if (n) names.push(n);
+      }
+      if (names.length > 0) return names.join(', ');
+    }
+    return null;
+  }
+
   // ts-morph uses structural typing for "named" nodes — many declarations
   // expose a getName() method but it's not part of the base Node API. We
   // duck-type and fall back gracefully.

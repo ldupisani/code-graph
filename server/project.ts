@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { Project, type Node, type SourceFile } from 'ts-morph';
+import { Project, ts, type Node, type SourceFile } from 'ts-morph';
 import type {
   FileAstResponse,
   FileNode,
@@ -38,7 +38,30 @@ export async function openProject(rawPath: string): Promise<ProjectResponse> {
   }
 
   const project = new Project({ tsConfigFilePath: tsConfigPath });
-  const sourceFiles = project.getSourceFiles();
+  let sourceFiles = project.getSourceFiles();
+  // Solution-style tsconfig (e.g. { "files": [], "references": [...] }):
+  // ts-morph doesn't follow project references, so the root config yields no
+  // files. Pull sources from each referenced config directly. ts.readConfigFile
+  // tolerates comments (JSONC) in the tsconfig.
+  if (sourceFiles.length === 0) {
+    const parsed = ts.readConfigFile(tsConfigPath, ts.sys.readFile).config as
+      | { references?: { path?: string }[] }
+      | undefined;
+    for (const ref of parsed?.references ?? []) {
+      if (typeof ref.path !== 'string') continue;
+      const refResolved = path.resolve(rootPath, ref.path);
+      const refTsConfig = refResolved.endsWith('.json')
+        ? refResolved
+        : path.join(refResolved, 'tsconfig.json');
+      if (!existsSync(refTsConfig)) continue;
+      try {
+        project.addSourceFilesFromTsConfig(refTsConfig);
+      } catch {
+        // Skip a malformed/unreadable referenced config rather than failing.
+      }
+    }
+    sourceFiles = project.getSourceFiles();
+  }
 
   const files: FileNode[] = sourceFiles.map((sf) => buildFileNode(sf, rootPath));
   const fileIdByAbs = new Map(files.map((f) => [f.absolutePath, f.id]));

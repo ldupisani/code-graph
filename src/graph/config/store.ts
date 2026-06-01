@@ -121,7 +121,10 @@ export const useConfigStore = create<ConfigStore>()(
                 set((s) => {
                     const t = s.templates.find((x) => x.id === id);
                     if (!t) return s;
-                    return {config: {...clone(t.config), version: s.config.version + 1}, activeTemplateId: id};
+                    // Normalize so a template saved before a config field existed
+                    // (e.g. theme.edgeStyle) gets that field filled from defaults
+                    // rather than dropping it from the live config.
+                    return {config: {...sanitizeConfig(t.config), version: s.config.version + 1}, activeTemplateId: id};
                 }),
             deleteTemplate: (id) =>
                 set((s) => {
@@ -164,7 +167,11 @@ export const useConfigStore = create<ConfigStore>()(
             migrate: (persisted) => persisted as never,
             merge: (persisted, current) => {
                 const p = (persisted ?? {}) as Partial<ConfigStore>;
-                const userTemplates = Array.isArray(p.templates) ? p.templates.filter((t) => t && !t.builtin) : [];
+                // Normalize each saved template's config too, so fields added
+                // after a template was saved are filled in (and re-persisted).
+                const userTemplates = Array.isArray(p.templates)
+                    ? p.templates.filter((t) => t && !t.builtin).map((t) => ({...t, config: sanitizeConfig(t.config)}))
+                    : [];
                 return {
                     ...current,
                     config: p.config ? sanitizeConfig(p.config) : current.config,

@@ -31,6 +31,14 @@ export interface SimFileNode {
   // lerps x/y toward these as the user zooms out.
   rigidX: number;
   rigidY: number;
+  // Per-tier render buffers, indexed parallel to config.tiers. For a STATIC
+  // tier, tierX[t]/tierY[t] hold that pattern's position for this node,
+  // re-centred on the connectivity centroid each frame (the generalisation of
+  // rigidX/rigidY to N tiers). Live (force) tiers are not stored here — the
+  // renderer reads connX/connY for those. Filled by the TierEngine; lazily
+  // allocated, so may be undefined before the first fillBuffers().
+  tierX?: number[];
+  tierY?: number[];
   // Collision-relaxation offset. The render position is
   // lerp(connectivity, rigid) PLUS this offset; the offset is what
   // a per-frame overlap-relaxation pass produces to keep file
@@ -75,6 +83,14 @@ export interface SimFileNode {
   // reset to `collapsedW` on collapse. Initialised to `collapsedW`
   // as a safe fallback.
   lastExpandedTargetW: number;
+  // True when the user has manually dragged this file to a position.
+  // Disambiguates from the transient `fx`/`fy` pin that
+  // `expandFileForSelection` sets during the post-expand rebalance:
+  // every pin-release site (stepLayout sim-settle, syncExpansion
+  // collapse, expandFileForSelection's other-file release) skips
+  // nodes with `userPinned` so the position survives every internal
+  // re-layout. Cleared only by the `U` (hover) or `R` (all) keys.
+  userPinned?: boolean;
   relativePath: string;
 }
 

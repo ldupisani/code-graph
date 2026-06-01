@@ -1,4 +1,4 @@
-import {forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY, type Simulation} from "d3-force";
+import {forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, type Simulation} from "d3-force";
 import type {FileNode, ProjectResponse, SemanticEdge} from "../api/types";
 import type {SimFileNode, SimImportLink} from "./types";
 import {fileLabel, measureMono} from "./labels";
@@ -326,8 +326,8 @@ function importPolarityForce(links: readonly SimImportLink[], strength: number) 
 // from every other file with no restoring force — over many ticks
 // they accumulate outward drift and end up flung far from the
 // rest of the project.
-const ROOT_CLUSTER = "<root>";
-function dirnameOf(relativePath: string): string {
+export const ROOT_CLUSTER = "<root>";
+export function dirnameOf(relativePath: string): string {
     const i = relativePath.lastIndexOf("/");
     return i < 0 ? ROOT_CLUSTER : relativePath.slice(0, i);
 }
@@ -536,6 +536,76 @@ function linkClearanceForce(links: readonly SimImportLink[], strength: number) {
     return force;
 }
 
+// Radial containment: soft quadratic pull outside `softR`, plus a
+// hard backstop clamp at 3× softR. Replaces the constant-pull
+// leashX/leashY: those exerted a force on every file regardless of
+// position, which compressed the layout for well-connected
+// projects, and were too weak (strength 0.004) to stop a
+// disconnected file from drifting under unbounded many-body
+// repulsion. The piecewise design here has ZERO effect on files
+// inside softR — only outliers feel the pull — and grows
+// quadratically with excess so a file that's drifted far feels a
+// proportionally stronger correction.
+//
+// The hard cap is a backstop: a strong reheat can briefly fling
+// something past 3× softR, and we want a known finite maximum
+// extent for the project (helps camera-fit, hit-testing, and the
+// user's "where did my file go" intuition). Clamping `n.x`/`n.y`
+// from a force callback is the same pattern the userPinned drag
+// uses (`sim.x = nx` in onFileDragMove) — d3-force picks up
+// post-callback positions before the next force in the same tick.
+//
+// Pinned files (userPinned, or transiently fx-set during
+// expansion) are skipped: their position is user/expansion-
+// controlled, and d3 would clamp x to fx at end-of-tick anyway.
+function radialContainmentForce(getSoftR: () => number, strength: number) {
+    let nodes: SimFileNode[] = [];
+    function force(alpha: number): void {
+        const softR = getSoftR();
+        if (softR <= 0) return;
+        const softR2 = softR * softR;
+        const hardR = softR * 3;
+        const hardR2 = hardR * hardR;
+        for (const n of nodes) {
+            if (n.userPinned || n.fx != null) continue;
+            const r2 = n.x * n.x + n.y * n.y;
+            if (r2 <= softR2) continue;
+            const r = Math.sqrt(r2);
+            // Soft pull: quadratic in excess past softR. Multiplied
+            // by alpha so the force fades as the sim cools.
+            const excess = r - softR;
+            const mag = strength * alpha * excess * excess;
+            const ux = n.x / r;
+            const uy = n.y / r;
+            n.vx = (n.vx ?? 0) - ux * mag;
+            n.vy = (n.vy ?? 0) - uy * mag;
+            // Hard backstop: nothing past 3× softR. Clamp position
+            // back to the boundary and zero the outward component
+            // of velocity so the next tick doesn't immediately
+            // push it back out.
+            if (r2 > hardR2) {
+                const k = hardR / r;
+                n.x *= k;
+                n.y *= k;
+                // After scaling, (n.x, n.y) lies on the hardR
+                // circle. Recompute the unit direction from the
+                // clamped position.
+                const ux2 = n.x / hardR;
+                const uy2 = n.y / hardR;
+                const dot = (n.vx ?? 0) * ux2 + (n.vy ?? 0) * uy2;
+                if (dot > 0) {
+                    n.vx = (n.vx ?? 0) - dot * ux2;
+                    n.vy = (n.vy ?? 0) - dot * uy2;
+                }
+            }
+        }
+    }
+    force.initialize = (n: SimFileNode[]): void => {
+        nodes = n;
+    };
+    return force;
+}
+
 export interface FileLayoutResult {
     nodes: SimFileNode[];
     links: SimImportLink[];
@@ -547,6 +617,13 @@ export interface FileLayoutResult {
     // via assignRigidPositions, then interpolates toward them as
     // the user zooms out.
     rigidRaw: Map<string, {x: number; y: number}>;
+    // Half the diagonal of the rigid layout's bounding box. Used by
+    // the radial-containment force to size its soft boundary so
+    // larger projects get a larger boundary automatically.
+    // Updated by assignRigidPositions every time the rigid layout
+    // is recomputed. 0 until assignRigidPositions has run at least
+    // once — the containment force early-exits in that case.
+    rigidHalfDiag: number;
 }
 
 // --- Rigid folder-outline layout -----------------------------------------
@@ -556,7 +633,7 @@ export interface FileLayoutResult {
 // wrapping into a new column to the right once a column reaches its
 // height budget — like a multi-column index. Within a column, depth
 // indents a folder left→right. The column count is chosen to make
-// the whole layout land near RIGID_TARGET_ASPECT (wider than tall),
+// the whole layout land near targetAspect (wider than tall),
 // so when zoomed out files spread horizontally rather than into one
 // tall ribbon. The renderer interpolates toward this as the
 // zoomed-OUT layout and away from it (toward the force-directed
@@ -566,14 +643,31 @@ export interface FileLayoutResult {
 // sized to comfortably hold a collapsed file box (~140×28) so the
 // rigid grid is overlap-free on its own; assignRigidPositions only
 // TRANSLATES it (no scaling), so these are real sizes, not ratios.
-const RIGID_COL_W = 360; // left→right depth indent within a column
-const RIGID_CELL_W = 230; // file-cell width within a folder grid
-const RIGID_CELL_H = 76; // file-cell height within a folder grid
-const RIGID_BAND_GAP = 120; // vertical gap between folders in a column
-const RIGID_COLUMN_GAP = 440; // horizontal gap between folder columns
-const RIGID_TARGET_ASPECT = 1.7; // desired width : height of the layout
+// Tunable parameters for the folder-grid layout (exposed as a configurable
+// pattern via patterns/folderGrid.ts). Defaults reproduce the original layout.
+export interface FolderGridParams {
+    colW: number; // left→right depth indent within a column
+    cellW: number; // file-cell width within a folder grid
+    cellH: number; // file-cell height within a folder grid
+    bandGap: number; // vertical gap between folders in a column
+    columnGap: number; // horizontal gap between folder columns
+    targetAspect: number; // desired width : height of the layout
+}
 
-export function computeRigidLayout(project: ProjectResponse): Map<string, {x: number; y: number}> {
+export const FOLDER_GRID_DEFAULTS: FolderGridParams = {
+    colW: 360,
+    cellW: 230,
+    cellH: 76,
+    bandGap: 120,
+    columnGap: 440,
+    targetAspect: 1.7,
+};
+
+export function computeRigidLayout(
+    project: ProjectResponse,
+    params: FolderGridParams = FOLDER_GRID_DEFAULTS,
+): Map<string, {x: number; y: number}> {
+    const {colW, cellW, cellH, bandGap, columnGap, targetAspect} = params;
     // Group files by parent directory ('<root>' for files with no
     // directory component — see dirnameOf).
     const byDir = new Map<string, FileNode[]>();
@@ -612,12 +706,12 @@ export function computeRigidLayout(project: ProjectResponse): Map<string, {x: nu
         const rows = Math.ceil(members.length / cols);
         blocks.push({
             depth,
-            w: cols * RIGID_CELL_W,
-            h: rows * RIGID_CELL_H,
+            w: cols * cellW,
+            h: rows * cellH,
             files: members.map((f, i) => ({
                 id: f.id,
-                dx: (i % cols) * RIGID_CELL_W,
-                dy: Math.floor(i / cols) * RIGID_CELL_H,
+                dx: (i % cols) * cellW,
+                dy: Math.floor(i / cols) * cellH,
             })),
         });
     }
@@ -627,8 +721,8 @@ export function computeRigidLayout(project: ProjectResponse): Map<string, {x: nu
     let totalStackH = 0;
     let maxSlotW = 1;
     for (const b of blocks) {
-        totalStackH += b.h + RIGID_BAND_GAP;
-        const slotW = b.depth * RIGID_COL_W + b.w;
+        totalStackH += b.h + bandGap;
+        const slotW = b.depth * colW + b.w;
         if (slotW > maxSlotW) maxSlotW = slotW;
     }
 
@@ -636,10 +730,10 @@ export function computeRigidLayout(project: ProjectResponse): Map<string, {x: nu
     //    target aspect. With K columns the layout is ~K·colSlotW
     //    wide and ~totalStackH/K tall, so width/height = K²·colSlotW
     //    / totalStackH; solving for the target gives K below.
-    const colSlotW = maxSlotW + RIGID_COLUMN_GAP;
+    const colSlotW = maxSlotW + columnGap;
     const columns = Math.max(
         1,
-        Math.round(Math.sqrt((RIGID_TARGET_ASPECT * totalStackH) / colSlotW)),
+        Math.round(Math.sqrt((targetAspect * totalStackH) / colSlotW)),
     );
     const budget = totalStackH / columns;
 
@@ -654,11 +748,11 @@ export function computeRigidLayout(project: ProjectResponse): Map<string, {x: nu
             col++;
             cursorY = 0;
         }
-        const x0 = col * colSlotW + b.depth * RIGID_COL_W;
+        const x0 = col * colSlotW + b.depth * colW;
         for (const f of b.files) {
             out.set(f.id, {x: x0 + f.dx, y: cursorY + f.dy});
         }
-        cursorY += b.h + RIGID_BAND_GAP;
+        cursorY += b.h + bandGap;
     }
     return out;
 }
@@ -686,6 +780,19 @@ export function assignRigidPositions(
     }
     const rCx = (rMinX + rMaxX) / 2;
     const rCy = (rMinY + rMaxY) / 2;
+    // Remember the rigid bbox's half-diagonal as a project-scale
+    // proxy. The radial containment force reads `2 × rigidHalfDiag`
+    // as its soft boundary so the boundary auto-scales with project
+    // size — small projects get a tight boundary, big monorepos
+    // get a wide one. Guard against degenerate (empty / 1-file)
+    // layouts where the bbox is undefined.
+    if (Number.isFinite(rMinX) && Number.isFinite(rMinY)) {
+        const dx = rMaxX - rMinX;
+        const dy = rMaxY - rMinY;
+        layout.rigidHalfDiag = 0.5 * Math.hypot(dx, dy);
+    } else {
+        layout.rigidHalfDiag = 0;
+    }
     for (const n of layout.nodes) {
         const p = layout.rigidRaw.get(n.id);
         if (!p) {
@@ -731,6 +838,10 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
             // having opened (degenerate path that shouldn't happen in
             // practice). First expand overwrites with the real value.
             lastExpandedTargetW: cs.w,
+            // User-drag pin marker. False by default; set true on
+            // pointer-up after a file-drag in PixiCanvas. Pin-release
+            // paths skip nodes with this flag set.
+            userPinned: false,
             x: seedX,
             y: seedY,
             connX: seedX,
@@ -760,7 +871,25 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
     // implementer (edge.fromId), so the extender drifts toward the bottom.
     const inheritEdges = directionalEdges(project, byId, new Set(["extends", "implements"]), (e) => ({aId: e.toId, bId: e.fromId}));
 
-    const simulation = forceSimulation<SimFileNode>(nodes)
+    // Assemble the result up-front so the radial-containment force
+    // can close over `result.rigidHalfDiag`. assignRigidPositions
+    // (the caller's responsibility, runs after build) mutates that
+    // field in-place on the SAME object reference; the closure
+    // reads the current value every tick, so it picks up the
+    // post-build value automatically without re-creating the force.
+    const result: FileLayoutResult = {
+        nodes,
+        links,
+        byId,
+        rigidRaw,
+        rigidHalfDiag: 0,
+        // Filled in immediately below — the cast lets us defer
+        // simulation construction one statement so the containment
+        // force can take a closure over `result` itself.
+        simulation: null as never,
+    };
+
+    result.simulation = forceSimulation<SimFileNode>(nodes)
         .force(
             "link",
             forceLink<SimFileNode, SimImportLink>(links)
@@ -777,7 +906,14 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
         // is bounded inside the no-overlap shell the collide pass
         // enforces anyway. The equilibrium positions don't change; the
         // ringing around them does.
-        .force("charge", forceManyBody<SimFileNode>().strength(-650).distanceMin(40))
+        // distanceMax bounds the inverse-square tail. Beyond ~3×
+        // the typical link distance (200) the per-pair repulsion
+        // is small but accumulating, and on a low-connectivity
+        // outlier it becomes the dominant outward force. Capping
+        // at 600 confines repulsion to the cluster zone — distant
+        // pairs no longer push each other further apart, which is
+        // what allowed lone files to drift in the first place.
+        .force("charge", forceManyBody<SimFileNode>().strength(-650).distanceMin(40).distanceMax(600))
         .force("center", forceCenter(0, 0))
         .force("collide", forceCollide<SimFileNode>().radius(collisionRadius).strength(0.95).iterations(2))
         .force("callsX", directionalForce(callEdges, "x", CALLS_X_STRENGTH))
@@ -798,15 +934,24 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
         .force("directoryCluster", directoryClusterForce(0.09))
         .force("directorySubsystemRepulsion", directorySubsystemRepulsion(120, 2))
         .force("clearance", linkClearanceForce(links, LINK_CLEARANCE_STRENGTH))
-        // Defensive per-file soft leash toward origin. forceCenter
-        // only constrains the global CENTROID — it can't stop a
-        // single low-connectivity file from accumulating outward
-        // drift while the rest of the cluster slides the other way
-        // to balance. For a file with no siblings it's the only
-        // restoring force keeping it from sailing off as manyBody
-        // slowly pushes it outward.
-        .force("leashX", forceX<SimFileNode>(0).strength(0.004))
-        .force("leashY", forceY<SimFileNode>(0).strength(0.004))
+        // Radial containment: zero-force inside a soft boundary
+        // sized at 2× the rigid (folder-grid) layout's half-
+        // diagonal; quadratic pull-back past the boundary; hard
+        // clamp at 3× softR as a backstop. Replaces the constant
+        // forceX/forceY "leash" — that pulled every file every
+        // tick (compressing legitimate spread for big projects)
+        // and was too weak (0.004) to stop drift on a
+        // disconnected file. The piecewise design only acts on
+        // OUTLIERS and grows quadratically with how far they've
+        // drifted, so the response is proportional to the problem.
+        //
+        // Closure reads `result.rigidHalfDiag` each tick — picked
+        // up automatically when assignRigidPositions mutates it
+        // post-build (and on subsequent project rebuilds).
+        .force(
+            "containment",
+            radialContainmentForce(() => 2 * result.rigidHalfDiag, 0.0008),
+        )
         .alpha(1)
         .alphaDecay(0.035)
         // Heavier damping than the d3 default of 0.4. In tight clusters
@@ -823,9 +968,8 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
     // interpolate toward the rigid layout after. With alphaTarget
     // at its default 0, alpha decays to alphaMin and the renderer
     // stops ticking — the sim does NOT run indefinitely.
-    simulation.stop();
-
-    return {nodes, links, byId, simulation, rigidRaw};
+    result.simulation.stop();
+    return result;
 }
 
 /**

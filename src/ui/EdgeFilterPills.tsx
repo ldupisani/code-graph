@@ -1,5 +1,7 @@
 import type React from 'react';
 import { useGraphStore, type EdgeFilter } from '../graph/store';
+import { useConfigStore } from '../graph/config/store';
+import { Pill } from './Pill';
 
 // HUD overlay: three pill toggles for the user's edge-type lens.
 // imports = the grey import lines drawn by drawEdges.
@@ -29,10 +31,12 @@ export function EdgeFilterPills() {
   const tracedPath = useGraphStore((s) => s.tracedPath);
   const showSupportFiles = useGraphStore((s) => s.showSupportFiles);
   const setShowSupportFiles = useGraphStore((s) => s.setShowSupportFiles);
-  const isolateImports = useGraphStore((s) => s.isolateImports);
-  const isolateExports = useGraphStore((s) => s.isolateExports);
-  const setIsolateImports = useGraphStore((s) => s.setIsolateImports);
-  const setIsolateExports = useGraphStore((s) => s.setIsolateExports);
+  // Isolate direction toggles now live in the config (persisted / templated).
+  const isolateImports = useConfigStore((s) => s.config.behavioral.isolateImports);
+  const isolateExports = useConfigStore((s) => s.config.behavioral.isolateExports);
+  const setConfig = useConfigStore((s) => s.setConfig);
+  const setIsolateImports = (on: boolean) => setConfig({ behavioral: { isolateImports: on } });
+  const setIsolateExports = (on: boolean) => setConfig({ behavioral: { isolateExports: on } });
 
   // Hide when no project is open — there are no edges to filter.
   if (!project) return null;
@@ -151,42 +155,3 @@ function Kbd({ children }: { children: React.ReactNode }) {
   );
 }
 
-function Pill({
-  label,
-  on,
-  color,
-  onToggle,
-}: {
-  label: string;
-  on: boolean;
-  color: { bg: string; text: string };
-  onToggle: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      aria-pressed={on}
-      style={{
-        appearance: 'none',
-        border: 0,
-        padding: '0.25rem 0.65rem',
-        borderRadius: 999,
-        background: on ? color.bg : 'rgba(40, 40, 46, 0.85)',
-        color: on ? color.text : '#888892',
-        fontFamily: 'inherit',
-        fontSize: 'inherit',
-        // Subtle border at all times — readable on the dark canvas
-        // whether the pill is on or off — opacity does the on/off
-        // signalling within the bg colour.
-        boxShadow: 'inset 0 0 0 1px rgba(120, 120, 130, 0.35)',
-        cursor: 'pointer',
-        opacity: on ? 1 : 0.55,
-        transition: 'opacity 120ms ease, background-color 120ms ease',
-        backdropFilter: 'blur(6px)',
-      }}
-    >
-      {label}
-    </button>
-  );
-}

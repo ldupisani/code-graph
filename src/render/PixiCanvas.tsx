@@ -4,6 +4,10 @@ import {getFileAst} from "../api/client";
 import {applyExpansion, assignRigidPositions, buildFileLayout, EXPANDED_MAX, EXPANDED_MIN, isCircular, refreshSizeForces, type FileLayoutResult} from "../graph/layout";
 import {AST_LABEL_FONT, astLabelOnScreenFactor, astLabelScale, fileLabel, labelScreenBox, measureMono} from "../graph/labels";
 import {isSupportFile, useGraphStore} from "../graph/store";
+import {useConfigStore} from "../graph/config/store";
+import type {EdgeLineStyle, GraphConfig, LodConfig, ThemeColors} from "../graph/config/types";
+import {activeTiers, createTierEngine} from "./tierLayout";
+import {getPattern} from "../graph/patterns/registry";
 import {layoutAst, type TreemapLayout, type TreemapNode} from "../graph/treemap";
 import {buildAstForceLayout, type AstForceLayout, type ContainerForceLayout} from "../graph/astForce";
 import type {FileAstResponse, ImportEdge, ProjectResponse, SemanticEdge, SemanticEdgeKind} from "../api/types";
@@ -51,43 +55,22 @@ const SEMANTIC_EDGE_STYLE: Record<SemanticEdgeKind, {color: number; width: numbe
     implements: {color: 0x60d0c0, width: 1.4, alpha: 0.85, arrowSize: 8},
 };
 
-// LOD: rects whose smaller side is below this many screen pixels are not drawn.
-const CULL_PX = 4;
-// Below this camera zoom the view "simplifies": generic kind labels
-// (type/if/=>/…) drop out, leaving only real names. Operator glyphs
-// (=, *, +, …) stay — they're the meaning that holds a pair of named
-// operands together — and only drop when they no longer fit. Zoom in
-// past it for full detail.
-const SIMPLIFY_BELOW = 1.5;
-// Block/object kind outlines are cheap structural cues (just a colored
-// border, no text), so they come back much earlier when zooming in than the
-// rest of the detail — at this lower zoom threshold.
-const OUTLINE_BELOW = 0.5;
-// Call links only render when their caller node is on screen anyway (its
-// file must be expanded), so they can come back early too — otherwise
-// they're invisible until an expanded node fills the whole viewport.
-const CALLS_BELOW = 0.5;
-// File-name labels and the cluster-hull stroke fade are now gated on
-// `isolateRegimeEnabled()` instead of an absolute zoom — they appear
-// at the same moment the isolate-mode regime kicks in, which is
-// project-fit-relative (cameraScale / fitScale ≥ ISOLATE_AT_MUL).
-// Keeping these three transitions (labels, hull stroke, isolate
-// hiding) co-located gives the user one coherent "you're now in
-// detail mode" zoom landmark instead of three independent ones.
-// Intra-directory edges — imports / calls / extends between two files
-// in the SAME directory — are mostly local plumbing and dense to look
-// at. Below this zoom they're hidden entirely so only cross-directory
-// connections remain visible. Zoom in past it for the local detail.
-const INTRA_DIR_BELOW = 0.6;
-// Edge "screen length" below which the edge progressively dims. Short
-// edges (within-cluster local plumbing) get muted; long edges
-// (cross-cluster architectural connections) stay bright. Linear ramp
-// from full alpha at EDGE_LENGTH_BRIGHT_PX → minimum alpha at
-// EDGE_LENGTH_DIM_PX. Keeps the architectural signal visible even
-// when local imports densely overlap.
-const EDGE_LENGTH_DIM_PX = 50;
-const EDGE_LENGTH_BRIGHT_PX = 180;
-const EDGE_LENGTH_MIN_ALPHA = 0.18;
+// Live theme: the renderer reads colors / semantic-edge styles through these
+// module-level bindings, refreshed each frame from cfg.theme in the ticker. The
+// `as const` palette above is the default + fallback. (KIND_OUTLINE /
+// KIND_FILL_TINT below capture the defaults at module load — the AST-kind
+// palette is intentionally not user-themed in v1.)
+let activeColors: ThemeColors = COLORS;
+let activeSemanticEdge: Record<SemanticEdgeKind, {color: number; width: number; alpha: number; arrowSize: number}> = SEMANTIC_EDGE_STYLE;
+
+// LOD thresholds (cull/simplify/outline/calls/intra-dir + edge-length ramp)
+// now live in the config — see DEFAULT_LOD in graph/config/defaults.ts for the
+// values and rationale. The renderer reads them per frame via `cfg.lod.*`.
+//
+// Note: the cluster-hull stroke fade is gated on `isolateRegimeEnabled()`
+// (project-fit-relative). File-name labels have their own configurable
+// fit-relative threshold (cfg.lod.fileNamesAtMul, default 2 — which matches the
+// isolate regime, so they still coincide unless the user retunes it).
 // Every Block (the magenta sequential-code cells — function bodies,
 // if/for/while/try bodies, standalone braced scopes) defaults to a
 // COLLAPSED single-cell rendering: just the kind outline, no
@@ -249,53 +232,53 @@ const NAME_LIKE_KINDS = new Set([
 // Kinds shown as a colored outline instead of a text label. They carry no
 // label (decluttered) but stay visually identifiable by border color.
 const KIND_OUTLINE: Record<string, number> = {
-    Block: COLORS.astOutlineBlock,
-    ObjectLiteralExpression: COLORS.astOutlineObject,
+    Block: activeColors.astOutlineBlock,
+    ObjectLiteralExpression: activeColors.astOutlineObject,
     // Same outline as ObjectLiteralExpression — TypeLiteral reads as
     // an "object shape" too, just in type position.
-    TypeLiteral: COLORS.astOutlineObject,
+    TypeLiteral: activeColors.astOutlineObject,
     // Destructured parameter pattern (`({ id, size }: Props)`) — the
     // React component prop-definition shape. Same yellow as
     // ObjectLiteralExpression / TypeLiteral so the brace cells across
     // value, type, and binding positions all read as one visual idiom.
-    ObjectBindingPattern: COLORS.astOutlineObject,
-    Parameter: COLORS.astOutlineParam,
+    ObjectBindingPattern: activeColors.astOutlineObject,
+    Parameter: activeColors.astOutlineParam,
     // Type definitions (interfaces, type aliases). They used to render
     // as a dashed green circle with every member visible; now they're
     // collapsed cells (see EXPANDABLE_KINDS) with this same green for
     // continuity. Click to drill into members.
-    InterfaceDeclaration: COLORS.astOutlineAbstract,
-    TypeAliasDeclaration: COLORS.astOutlineAbstract,
+    InterfaceDeclaration: activeColors.astOutlineAbstract,
+    TypeAliasDeclaration: activeColors.astOutlineAbstract,
     // Classes share the green with interfaces / type aliases — same
     // colour the EXPANDED class circle uses (see `classOutline` below
     // in drawAstNode). Visual continuity across the collapsed-cell ↔
     // expanded-circle toggle.
-    ClassDeclaration: COLORS.astOutlineAbstract,
+    ClassDeclaration: activeColors.astOutlineAbstract,
     // Top-level `const/let/var x = ...` statements collapse to a
     // single labelled cell. Yellow matches the object/array brace
     // colour since most non-trivial top-level vars are object or
     // array initializers — the colour signals "value-bearing
     // container, click to drill in" the same way the brace cells do.
-    VariableStatement: COLORS.astOutlineObject,
+    VariableStatement: activeColors.astOutlineObject,
     // JSX wrappers — `<Foo>…</Foo>` and `<>…</>`. The expandable cell
     // shows the tag in its collapsed leaf; clicking spawns an overlay
     // with the opening tag (and its attributes), children, and closing
     // tag as separate rects.
-    JsxElement: COLORS.astOutlineJsx,
-    JsxFragment: COLORS.astOutlineJsx,
+    JsxElement: activeColors.astOutlineJsx,
+    JsxFragment: activeColors.astOutlineJsx,
     // Control-flow statements — pink border matches the `control`
     // syntax category used for their labels (if/for/while/etc.). The
     // border makes the statement's rect boundary unambiguous even at
     // zooms where the small `if` / `for` text label would be easy to
     // miss inside a larger surrounding Block.
-    IfStatement: COLORS.astOutlineControl,
-    ForStatement: COLORS.astOutlineControl,
-    ForInStatement: COLORS.astOutlineControl,
-    ForOfStatement: COLORS.astOutlineControl,
-    WhileStatement: COLORS.astOutlineControl,
-    DoStatement: COLORS.astOutlineControl,
-    SwitchStatement: COLORS.astOutlineControl,
-    TryStatement: COLORS.astOutlineControl,
+    IfStatement: activeColors.astOutlineControl,
+    ForStatement: activeColors.astOutlineControl,
+    ForInStatement: activeColors.astOutlineControl,
+    ForOfStatement: activeColors.astOutlineControl,
+    WhileStatement: activeColors.astOutlineControl,
+    DoStatement: activeColors.astOutlineControl,
+    SwitchStatement: activeColors.astOutlineControl,
+    TryStatement: activeColors.astOutlineControl,
 };
 
 // Per-kind background tint applied to the AST cell's fill. Each entry
@@ -527,13 +510,13 @@ const SYNTAX_CATEGORY: Record<string, keyof typeof SYNTAX> = {
 // progressively muted to ~MIN_ALPHA; long edges (cross-cluster
 // architectural connections) keep full strength. Linear ramp between
 // the two thresholds.
-function edgeLengthAlphaMultiplier(sx: number, sy: number, tx: number, ty: number, cameraScale: number): number {
+function edgeLengthAlphaMultiplier(sx: number, sy: number, tx: number, ty: number, cameraScale: number, lod: LodConfig): number {
     // Convert world distance to screen pixels.
     const screenLen = Math.hypot(tx - sx, ty - sy) * cameraScale;
-    if (screenLen >= EDGE_LENGTH_BRIGHT_PX) return 1;
-    if (screenLen <= EDGE_LENGTH_DIM_PX) return EDGE_LENGTH_MIN_ALPHA;
-    const t = (screenLen - EDGE_LENGTH_DIM_PX) / (EDGE_LENGTH_BRIGHT_PX - EDGE_LENGTH_DIM_PX);
-    return EDGE_LENGTH_MIN_ALPHA + (1 - EDGE_LENGTH_MIN_ALPHA) * t;
+    if (screenLen >= lod.edgeLengthBrightPx) return 1;
+    if (screenLen <= lod.edgeLengthDimPx) return lod.edgeLengthMinAlpha;
+    const t = (screenLen - lod.edgeLengthDimPx) / (lod.edgeLengthBrightPx - lod.edgeLengthDimPx);
+    return lod.edgeLengthMinAlpha + (1 - lod.edgeLengthMinAlpha) * t;
 }
 
 // HSL → packed 0xRRGGBB. Saturation / lightness are percentages 0-100;
@@ -599,8 +582,19 @@ function isHighLevel(node: {syntaxKind: string; exported?: boolean}): boolean {
 // project starts at the default centered view.
 let savedCamera: {rootPath: string; x: number; y: number; scale: number} | null = null;
 
+// Imperative canvas controls exposed to the React HUD (zoom + pin buttons), so
+// device-independent actions exist alongside the wheel / keyboard.
+export interface CameraApi {
+    zoomBy: (factor: number) => void; // factor < 1 zooms out, > 1 zooms in
+    fitView: () => void; // re-frame the overview layout
+    pinAll: () => void; // pin every file box at its current position
+    pinVisible: () => void; // pin only the files currently on screen
+    unpinAll: () => void; // release every user pin
+}
+
 interface CanvasProps {
     project: ProjectResponse;
+    cameraApiRef?: {current: CameraApi | null};
 }
 
 interface HitRect {
@@ -612,7 +606,12 @@ interface HitRect {
     // and steal every click. handleClick treats 'ast-toggle' the same
     // as clicking an empty Block area (toggles), and the cursor flips
     // to 'pointer' over it.
-    kind: "file" | "ast" | "ast-toggle";
+    //
+    // 'folder' marks the directory-hull label (the `[src/components]`
+    // text shown at the centre of each cluster). Carries the cluster
+    // directory in `id`; `fileId` is unused for this kind. Used by
+    // the drag-fork to grab every file under a folder at once.
+    kind: "file" | "ast" | "ast-toggle" | "folder";
     x: number;
     y: number;
     w: number;
@@ -632,8 +631,19 @@ if (import.meta.hot) {
     });
 }
 
-export function PixiCanvas({project}: CanvasProps) {
+export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
     const containerRef = useRef<HTMLDivElement | null>(null);
+    // Live config bridge: mirror useConfigStore.config into a ref the render
+    // loop reads each frame. The canvas effect only re-runs on `project`
+    // change, so config edits reach the running renderer through this ref
+    // without tearing down / recreating the Pixi app.
+    const configRef = useRef<GraphConfig>(useConfigStore.getState().config);
+    useEffect(() => {
+        configRef.current = useConfigStore.getState().config;
+        return useConfigStore.subscribe((s) => {
+            configRef.current = s.config;
+        });
+    }, []);
 
     useEffect(() => {
         const container = containerRef.current;
@@ -645,7 +655,7 @@ export function PixiCanvas({project}: CanvasProps) {
         void (async () => {
             const app = new Application();
             await app.init({
-                background: COLORS.bg,
+                background: activeColors.bg,
                 resizeTo: container,
                 antialias: true,
                 autoDensity: true,
@@ -670,7 +680,17 @@ export function PixiCanvas({project}: CanvasProps) {
             // moderate zoom-in whatever the project's size.
             let fitScale = 1;
 
+            // Current config snapshot for this frame. Refreshed at the top of
+            // the ticker; nested draw/predicate helpers read `cfg.lod.*` /
+            // `cfg.behavioral.*` and so pick up live edits (closures resolve
+            // this free variable at call time).
+            let cfg = configRef.current;
+
             const layout = buildFileLayout(project);
+            // Drives the configured tiers: keeps layout.rigidRaw in sync with
+            // the static (overview) tier's pattern, and derives the rigid-blend
+            // weight from the tier zoom ranges (replaces the old rigidness()).
+            const tierEngine = createTierEngine(project, layout);
             if (import.meta.env.DEV && typeof window !== "undefined") {
                 (window as unknown as {__codegraph: unknown}).__codegraph = {
                     layout,
@@ -723,6 +743,11 @@ export function PixiCanvas({project}: CanvasProps) {
             // between them is a short travel rather than a fly-across.
             layout.simulation.tick(50);
             snapshotConn();
+            // Apply the configured overview pattern to rigidRaw BEFORE the
+            // initial anchor + fit, so a persisted non-default pattern (e.g. a
+            // saved hub-and-spoke template) is framed correctly on open rather
+            // than only after the first frame.
+            tierEngine.sync(configRef.current);
             assignRigidPositions(layout, connCentre());
 
             // Always run the auto-fit: besides framing the project it
@@ -760,19 +785,25 @@ export function PixiCanvas({project}: CanvasProps) {
                 let minY = Infinity;
                 let maxX = -Infinity;
                 let maxY = -Infinity;
+                // Frame the OVERVIEW (coarsest, index-0) tier — what's shown when
+                // fully zoomed out. If it's a live tier, that's the connectivity
+                // (connX) layout; otherwise the static buffer (rigidX = the
+                // coarsest static tier's centred positions). Framing only the
+                // overview keeps the fit matched to what's actually on screen at
+                // open — earlier this framed the force sim's (often huge,
+                // undisplayed) extent too, which skewed fitScale and pushed the
+                // open zoom past the overview tier's range.
+                const tiers = configRef.current.tiers;
+                const overviewLive = tiers.length > 0 && getPattern(tiers[0].patternId).kind === "live";
                 for (const n of nodes) {
                     const halfW = n.width / 2;
                     const halfH = n.height / 2;
-                    // Connectivity-layout extent.
-                    if (n.connX - halfW < minX) minX = n.connX - halfW;
-                    if (n.connY - halfH < minY) minY = n.connY - halfH;
-                    if (n.connX + halfW > maxX) maxX = n.connX + halfW;
-                    if (n.connY + halfH > maxY) maxY = n.connY + halfH;
-                    // Rigid-layout extent.
-                    if (n.rigidX - halfW < minX) minX = n.rigidX - halfW;
-                    if (n.rigidY - halfH < minY) minY = n.rigidY - halfH;
-                    if (n.rigidX + halfW > maxX) maxX = n.rigidX + halfW;
-                    if (n.rigidY + halfH > maxY) maxY = n.rigidY + halfH;
+                    const px = overviewLive ? n.connX : n.rigidX;
+                    const py = overviewLive ? n.connY : n.rigidY;
+                    if (px - halfW < minX) minX = px - halfW;
+                    if (py - halfH < minY) minY = py - halfH;
+                    if (px + halfW > maxX) maxX = px + halfW;
+                    if (py + halfH > maxY) maxY = py + halfH;
                 }
                 const bboxW = maxX - minX;
                 const bboxH = maxY - minY;
@@ -923,7 +954,9 @@ export function PixiCanvas({project}: CanvasProps) {
                 // the visibleById entry for the Block id, otherwise camera
                 // follow / edge anchoring would resolve to the small 12px
                 // handle rect instead of the full overlay or cell.
-                if (r.kind !== "ast-toggle") {
+                // 'folder' is the same story: a drag handle, not a
+                // semantic anchor for edges or follow.
+                if (r.kind !== "ast-toggle" && r.kind !== "folder") {
                     visibleById.set(r.id, r);
                 }
             };
@@ -1411,6 +1444,33 @@ export function PixiCanvas({project}: CanvasProps) {
                         anchorY: 0.5,
                         scale: 1 / cameraScale,
                     });
+                    // Hit rect so the drag-fork can grab a folder by
+                    // its label. The label is drawn at screen size 12
+                    // monospace with a scale of 1 / cameraScale, so
+                    // its WORLD-space size is `12 / cameraScale` tall
+                    // and `chars × ~7 / cameraScale` wide. The 7 px/
+                    // char heuristic over-shoots most monospace UI
+                    // fonts slightly, giving a generous grab target
+                    // (which is what you want for a small text rect).
+                    // The hit rect is centred on the eased label
+                    // position to match anchorX/Y = 0.5 in the label
+                    // pool.
+                    const text = `[${dir}]`;
+                    const rectW = (text.length * 7) / cameraScale;
+                    const rectH = 14 / cameraScale;
+                    pushRect({
+                        id: dir,
+                        // fileId is unused for folder hits — the
+                        // drag-fork keys off `id` (the cluster dir)
+                        // and resolves the file list at drag-start.
+                        fileId: "",
+                        kind: "folder",
+                        x: eased.x - rectW / 2,
+                        y: eased.y - rectH / 2,
+                        w: rectW,
+                        h: rectH,
+                        area: rectW * rectH,
+                    });
                 }
             };
 
@@ -1450,8 +1510,8 @@ export function PixiCanvas({project}: CanvasProps) {
                 // nothing — only the seeds themselves stay live, and
                 // (later) the isolate-active check turns isolate off
                 // anyway so this branch isn't usually exercised.
-                const followOut = st.isolateImports;
-                const followIn = st.isolateExports;
+                const followOut = cfg.behavioral.isolateImports;
+                const followIn = cfg.behavioral.isolateExports;
                 for (let hop = 0; hop < st.focusHops; hop++) {
                     const next: string[] = [];
                     for (const node of frontier) {
@@ -1479,7 +1539,7 @@ export function PixiCanvas({project}: CanvasProps) {
             };
             const maybeRecomputeLiveFiles = (): void => {
                 const st = useGraphStore.getState();
-                const key = `${st.focusHops}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}|${st.isolateImports}|${st.isolateExports}`;
+                const key = `${st.focusHops}|${st.edgeFilter.imports}|${st.edgeFilter.calls}|${st.edgeFilter.extends}|${cfg.behavioral.isolateImports}|${cfg.behavioral.isolateExports}`;
                 if (st.selectionSet === liveFilesSelectionRef && key === liveFilesKey) {
                     return;
                 }
@@ -1763,7 +1823,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // visual changes rather than firing them together.
                 // Each regime has its own hysteresis band. Path-traced
                 // files override the hide.
-                const isolateActive = (state.isolateImports || state.isolateExports) && !ambient && liveFiles != null && isolateRegimeEnabled();
+                const isolateActive = (cfg.behavioral.isolateImports || cfg.behavioral.isolateExports) && !ambient && liveFiles != null && isolateRegimeEnabled();
                 // Set of file ids to suppress completely from rendering
                 // this frame — union of support files (when "tests" is
                 // off) and isolate-mode outsiders (when isolate is
@@ -1780,10 +1840,22 @@ export function PixiCanvas({project}: CanvasProps) {
                     if (!hideSupport && !isolateActive) return null;
                     const out = new Set<string>();
                     if (hideSupport) {
-                        for (const id of supportFileIds) out.add(id);
+                        for (const id of supportFileIds) {
+                            // User-pinned files are always visible — a
+                            // pin is the user explicitly saying "I
+                            // care about THIS file"; respect that
+                            // over the broad-strokes tests filter.
+                            if (layout.byId.get(id)?.userPinned) continue;
+                            out.add(id);
+                        }
                     }
                     if (isolateActive && liveFiles) {
                         for (const sim of layout.nodes) {
+                            // Same rule applies to isolation hiding:
+                            // a pinned file is a persistent "point
+                            // of interest" indicator that must stay
+                            // on screen regardless of focus mode.
+                            if (sim.userPinned) continue;
                             if (!liveFiles.has(sim.id) && !pathFileSet.has(sim.id)) {
                                 out.add(sim.id);
                             }
@@ -1832,6 +1904,8 @@ export function PixiCanvas({project}: CanvasProps) {
                         // group into. Otherwise edges between same-cluster but
                         // different-leaf-directory files would still draw.
                         fileToActiveCluster,
+                        cfg.lod,
+                        cfg.theme.edgeStyle,
                     );
                 } else {
                     visibleSemanticPairs.clear();
@@ -1856,7 +1930,14 @@ export function PixiCanvas({project}: CanvasProps) {
                 // multiplier, so file + directory names stay readable.
                 for (const sim of layout.nodes) {
                     if (hiddenFileIds && hiddenFileIds.has(sim.id)) continue;
-                    const dimmed = effectiveLiveFiles != null && !effectiveLiveFiles.has(sim.id) && !pathFileSet.has(sim.id);
+                    // Pinned files dim with focus like any other file (their
+                    // box gets no special brightness). Whether the pin ICON
+                    // stays bright on a dimmed box is controlled separately by
+                    // cfg.behavioral.highlightPins (see drawFile's badge).
+                    const dimmed =
+                        effectiveLiveFiles != null &&
+                        !effectiveLiveFiles.has(sim.id) &&
+                        !pathFileSet.has(sim.id);
                     drawFile(sim, selectionSet, dimmed ? 0.22 : 1);
                 }
                 // 2c. Path overlay: thin yellow outline around every file
@@ -1969,6 +2050,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     hiddenFileIds,
                     // Same active-cluster grouping as drawEdges (above).
                     fileToActiveCluster,
+                    cfg.lod,
                 );
             }
 
@@ -2010,14 +2092,14 @@ export function PixiCanvas({project}: CanvasProps) {
                 const labelScale = 1 / cameraScale;
                 const aboveGap = 8 / cameraScale; // screen-constant gap above the node
                 const putName = (topY: number): void => {
-                    // LOD gate: hide individual file names below the
-                    // isolate-regime zoom so the directory-hull labels
-                    // carry the spatial story until the user has zoomed
-                    // in enough to commit to per-file detail. The
-                    // SELECTED file AND any currently HOVERED file are
-                    // exceptions — they're the user's anchor and the user's
-                    // current point of attention; both must stay readable.
-                    if (!isolateRegimeEnabled() && !isSelected && !isHovered) {
+                    // LOD gate: hide individual file names until the camera
+                    // reaches the configured file-name zoom (fileNamesAtMul ×
+                    // fitScale) so the directory-hull labels carry the spatial
+                    // story until then. The SELECTED file AND any currently
+                    // HOVERED file are exceptions — they're the user's anchor
+                    // and current point of attention; both stay readable.
+                    const fileNamesVisible = cameraScale >= cfg.lod.fileNamesAtMul * Math.max(fitScale, 1e-4);
+                    if (!fileNamesVisible && !isSelected && !isHovered) {
                         return;
                     }
                     // Expanded files AND hovered files show the FULL
@@ -2037,7 +2119,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     // attention target stands out against the dimmer rest.
                     const cluster = fileToActiveCluster.get(sim.id);
                     const highlighted = showFullPath || isSelected;
-                    const color = highlighted || !cluster ? COLORS.text : colourForDirectoryDim(cluster);
+                    const color = highlighted || !cluster ? activeColors.text : colourForDirectoryDim(cluster);
                     // Default: 75% of the directory-hull label's 12px so
                     // file names sit a tier below their containing folder
                     // name in the visual hierarchy. Highlighted state
@@ -2135,9 +2217,9 @@ export function PixiCanvas({project}: CanvasProps) {
                     // blue override so the click target stays unambiguously
                     // distinct.
                     const cluster = fileToActiveCluster.get(sim.id);
-                    const dirColour = cluster ? colourForDirectoryStrong(cluster) : COLORS.file;
-                    const body = isSelected ? COLORS.fileSelected : dirColour;
-                    const line = isSelected ? COLORS.fileBorderSelected : cluster ? colourForDirectory(cluster) : COLORS.fileBorder;
+                    const dirColour = cluster ? colourForDirectoryStrong(cluster) : activeColors.file;
+                    const body = isSelected ? activeColors.fileSelected : dirColour;
+                    const line = isSelected ? activeColors.fileBorderSelected : cluster ? colourForDirectory(cluster) : activeColors.fileBorder;
                     const strokeW = Math.min(1, 1 / cameraScale);
                     worldGfx
                         .poly([ix, iy, ix + iw - fold, iy, ix + iw, iy + fold, ix + iw, iy + ih, ix, iy + ih])
@@ -2152,10 +2234,10 @@ export function PixiCanvas({project}: CanvasProps) {
                 //    only thing rendered (icon path above skipped).
                 if (t > 0) {
                     const circleAlpha = t * dimAlpha;
-                    worldGfx.circle(sim.x, sim.y, animatedR).fill({color: COLORS.fileExpanded, alpha: 0.7 * circleAlpha});
+                    worldGfx.circle(sim.x, sim.y, animatedR).fill({color: activeColors.fileExpanded, alpha: 0.7 * circleAlpha});
                     if (isSelected) {
                         worldGfx.circle(sim.x, sim.y, animatedR).stroke({
-                            color: COLORS.fileSelected,
+                            color: activeColors.fileSelected,
                             width: FILE_RIM / 2,
                             alpha: circleAlpha,
                         });
@@ -2210,6 +2292,34 @@ export function PixiCanvas({project}: CanvasProps) {
                     }
                     if (tree) drawSubtree(tree, x, y, sim.id, selectionSet);
                 }
+
+                // 6. Pin badge — a small yellow dot at the upper-right
+                //    of the file's visible shape when this file has
+                //    been manually dragged by the user. Yellow matches
+                //    the `↓ imports` pill in the HUD (the existing
+                //    "user choice" hue in this UI). Position
+                //    interpolates between the icon's top-right corner
+                //    (t=0) and the circle's 45°-above-right point
+                //    (t=1) so the badge tracks the shape through the
+                //    expand/collapse animation without a jump.
+                if (sim.userPinned) {
+                    // The box dims with focus; the pin ICON can optionally stay
+                    // bright so it remains a clear anchor on a dimmed file
+                    // (highlightPins). When off, the icon dims with its box.
+                    const pinAlpha = cfg.behavioral.highlightPins ? 1 : dimAlpha;
+                    const iconPx = ix + iw;
+                    const iconPy = iy;
+                    const circPx = sim.x + animatedR * 0.7071;
+                    const circPy = sim.y - animatedR * 0.7071;
+                    const bx = iconPx + (circPx - iconPx) * t;
+                    const by = iconPy + (circPy - iconPy) * t;
+                    const badgeR = 4 / cameraScale;
+                    const badgeStroke = 1 / cameraScale;
+                    worldGfx
+                        .circle(bx, by, badgeR)
+                        .fill({color: 0xe8c84a, alpha: pinAlpha})
+                        .stroke({color: 0x1c1c08, width: badgeStroke, alpha: pinAlpha});
+                }
             }
 
             function drawSubtree(tree: TreemapLayout, _baseX: number, _baseY: number, fileId: string, selectionSet: ReadonlySet<string>): void {
@@ -2261,7 +2371,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 const isInterface = node.syntaxKind === "InterfaceDeclaration";
                 const isAbstract = !!node.abstract;
                 const dashed = isInterface || isAbstract;
-                const strokeColor = isSelected ? COLORS.fileSelected : isInterface || isAbstract ? COLORS.astOutlineAbstract : SYNTAX.type;
+                const strokeColor = isSelected ? activeColors.fileSelected : isInterface || isAbstract ? activeColors.astOutlineAbstract : SYNTAX.type;
                 const strokeWidth = (isSelected ? FILE_RIM / 2 : 1) / cameraScale;
                 const strokeAlpha = 1;
 
@@ -2287,8 +2397,8 @@ export function PixiCanvas({project}: CanvasProps) {
                     node.syntaxKind === "ExportDeclaration" ||
                     node.syntaxKind === "ExportAssignment";
                 const containerFillColor = isExportContainer
-                    ? blendColor(COLORS.fileExpanded, EXPORT_FILL_COLOR, EXPORT_FILL_BLEND)
-                    : COLORS.fileExpanded;
+                    ? blendColor(activeColors.fileExpanded, EXPORT_FILL_COLOR, EXPORT_FILL_BLEND)
+                    : activeColors.fileExpanded;
                 worldGfx.circle(cx, cy, radius).fill({color: containerFillColor, alpha: 0.55});
 
                 if (dashed) {
@@ -2328,7 +2438,7 @@ export function PixiCanvas({project}: CanvasProps) {
                         text: labelText,
                         worldX: cx,
                         worldY: y - aboveGap,
-                        color: isInterface ? COLORS.astOutlineAbstract : SYNTAX.type,
+                        color: isInterface ? activeColors.astOutlineAbstract : SYNTAX.type,
                         size: AST_LABEL_FONT,
                         anchorX: 0.5,
                         anchorY: 1,
@@ -2425,10 +2535,10 @@ export function PixiCanvas({project}: CanvasProps) {
                 // (magenta for Block, yellow for ObjectLiteralExpression)
                 // so the overlay reads as a magnified version of the cell
                 // it was spawned from.
-                const stroke = KIND_OUTLINE[blockNode.syntaxKind] ?? COLORS.astBorder;
+                const stroke = KIND_OUTLINE[blockNode.syntaxKind] ?? activeColors.astBorder;
                 worldGfx
                     .rect(x, y, w, h)
-                    .fill({color: COLORS.fileExpanded, alpha: 1})
+                    .fill({color: activeColors.fileExpanded, alpha: 1})
                     .stroke({color: stroke, width: 1.5 / cameraScale, alpha: 1});
 
                 pushRect({
@@ -2458,7 +2568,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // request to move it). Smaller-area HitRect with kind
                 // 'ast-toggle' takes priority over the overlay body for
                 // clicks in this region.
-                if (!anim && cameraScale >= OUTLINE_BELOW) {
+                if (!anim && cameraScale >= cfg.lod.outlineBelow) {
                     const handleSize = 12 / cameraScale;
                     const handleInset = 4 / cameraScale;
                     const hx = x + handleInset;
@@ -2499,7 +2609,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 const wOnScreen = node.rect.w * cameraScale;
                 const hOnScreen = node.rect.h * cameraScale;
                 const minScreen = Math.min(wOnScreen, hOnScreen);
-                if (minScreen < CULL_PX) return;
+                if (minScreen < cfg.lod.cullPx) return;
 
                 // (The Block grow/shrink animation now lives in drawOverlay —
                 // the underlying main-scene cell stays at its layout size and
@@ -2526,7 +2636,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // (alpha 1 + thicker stroke) so the user sees it's interactive;
                 // clicking toggles it via handleClick.
                 if (node.collapsed) {
-                    const stroke = KIND_OUTLINE[node.syntaxKind] ?? COLORS.astBorder;
+                    const stroke = KIND_OUTLINE[node.syntaxKind] ?? activeColors.astBorder;
                     const isSelectedLeaf = selectionSet.has(node.id);
                     const isHovered = hoveredHit?.id === node.id;
                     // Collapsed exported cells (e.g. `export class Cat` when
@@ -2557,7 +2667,7 @@ export function PixiCanvas({project}: CanvasProps) {
                             alpha: collapsedFillAlpha,
                         })
                         .stroke({
-                            color: isSelectedLeaf ? COLORS.astSelected : stroke,
+                            color: isSelectedLeaf ? activeColors.astSelected : stroke,
                             width: (isHovered ? 2 : 1) / cameraScale,
                             alpha: 1,
                         });
@@ -2613,7 +2723,7 @@ export function PixiCanvas({project}: CanvasProps) {
 
                 // Zoomed-out "simplified" tier: drop operators and generic kind
                 // labels — keep only real names.
-                const simplified = cameraScale < SIMPLIFY_BELOW;
+                const simplified = cameraScale < cfg.lod.simplifyBelow;
 
                 // AST label scaling tier. Below the lock zoom, labels render
                 // at WORLD scale (shrink as you zoom out, grow as you zoom
@@ -2664,17 +2774,17 @@ export function PixiCanvas({project}: CanvasProps) {
                 // Kind outlines have their own (much lower) zoom threshold so they
                 // reappear well before the rest of the detail does. A call argument
                 // with no outline of its own gets the parameter light-blue.
-                const kindOutline = cameraScale < OUTLINE_BELOW ? undefined : (KIND_OUTLINE[node.syntaxKind] ?? (isCallArg ? COLORS.astOutlineParam : undefined));
+                const kindOutline = cameraScale < cfg.lod.outlineBelow ? undefined : (KIND_OUTLINE[node.syntaxKind] ?? (isCallArg ? activeColors.astOutlineParam : undefined));
                 // Abstract definitions AND interfaces get a green dashed outline
                 // (TS interfaces aren't flagged `abstract` but are abstract by
                 // nature). Same zoom gate as the kind outlines.
-                const abstractOutline = (!!node.abstract || node.syntaxKind === "InterfaceDeclaration") && cameraScale >= OUTLINE_BELOW;
+                const abstractOutline = (!!node.abstract || node.syntaxKind === "InterfaceDeclaration") && cameraScale >= cfg.lod.outlineBelow;
                 // An abstract *function* (method/accessor) reads differently from an
                 // abstract class/interface: grey + dotted instead of green + dashed.
                 const abstractFn = !!node.abstract && (node.syntaxKind === "MethodDeclaration" || node.syntaxKind === "GetAccessor" || node.syntaxKind === "SetAccessor");
                 // A concrete class gets the same green, but SOLID (abstract classes
                 // hit the dashed branch above first, so this is non-abstract only).
-                const classOutline = (node.syntaxKind === "ClassDeclaration" || node.syntaxKind === "ClassExpression") && cameraScale >= OUTLINE_BELOW;
+                const classOutline = (node.syntaxKind === "ClassDeclaration" || node.syntaxKind === "ClassExpression") && cameraScale >= cfg.lod.outlineBelow;
                 // A concrete function definition gets the same grey, but SOLID
                 // (abstract functions hit the dotted branch above first).
                 const fnOutline =
@@ -2684,16 +2794,16 @@ export function PixiCanvas({project}: CanvasProps) {
                         node.syntaxKind === "MethodDeclaration" ||
                         node.syntaxKind === "GetAccessor" ||
                         node.syntaxKind === "SetAccessor") &&
-                    cameraScale >= OUTLINE_BELOW;
+                    cameraScale >= cfg.lod.outlineBelow;
                 // Constructor: white box outline + a white wrench badge inside, on
                 // the same cheap-cue zoom gate as the kind outlines.
-                const isCtor = node.syntaxKind === "Constructor" && cameraScale >= OUTLINE_BELOW;
-                let borderColor: number = COLORS.astBorder;
+                const isCtor = node.syntaxKind === "Constructor" && cameraScale >= cfg.lod.outlineBelow;
+                let borderColor: number = activeColors.astBorder;
                 let borderWidth = 0.5;
                 let borderAlpha = 0.9;
                 if (isSelected) {
                     // Selection blue as a thick outline, not a background recolor.
-                    borderColor = COLORS.astSelected;
+                    borderColor = activeColors.astSelected;
                     borderWidth = FILE_RIM / 2;
                     borderAlpha = 1;
                 } else if (kindOutline !== undefined) {
@@ -2708,7 +2818,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     // Visible even when unselected — its own color/width, not the
                     // faint default border (the dashing is applied below). Abstract
                     // functions are grey; abstract classes/interfaces are green.
-                    borderColor = abstractFn ? COLORS.astOutlineAbstractFn : COLORS.astOutlineAbstract;
+                    borderColor = abstractFn ? activeColors.astOutlineAbstractFn : activeColors.astOutlineAbstract;
                     borderWidth = 1 / cameraScale;
                     borderAlpha = 1;
                 } else if (classOutline) {
@@ -2717,12 +2827,12 @@ export function PixiCanvas({project}: CanvasProps) {
                     borderWidth = 1 / cameraScale;
                     borderAlpha = 1;
                 } else if (isCtor) {
-                    borderColor = COLORS.astSelectedBorder; // white
+                    borderColor = activeColors.astSelectedBorder; // white
                     borderWidth = 1 / cameraScale;
                     borderAlpha = 1;
                 } else if (fnOutline) {
                     // Solid grey — same color as an abstract function, but not dotted.
-                    borderColor = COLORS.astOutlineAbstractFn;
+                    borderColor = activeColors.astOutlineAbstractFn;
                     borderWidth = 1 / cameraScale;
                     borderAlpha = 1;
                 }
@@ -2804,7 +2914,7 @@ export function PixiCanvas({project}: CanvasProps) {
                     const gx = x + node.rect.w / 2 - s / 2;
                     const gy = y + bandH / 2 - s / 2;
                     const lw = 1.2 / cameraScale; // outline stroke, ~constant on screen
-                    const col = COLORS.astSelectedBorder; // white
+                    const col = activeColors.astSelectedBorder; // white
                     // Handle: lower-left → up toward the head.
                     worldGfx
                         .moveTo(gx + s * 0.12, gy + s * 0.9)
@@ -3177,25 +3287,14 @@ export function PixiCanvas({project}: CanvasProps) {
             // fully to the deterministic folder outline; 0 = pure
             // force-directed connectivity layout.
             //
-            // The transition band is RELATIVE to fitScale (the zoom the
-            // auto-fit chose at project open), not absolute: fully rigid
-            // at/below fitScale × 1.5, fully connectivity at/above
-            // fitScale × 4.5. A big project auto-fits to a tiny zoom and
-            // a small project to a large one — an absolute band would sit
-            // unreachably far from one or the other. Relative means the
-            // transition is always the same 1.5×–4.5× zoom-in from wherever
-            // the project landed. Log-space because zoom is multiplicative;
-            // smoothstep for an ease-in-out feel.
-            const RIGID_FULL_MUL = 1.5; // fully rigid at/below fitScale × this
-            const RIGID_NONE_MUL = 4.5; // fully connectivity at/above fitScale × this
-            function rigidness(scale: number): number {
-                const lo = Math.log(fitScale * RIGID_FULL_MUL);
-                const hi = Math.log(fitScale * RIGID_NONE_MUL);
-                let t = (Math.log(Math.max(1e-4, scale)) - lo) / (hi - lo);
-                t = t < 0 ? 0 : t > 1 ? 1 : t;
-                const s = t * t * (3 - 2 * t); // smoothstep
-                return 1 - s;
-            }
+            // The zoom→blend transition is now expressed by the configured
+            // tiers' zoom ranges (multiples of fitScale) and computed by the
+            // TierEngine (see tierLayout.ts / activeTiers). It is RELATIVE to
+            // fitScale — the zoom the auto-fit chose at project open — so a big
+            // project (tiny fitScale) and a small one (large fitScale) get the
+            // same transition reachable by a moderate zoom-in. The default
+            // config reproduces the old 1.5×–4.5× band; log-space + smoothstep
+            // for an ease-in-out feel live in activeTiers().
 
             // --- Overlap relaxation -------------------------------------------
             //
@@ -3277,8 +3376,16 @@ export function PixiCanvas({project}: CanvasProps) {
                         // click. The other node in the pair absorbs the
                         // whole separation. Two expanded files: skip — no
                         // push is useful (both are pinned at sim level).
-                        const aMov = a.expanded ? 0 : 1;
-                        const bMov = b.expanded ? 0 : 1;
+                        //
+                        // User-pinned files share the same treatment for
+                        // a different reason: the pin coordinate IS the
+                        // rendered position (ntFor returns 0, so no
+                        // rigid-blend lerp), and letting overlap-relax
+                        // push a pinned file off that coordinate would
+                        // break the "stays put regardless of zoom"
+                        // promise.
+                        const aMov = a.expanded || a.userPinned ? 0 : 1;
+                        const bMov = b.expanded || b.userPinned ? 0 : 1;
                         const tot = aMov + bMov;
                         if (tot === 0) continue;
                         const aShare = aMov / tot;
@@ -3390,9 +3497,9 @@ export function PixiCanvas({project}: CanvasProps) {
             // blend would drag its neighbours under it. 0.5 keeps half the
             // folder structure; the overlap-relaxation pass plus the
             // connectivity sim space things out so the open file stays clear.
-            const RIGID_OPEN_BLEND = 0.5;
             // Eased multiplier on rigidness: 1 when nothing is open, eased
-            // toward RIGID_OPEN_BLEND while any file is open.
+            // toward cfg.behavioral.openLayoutBias while any file is open
+            // (was the RIGID_OPEN_BLEND/RIGID_FLOOR constant, now configurable).
             let rigidEnable = 1;
 
             // Centre the rigid folder layout is currently anchored on. The
@@ -3418,6 +3525,17 @@ export function PixiCanvas({project}: CanvasProps) {
             // release any expansion pins once the post-expand rebalance
             // has finished.
             let simWasActive = false;
+
+            // True between onFileDragStart and onFileDragEnd. While
+            // set, stepLayout skips the d3-force tick, the overlap
+            // relaxation pass, and the rigid-blend lerp — every
+            // automatic layout adjustment is frozen so the user can
+            // place the dragged file against a stable backdrop. The
+            // dragged file's own position is written directly by
+            // onFileDragMove every pointermove, so the renderer still
+            // draws it under the cursor; everything else holds the
+            // pose it had at the moment the drag started.
+            let userDragActive = false;
 
             // How fast each file's actual `width`/`height` ease toward
             // their targets (set by applyExpansion). Asymmetric:
@@ -3460,6 +3578,10 @@ export function PixiCanvas({project}: CanvasProps) {
             // expand/collapse still re-blend cleanly.
             function stepLayout(): void {
                 const sim = layout.simulation;
+                // Recompute the static (overview) tier's buffer into
+                // layout.rigidRaw if its pattern/params changed (cheap no-op
+                // otherwise). Must precede assignRigidPositions below.
+                tierEngine.sync(cfg);
 
                 // 1. Ease per-file width/height toward their targets.
                 //    Runs BEFORE the sim tick so the tick's forces
@@ -3507,6 +3629,27 @@ export function PixiCanvas({project}: CanvasProps) {
                     refreshSizeForces(layout);
                 }
 
+                // FREEZE everything during a manual file drag. While
+                // the user holds and moves a file we don't tick the
+                // sim, run relaxation, or recompute the rigid-blend
+                // lerp — every other node holds the exact pose it had
+                // when the drag started, giving the user a stable
+                // backdrop to aim against. The dragged file's
+                // position is being written directly by
+                // onFileDragMove on each pointermove (sim.x / connX /
+                // fx all in sync), so the renderer still draws it
+                // under the cursor.
+                //
+                // simWasActive is left in lock-step with simActive so
+                // the post-drop frame's "sim just settled" branch
+                // fires correctly: the alpha(0.6) reheat in
+                // onFileDragEnd flips simActive back true, then it
+                // decays naturally over the next ~3 s.
+                if (userDragActive) {
+                    simWasActive = sim.alpha() > sim.alphaMin();
+                    return;
+                }
+
                 // FREEZE positions during the size animation. The
                 // expand/collapse motion is meant to read as a pure
                 // size change in place — letting d3-force's tick and
@@ -3535,10 +3678,14 @@ export function PixiCanvas({project}: CanvasProps) {
                     // the file is where it ended up, and keeping it
                     // pinned would block the next expansion / collide
                     // pass from pushing it out of the new file's way.
-                    // (See expandFileForSelection — pins are designed to
-                    // be transient.)
+                    // (See expandFileForSelection — those pins are
+                    // designed to be transient.)
+                    // EXCEPT user-pinned files: a user drag explicitly
+                    // anchors a file's position; that pin must survive
+                    // every sim settle, expansion, and collapse until
+                    // the user presses U or R to release it.
                     for (const n of layout.nodes) {
-                        if (n.expanded && n.fx != null) {
+                        if (n.expanded && n.fx != null && !n.userPinned) {
                             n.fx = null;
                             n.fy = null;
                         }
@@ -3564,28 +3711,61 @@ export function PixiCanvas({project}: CanvasProps) {
                 rigidCentre.x += (targetCentre.x - rigidCentre.x) * 0.1;
                 rigidCentre.y += (targetCentre.y - rigidCentre.y) * 0.1;
                 assignRigidPositions(layout, rigidCentre);
-                // Ease rigidEnable toward RIGID_OPEN_BLEND while any file is
-                // open, back to 1 when none are. 0.08/frame ≈ a ~0.4s fade —
-                // slow enough to read as a transition, fast enough not to drag.
+                // If the overview tier's pattern just changed, the static
+                // layout's extent is different — re-fit the camera so the new
+                // arrangement lands in view (rigidX/rigidY are fresh above).
+                if (tierEngine.takeRefit()) fitProjectToViewport();
+                // Ease rigidEnable toward openLayoutBias while any file is open,
+                // back to 1 when none are. 0.08/frame ≈ a ~0.4s fade. Governs
+                // the "open a file → neighbours lean toward the live/force layer
+                // to reveal connectivity" blend.
                 const anyFileOpen = useGraphStore.getState().expandedFiles.size > 0;
-                rigidEnable += ((anyFileOpen ? RIGID_OPEN_BLEND : 1) - rigidEnable) * 0.08;
-                // Base zoom-driven rigid weight: 1 at zoom-out, 0 at zoom-in,
-                // scaled by rigidEnable.
-                const rWeight = rigidness(cameraScale) * rigidEnable;
-                // Unconditional floor on the rigid weight — the layout is
-                // never allowed to lean further than halfway toward the
-                // connectivity arrangement. The folder grid is the primary
-                // "where does it live" signal at every zoom, and opening a
-                // file isn't a reason to fully abandon it: the surrounding
-                // files only need to drift halfway toward their connected
-                // positions for the user to read the neighbourhood, and a
-                // bigger lurch makes the context jarring when files open
-                // or close. With this floor, the no-file regime spans
-                // t∈[0.5, 1] and the file-open regime sits at t=0.5 (the
-                // zoom-out endpoint of rWeight equals the floor exactly,
-                // since RIGID_OPEN_BLEND === RIGID_FLOOR).
-                const RIGID_FLOOR = 0.5;
-                const t = Math.max(rWeight, RIGID_FLOOR);
+                rigidEnable += ((anyFileOpen ? cfg.behavioral.openLayoutBias : 1) - rigidEnable) * 0.08;
+
+                // Fill the per-tier render buffers: each static tier's pattern
+                // re-centred on the connectivity centroid into tierX[t]/tierY[t];
+                // live tiers mirror connX/connY.
+                tierEngine.fillBuffers(cfg, rigidCentre, layout.nodes);
+
+                // Which tier(s) are active at this zoom, and how much of the
+                // blend is STATIC vs the live/force layer. Two active static
+                // tiers → staticWeight 1 (the live layer drops out, a pure
+                // static→static crossfade, e.g. treemap → hub-and-spoke). One
+                // static + the live tier → staticWeight = the old folder ⇄ force
+                // lean.
+                const sel = activeTiers(cameraScale, fitScale, cfg.tiers);
+                const aStatic = getPattern(cfg.tiers[sel.a].patternId).kind === "static";
+                const bStatic = sel.b != null && getPattern(cfg.tiers[sel.b].patternId).kind === "static";
+                const wa = sel.b != null ? 1 - sel.w : 1;
+                const wb = sel.w;
+                const staticWeight = (aStatic ? wa : 0) + (bStatic ? wb : 0);
+                // Static blend weight `t`, eased by rigidEnable and floored by
+                // openLayoutBias. The floor only matters when leaning toward the
+                // live layer; with two static tiers staticWeight is 1 so it
+                // never binds and the crossfade completes fully.
+                const t = Math.max(staticWeight * rigidEnable, cfg.behavioral.openLayoutBias);
+
+                // Per-node STATIC position: the crossfade of the active STATIC
+                // tiers' buffers (weight-normalised). When no static tier is
+                // active it returns the connectivity position, so the
+                // lerp(connX, S, nt) below collapses to connX (fully live).
+                function staticPos(n: SimFileNode): {x: number; y: number} {
+                    let sw = 0;
+                    let sx = 0;
+                    let sy = 0;
+                    if (aStatic) {
+                        sx += n.tierX![sel.a] * wa;
+                        sy += n.tierY![sel.a] * wa;
+                        sw += wa;
+                    }
+                    if (bStatic && sel.b != null) {
+                        sx += n.tierX![sel.b] * wb;
+                        sy += n.tierY![sel.b] * wb;
+                        sw += wb;
+                    }
+                    if (sw > 1e-6) return {x: sx / sw, y: sy / sw};
+                    return {x: n.connX, y: n.connY};
+                }
                 // Per-file rigid-blend factor `nt`, by file state:
                 //
                 //   * Expanded (or animating TOWARD expanded): nt=0.
@@ -3667,6 +3847,14 @@ export function PixiCanvas({project}: CanvasProps) {
                 }
 
                 function ntFor(n: SimFileNode): number {
+                    // User-pinned files render at their pin position
+                    // regardless of zoom — nt=0 means the rigid-blend
+                    // term drops out and n.x = connX (the pin) at
+                    // every zoom level. The pin is the user's
+                    // explicit "this file lives HERE" statement; the
+                    // folder-grid layout shouldn't override that as
+                    // they zoom out.
+                    if (n.userPinned) return 0;
                     if (n.targetExpanded) return 0;
                     const base = (1 - biasFor(n)) * t;
                     const polarityProgress = polarityProgressByFile.get(n.id);
@@ -3690,8 +3878,9 @@ export function PixiCanvas({project}: CanvasProps) {
                     n.offX *= OVERLAP_DECAY;
                     n.offY *= OVERLAP_DECAY;
                     const nt = ntFor(n);
-                    n.x = n.connX + (n.rigidX - n.connX) * nt + n.offX;
-                    n.y = n.connY + (n.rigidY - n.connY) * nt + n.offY;
+                    const s = staticPos(n);
+                    n.x = n.connX + (s.x - n.connX) * nt + n.offX;
+                    n.y = n.connY + (s.y - n.connY) * nt + n.offY;
                 }
                 // 2. Relax overlaps — early-exit once a pass moves
                 //    nothing. Skipped while sizes are animating: the
@@ -3715,12 +3904,21 @@ export function PixiCanvas({project}: CanvasProps) {
                 //    is mid-collapse animation.
                 for (const n of layout.nodes) {
                     const nt = ntFor(n);
-                    n.offX = n.x - (n.connX + (n.rigidX - n.connX) * nt);
-                    n.offY = n.y - (n.connY + (n.rigidY - n.connY) * nt);
+                    const s = staticPos(n);
+                    n.offX = n.x - (n.connX + (s.x - n.connX) * nt);
+                    n.offY = n.y - (n.connY + (s.y - n.connY) * nt);
                 }
             }
 
             const tickerCb = () => {
+                // Refresh the per-frame config snapshot first so every helper
+                // below reads this frame's (possibly just-edited) config.
+                cfg = configRef.current;
+                // Live theme: point the renderer's color bindings at the current
+                // config and keep the Pixi clear color in sync.
+                activeColors = cfg.theme.colors;
+                activeSemanticEdge = cfg.theme.semanticEdge;
+                if (app.renderer) app.renderer.background.color = activeColors.bg;
                 // updateZoomFit BEFORE syncExpansion so the latter sees the
                 // zoom we're heading to (a zoom-fit in progress shouldn't be
                 // ignored when deciding whether to expand). syncExpansion
@@ -3784,6 +3982,83 @@ export function PixiCanvas({project}: CanvasProps) {
             // the same id (the Block's) but signal different intent.
             let hoveredHit: HitRect | null = null;
 
+            // Bulk pin/unpin (HUD buttons + P / ⇧P keys). Pinning a file fixes
+            // it at its CURRENT rendered position against the layout — same
+            // recipe as a drag-drop (connX/connY + fx/fy at the spot, clear the
+            // relax offset, mark userPinned). A pinned file renders at connX
+            // (ntFor returns 0), so this holds it exactly where it sits now.
+            function pinNodes(nodes: Iterable<SimFileNode>): void {
+                let any = false;
+                for (const n of nodes) {
+                    n.connX = n.x;
+                    n.connY = n.y;
+                    n.fx = n.x;
+                    n.fy = n.y;
+                    n.offX = 0;
+                    n.offY = 0;
+                    n.userPinned = true;
+                    any = true;
+                }
+                if (any) layout.simulation.alpha(0.6);
+            }
+            function pinAllFiles(): void {
+                pinNodes(layout.nodes);
+            }
+            function pinVisibleFiles(): void {
+                // "Visible" = files the renderer actually drew this frame
+                // (on-screen, not culled, not hidden by support/isolate filters).
+                const seen = new Set<string>();
+                const out: SimFileNode[] = [];
+                for (const r of visibleById.values()) {
+                    if (r.kind !== "file" || seen.has(r.fileId)) continue;
+                    seen.add(r.fileId);
+                    const sim = layout.byId.get(r.fileId);
+                    if (sim) out.push(sim);
+                }
+                pinNodes(out);
+            }
+            function unpinAllFiles(): void {
+                let any = false;
+                for (const n of layout.nodes) {
+                    if (!n.userPinned) continue;
+                    n.userPinned = false;
+                    n.fx = null;
+                    n.fy = null;
+                    any = true;
+                }
+                if (any) layout.simulation.alpha(0.8);
+            }
+
+            // Imperative zoom for the HUD buttons: pivot on the viewport centre
+            // and clear any follow / zoom-fit so they don't fight the input.
+            // Mirrors the wheel handler's math but is device-independent.
+            function applyZoom(next: number): void {
+                const clamped = Math.min(32, Math.max(0.05, next));
+                const px = app.screen.width / 2;
+                const py = app.screen.height / 2;
+                const k = clamped / world.scale.x;
+                world.x = px - (px - world.x) * k;
+                world.y = py - (py - world.y) * k;
+                world.scale.set(clamped);
+                cameraScale = clamped;
+                followId = null;
+                zoomFit = null;
+            }
+            if (cameraApiRef) {
+                cameraApiRef.current = {
+                    zoomBy: (factor) => applyZoom(world.scale.x * factor),
+                    fitView: () => {
+                        followId = null;
+                        zoomFit = null;
+                        fitProjectToViewport();
+                        cameraScale = world.scale.x;
+                    },
+                    pinAll: pinAllFiles,
+                    pinVisible: pinVisibleFiles,
+                    unpinAll: unpinAllFiles,
+                };
+            }
+
             const detachCamera = wireCamera({
                 app,
                 world,
@@ -3804,7 +4079,38 @@ export function PixiCanvas({project}: CanvasProps) {
                     // point.
                     const overlay = smallestContaining(overlayHitRects, worldX, worldY);
                     if (overlay) return overlay;
-                    return smallestContaining(hitRects, worldX, worldY);
+                    const direct = smallestContaining(hitRects, worldX, worldY);
+                    if (direct) return direct;
+                    // Low-zoom proximity fallback for FILE rects. When
+                    // zoomed out, file icons render as 2-3 screen px
+                    // squares; the cursor lands in the gaps between
+                    // them more often than on one, and hover / drag
+                    // become near-impossible. If no direct rect won,
+                    // pick the file whose centre is within a screen-
+                    // constant radius of the cursor. Threshold of 24
+                    // screen px (= 24/cameraScale world units) is
+                    // ~1.5× a default touch target — generous enough
+                    // to reliably catch tiny icons without swallowing
+                    // intentional empty-space clicks (the user has to
+                    // be visibly near a file). Closest centre wins
+                    // when several are inside the radius.
+                    const r = 24 / cameraScale;
+                    const r2 = r * r;
+                    let best: HitRect | null = null;
+                    let bestDist2 = Infinity;
+                    for (const rect of visibleById.values()) {
+                        if (rect.kind !== "file") continue;
+                        const cx = rect.x + rect.w / 2;
+                        const cy = rect.y + rect.h / 2;
+                        const dx = cx - worldX;
+                        const dy = cy - worldY;
+                        const d2 = dx * dx + dy * dy;
+                        if (d2 < r2 && d2 < bestDist2) {
+                            bestDist2 = d2;
+                            best = rect;
+                        }
+                    }
+                    return best;
                 },
                 onClick: handleClick,
                 onHover: (target) => {
@@ -3904,7 +4210,132 @@ export function PixiCanvas({project}: CanvasProps) {
                     if (!bestNode) return null;
                     return {worldX: bestNode.x, worldY: bestNode.y};
                 },
+                // Drag-to-pin: when wireCamera detects the user has
+                // moved past DRAG_DEADZONE while pointer-down on a
+                // file, it asks us to start a file-drag. We resolve
+                // the SimFileNode by id; returning it commits to
+                // file-drag mode. Returning null falls through to
+                // camera-pan.
+                onFileDragStart: (id) => {
+                    const sim = layout.byId.get(id);
+                    if (!sim) return null;
+                    // Freeze automatic layout adjustment so other
+                    // files don't drift while the user is placing
+                    // this one. The flag is consulted at the top of
+                    // stepLayout; cleared in onFileDragEnd.
+                    userDragActive = true;
+                    return sim;
+                },
+                // During a file-drag we update every position field
+                // the renderer / sim might read:
+                //   * sim.x / sim.y     — what drawFile reads
+                //   * connX / connY     — the d3-force authoritative
+                //                         position; the renderer
+                //                         restores x/y from these
+                //                         before each manual tick
+                //   * fx / fy           — d3-force fixed-coordinate
+                //                         pin; freezes the node in
+                //                         place against the next tick
+                //   * offX / offY = 0   — clear any in-flight relax-
+                //                         overlap offset so the file
+                //                         lands exactly under the
+                //                         cursor, not at cursor+offset
+                // Then bump alpha so neighbours start redistributing
+                // live as the user drags — not all at once on drop.
+                onFileDragMove: (sim, nx, ny) => {
+                    sim.x = nx; sim.y = ny;
+                    sim.connX = nx; sim.connY = ny;
+                    sim.fx = nx; sim.fy = ny;
+                    sim.offX = 0; sim.offY = 0;
+                    // No alpha bump here — stepLayout is frozen by
+                    // userDragActive, so heating the sim wouldn't
+                    // achieve anything. The single alpha(0.6) in
+                    // onFileDragEnd does the post-drop redistribute.
+                },
+                // Drop: mark the pin user-set (this is the bit that
+                // makes it survive sim-settle, expansion, collapse,
+                // and reheats — every release site checks userPinned)
+                // and reheat one last time so the surrounding files
+                // converge into the new arrangement.
+                onFileDragEnd: (sim) => {
+                    sim.userPinned = true;
+                    // Release the freeze BEFORE the alpha bump so the
+                    // first post-drop frame's stepLayout actually
+                    // ticks the sim with the freshly heated alpha.
+                    userDragActive = false;
+                    layout.simulation.alpha(0.6);
+                },
+                // Folder-drag start: resolve the directory id to the
+                // list of files whose cluster (at the CURRENT zoom-
+                // adaptive depth) matches. Snapshotting at the start
+                // of the gesture means a depth change mid-drag (e.g.
+                // from zoom-out) doesn't reshape the moving group;
+                // the user keeps moving the same set of files they
+                // grabbed. Returning null/empty falls through to a
+                // camera pan, matching the single-file callback.
+                onFolderDragStart: (folderId) => {
+                    const depth = chooseClusterDepth();
+                    const sims: SimFileNode[] = [];
+                    for (const n of layout.nodes) {
+                        if (clusterDirOf(n.relativePath, depth) === folderId) {
+                            sims.push(n);
+                        }
+                    }
+                    if (sims.length === 0) return null;
+                    userDragActive = true;
+                    return sims;
+                },
             });
+
+            // Pin-release shortcuts. U unpins the file currently
+            // under the cursor (if any); R releases every user pin
+            // in one shot. Both bump the sim alpha so the freed
+            // file(s) drift back into the layout instead of just
+            // sitting where they were.
+            //
+            // Guarded against text-input focus so the keys don't
+            // hijack the URL bar / search box.
+            const onPinKey = (e: KeyboardEvent) => {
+                const ae = document.activeElement;
+                if (ae instanceof HTMLInputElement || ae instanceof HTMLTextAreaElement) return;
+                if (e.key === "u" || e.key === "U") {
+                    if (hoveredHit?.kind === "file") {
+                        const sim = layout.byId.get(hoveredHit.fileId);
+                        if (sim?.userPinned) {
+                            sim.userPinned = false;
+                            sim.fx = null;
+                            sim.fy = null;
+                            layout.simulation.alpha(0.6);
+                        }
+                    } else if (hoveredHit?.kind === "folder") {
+                        // Folder unpin: release every pinned file
+                        // whose cluster (at the current zoom-adaptive
+                        // depth) matches the hovered folder label.
+                        // Mirrors the resolution policy in
+                        // onFolderDragStart so the same folder click
+                        // target consistently pins on drag / unpins
+                        // on U.
+                        const depth = chooseClusterDepth();
+                        let any = false;
+                        for (const n of layout.nodes) {
+                            if (!n.userPinned) continue;
+                            if (clusterDirOf(n.relativePath, depth) !== hoveredHit.id) continue;
+                            n.userPinned = false;
+                            n.fx = null;
+                            n.fy = null;
+                            any = true;
+                        }
+                        if (any) layout.simulation.alpha(0.6);
+                    }
+                } else if (e.key === "r" || e.key === "R") {
+                    unpinAllFiles();
+                } else if (e.key === "p" || e.key === "P") {
+                    // P pins the files currently on screen; ⇧P pins every file.
+                    if (e.shiftKey) pinAllFiles();
+                    else pinVisibleFiles();
+                }
+            };
+            window.addEventListener("keydown", onPinKey);
 
             function handleClick(target: HitRect | null) {
                 if (!target) {
@@ -4023,77 +4454,24 @@ export function PixiCanvas({project}: CanvasProps) {
             // already expanded only collapses when zoom drops past the LOWER
             // bound, and vice versa. Stops the file flickering open/closed when
             // the user pauses near the threshold.
-            const FILE_EXPAND_AT_MUL = 3;
-            const FILE_COLLAPSE_BELOW_MUL = 2.5;
-            // Isolation kicks in BEFORE expansion — at a lower zoom — so
-            // the user sees the surrounding cluster fade out before the
-            // selected files start expanding into their AST view. Gives
-            // the eye a moment to settle on what's about to be the
-            // focus instead of two large visual changes (hide + grow)
-            // happening simultaneously. Own hysteresis band, narrower
-            // than expansion's because the isolate transition is less
-            // dramatic and the user doesn't need as much dead-zone.
-            const ISOLATE_AT_MUL = 2;
-            const ISOLATE_BELOW_MUL = 1.7;
-            // ABSOLUTE cameraScale ceilings on the regime thresholds.
-            // The ratio-based thresholds (× fitScale) work well for
-            // medium-and-large projects, but `fitScale` is clamped to
-            // [0.05, 2] in fitProjectToViewport — so for SMALL projects
-            // (few files, naturally fitting at high zoom), fitScale
-            // saturates at 2 and the ratio thresholds become
-            // unreachable in practice (3 × 2 = cameraScale ≥ 6, which
-            // is way past the point where file icons have stopped
-            // visually growing — they cap at `baseW × popFactor`
-            // around cameraScale = 1). The user is left staring at
-            // saturated icons with no way to expand them.
+            // Isolation kicks in BEFORE expansion (lower zoom) so the cluster
+            // fades before files grow. The threshold multipliers and their
+            // absolute cameraScale ceilings (for small projects whose fitScale
+            // saturates at 2) now live in config — see DEFAULT_BEHAVIORAL in
+            // graph/config/defaults.ts for the values and the full rationale.
+            // Effective threshold is min(ratio × fitScale, absoluteCeiling).
             //
-            // The absolute floors kick in when icons have CLEARLY
-            // saturated visually — past cameraScale ≈ 1, additional
-            // zoom adds no detail to the icons themselves; that's
-            // when expansion is meaningful regardless of how the
-            // project's fitScale compares. Effective threshold is
-            // `min(ratio × fitScale, absoluteFloor)` so whichever
-            // metric is more permissive wins:
-            //   * Tiny project (fitScale = 2 capped):
-            //       ratio = 3 × 2 = 6
-            //       absolute = 1.5
-            //       → effective expand = 1.5
-            //   * Big project (fitScale = 0.05):
-            //       ratio = 3 × 0.05 = 0.15
-            //       absolute = 1.5
-            //       → effective expand = 0.15 (big project keeps the
-            //         ratio-based "see the layout first, then drill"
-            //         behaviour).
-            // Absolute ceilings chosen to fire well BEFORE icon
-            // saturation (cameraScale = 1, where icons stop growing
-            // visually): even at cameraScale = 0.8 a moderately-
-            // popular file icon already takes 100+ screen px, which
-            // is enough screen real estate to host a useful expanded
-            // view. Original calibration was at the saturation point
-            // (1.5), which felt "too late" — content text inside the
-            // expanded file was already quite large by the time the
-            // threshold finally fired. The relative ordering matches
-            // the ratio constants (ISOLATE = 2/3 × EXPAND) so the
-            // staging — isolate first, then expand — is preserved.
-            const EXPAND_ABS_CEILING = 0.8;
-            const COLLAPSE_ABS_CEILING = 0.65;
-            const ISOLATE_ABS_CEILING = 0.55;
-            const ISOLATE_BELOW_ABS_CEILING = 0.45;
-            // Per-frame state of each regime, holding through its
-            // hysteresis band.
+            // Per-frame state of each regime, holding through its hysteresis band.
             let expansionRegimeOn = false;
             let isolateRegimeOn = false;
 
             function selectionExpansionEnabled(): boolean {
+                const b = cfg.behavioral;
+                // Master toggle: when off, files never auto-expand on zoom.
+                if (!b.selectionExpands) return false;
                 const fit = Math.max(fitScale, 1e-4);
-                // Effective thresholds: whichever is SMALLER between
-                // "ratio × fitScale" and "absolute ceiling" wins, so
-                // small projects (where ratio × fitScale is huge) get
-                // the absolute floor and big projects (where
-                // ratio × fitScale is tiny) keep their natural
-                // ratio-based behaviour.
-                const expandAt = Math.min(FILE_EXPAND_AT_MUL * fit, EXPAND_ABS_CEILING);
-                const collapseBelow = Math.min(FILE_COLLAPSE_BELOW_MUL * fit, COLLAPSE_ABS_CEILING);
+                const expandAt = Math.min(b.expandAtMul * fit, b.expandAbsCeiling);
+                const collapseBelow = Math.min(b.collapseBelowMul * fit, b.collapseAbsCeiling);
                 if (cameraScale >= expandAt) expansionRegimeOn = true;
                 else if (cameraScale < collapseBelow) expansionRegimeOn = false;
                 return expansionRegimeOn;
@@ -4101,8 +4479,9 @@ export function PixiCanvas({project}: CanvasProps) {
 
             function isolateRegimeEnabled(): boolean {
                 const fit = Math.max(fitScale, 1e-4);
-                const onAt = Math.min(ISOLATE_AT_MUL * fit, ISOLATE_ABS_CEILING);
-                const offBelow = Math.min(ISOLATE_BELOW_MUL * fit, ISOLATE_BELOW_ABS_CEILING);
+                const b = cfg.behavioral;
+                const onAt = Math.min(b.isolateAtMul * fit, b.isolateAbsCeiling);
+                const offBelow = Math.min(b.isolateBelowMul * fit, b.isolateBelowAbsCeiling);
                 if (cameraScale >= onAt) isolateRegimeOn = true;
                 else if (cameraScale < offBelow) isolateRegimeOn = false;
                 return isolateRegimeOn;
@@ -4143,7 +4522,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // freshly-expanded file's alpha=0.9 reheat push the
                 // older ones out of its way as it claims its position.
                 for (const n of layout.nodes) {
-                    if (n.id !== fileId && n.expanded) {
+                    if (n.id !== fileId && n.expanded && !n.userPinned) {
                         n.fx = null;
                         n.fy = null;
                     }
@@ -4166,7 +4545,7 @@ export function PixiCanvas({project}: CanvasProps) {
                 // released when the sim next settles (see stepLayout)
                 // or when the file is collapsed (see syncExpansion).
                 const sim = layout.byId.get(fileId);
-                if (sim) {
+                if (sim && !sim.userPinned) {
                     sim.fx = sim.x;
                     sim.fy = sim.y;
                     // Critical: align connX/connY (and zero offX/offY)
@@ -4193,6 +4572,20 @@ export function PixiCanvas({project}: CanvasProps) {
                     sim.offX = 0;
                     sim.offY = 0;
                 }
+                // User-pinned files: fx/fy/connX/connY are already at
+                // the user's chosen position from the original drag
+                // (and were preserved across collapse / sim-settle by
+                // the gated release sites). Overwriting them here
+                // with the CURRENT sim.x — which during a re-expand
+                // triggered mid zoom-in is a lerped position between
+                // the pin and the folder-grid rigidX — would replace
+                // the user's pin with whatever happened to be on
+                // screen at the moment of expansion. So we skip the
+                // alignment for user-pinned files. The rendered
+                // position will snap back to the pin within one
+                // frame: targetExpanded=true forces nt=0, and
+                // step 3's offX recompute zeros the carried offset
+                // since n.x ends up at connX after the first tick.
                 followId = fileId;
                 followStartAt = 0;
                 followAt = null;
@@ -4236,8 +4629,11 @@ export function PixiCanvas({project}: CanvasProps) {
                         // Release the sim pin set when this file was
                         // expanded — it's a small icon again and the
                         // layout should treat it like any other.
+                        // EXCEPT user-pinned files: a user-drag pin
+                        // is independent of expansion state and must
+                        // outlive collapse.
                         const sim = layout.byId.get(id);
-                        if (sim) {
+                        if (sim && !sim.userPinned) {
                             sim.fx = null;
                             sim.fy = null;
                         }
@@ -4265,11 +4661,13 @@ export function PixiCanvas({project}: CanvasProps) {
                 detachCamera();
                 window.removeEventListener("keydown", onShiftDown);
                 window.removeEventListener("keyup", onShiftUp);
+                window.removeEventListener("keydown", onPinKey);
                 labelPool.destroy();
                 directoryLabelPool.destroy();
                 for (const pane of overlayPanes) pane.labels.destroy();
                 app.ticker.remove(tickerCb);
                 app.destroy(true, {children: true, texture: true});
+                if (cameraApiRef) cameraApiRef.current = null;
             };
         })();
 
@@ -4290,6 +4688,38 @@ export function PixiCanvas({project}: CanvasProps) {
 // "on" span emitted as its own moveTo/lineTo subpath; the caller strokes them
 // all with one .stroke(). Lengths are world units (callers pass screen-
 // constant values via 1/cameraScale where the layer is counter-scaled).
+// Lay down an import-edge path from (sx,sy) to (tx,ty) in the chosen style,
+// leaving it ready for the caller to .stroke(). straight = direct line;
+// curved = a gentle perpendicular-bowed quadratic arc (reads well at any
+// orientation); square = orthogonal steps (horizontal → vertical → horizontal
+// through the midpoint x).
+function traceEdge(gfx: Graphics, sx: number, sy: number, tx: number, ty: number, style: EdgeLineStyle): void {
+    gfx.moveTo(sx, sy);
+    if (style === "curved") {
+        const dx = tx - sx;
+        const dy = ty - sy;
+        const len = Math.hypot(dx, dy) || 1;
+        const bow = len * 0.18;
+        const mx = (sx + tx) / 2 + (-dy / len) * bow;
+        const my = (sy + ty) / 2 + (dx / len) * bow;
+        gfx.quadraticCurveTo(mx, my, tx, ty);
+    } else if (style === "square") {
+        const mx = (sx + tx) / 2;
+        gfx.lineTo(mx, sy).lineTo(mx, ty).lineTo(tx, ty);
+    } else if (style === "semi-square") {
+        // Orthogonal steps, but each corner rounded with an arc. Radius is half
+        // the shorter leg (capped by geometry so segments stay straight between
+        // corners) — reads as "square with rounded corners".
+        const mx = (sx + tx) / 2;
+        const r = Math.min(Math.abs(mx - sx), Math.abs(ty - sy) / 2) * 0.5;
+        gfx.arcTo(mx, sy, mx, ty, r);
+        gfx.arcTo(mx, ty, tx, ty, r);
+        gfx.lineTo(tx, ty);
+    } else {
+        gfx.lineTo(tx, ty);
+    }
+}
+
 function emitDashed(gfx: Graphics, pts: {x: number; y: number}[], dash: number, gap: number): void {
     if (pts.length < 2) return;
     let on = true;
@@ -4349,7 +4779,7 @@ function drawEdges(
     // import line that touches a selected file: yellow when the
     // selected file is the importer (line goes FROM it), blue when
     // the selected file is the imported (line points TO it). Edges
-    // not touching the selection stay COLORS.edge (grey).
+    // not touching the selection stay activeColors.edge (grey).
     selectionSet: ReadonlySet<string>,
     // Focus-mode live set: import edges with at least one endpoint
     // outside it dim down to ~18% so they recede into the background.
@@ -4370,6 +4800,10 @@ function drawEdges(
     // endpoints share a directory, skip the edge so the diagram
     // shows only cross-cluster connections at low zoom.
     fileToDir: ReadonlyMap<string, string>,
+    // LOD thresholds (intra-dir gate + edge-length alpha ramp).
+    lod: LodConfig,
+    // How to route each connection line (straight / curved / square).
+    edgeStyle: EdgeLineStyle,
 ): void {
     // Import links: a quiet subdued background layer. Suppressed when a
     // calls/extends/implements link is already visible between the same two
@@ -4392,7 +4826,7 @@ function drawEdges(
         }
         // Intra-directory LOD: at low zoom, suppress sibling edges so
         // the architectural cross-cluster lines stand out.
-        if (cameraScale < INTRA_DIR_BELOW) {
+        if (cameraScale < lod.intraDirBelow) {
             const dirFrom = fileToDir.get(edge.fromId);
             const dirTo = fileToDir.get(edge.toId);
             if (dirFrom != null && dirFrom === dirTo) continue;
@@ -4441,7 +4875,7 @@ function drawEdges(
         // architectural links) stay bright. Path-traced edges always
         // stay bright — they ARE the user's question.
         if (!onPath) {
-            edgeAlpha *= edgeLengthAlphaMultiplier(sx, sy, tx, ty, cameraScale);
+            edgeAlpha *= edgeLengthAlphaMultiplier(sx, sy, tx, ty, cameraScale, lod);
         }
         // Directional colour. If the IMPORTING file (edge.fromId) is
         // selected the line goes OUT from it → yellow. If the
@@ -4451,24 +4885,22 @@ function drawEdges(
         // Edges that don't touch any selection keep the default grey.
         const fromSel = selectionSet.has(edge.fromId);
         const toSel = selectionSet.has(edge.toId);
-        const edgeColor = fromSel && toSel ? COLORS.edgeBidirectional : fromSel ? COLORS.edgeImporting : toSel ? COLORS.edgeImported : COLORS.edge;
-        gfx.moveTo(sx, sy)
-            .lineTo(tx, ty)
-            .stroke({
-                color: edgeColor,
-                width: 1.5 / cameraScale, // ~1.5px on screen, zoom-stable
-                alpha: edgeAlpha,
-            });
+        const edgeColor = fromSel && toSel ? activeColors.edgeBidirectional : fromSel ? activeColors.edgeImporting : toSel ? activeColors.edgeImported : activeColors.edge;
+        traceEdge(gfx, sx, sy, tx, ty, edgeStyle);
+        gfx.stroke({
+            color: edgeColor,
+            width: 1.5 / cameraScale, // ~1.5px on screen, zoom-stable
+            alpha: edgeAlpha,
+        });
         if (onPath) {
             // Re-stroke in func / yellow on top of the normal stroke so the
             // path overlay is consistent across import + semantic edges.
-            gfx.moveTo(sx, sy)
-                .lineTo(tx, ty)
-                .stroke({
-                    color: SYNTAX.func,
-                    width: 3.5 / cameraScale,
-                    alpha: 0.85,
-                });
+            traceEdge(gfx, sx, sy, tx, ty, edgeStyle);
+            gfx.stroke({
+                color: SYNTAX.func,
+                width: 3.5 / cameraScale,
+                alpha: 0.85,
+            });
         }
     }
 }
@@ -4670,6 +5102,8 @@ function drawSemanticEdges(
     // file id → containing directory, for the intra-directory LOD
     // gate (see drawEdges).
     fileToDir: ReadonlyMap<string, string>,
+    // LOD thresholds (intra-dir gate + edge-length alpha ramp).
+    lod: LodConfig,
 ): void {
     visibleSemanticPairs.clear();
     const fileOf = (id: string): string => {
@@ -4705,13 +5139,13 @@ function drawSemanticEdges(
         // Hidden-files filter: same suppression as drawEdges. Endpoint
         // file id is the part of the AST id before '#'; if either side
         // resolves to a hidden file, skip the edge entirely.
-        if (hiddenFileIds || cameraScale < INTRA_DIR_BELOW) {
+        if (hiddenFileIds || cameraScale < lod.intraDirBelow) {
             const fromF = fileOf(edge.fromId);
             const toF = fileOf(edge.toId);
             if (hiddenFileIds && (hiddenFileIds.has(fromF) || hiddenFileIds.has(toF))) {
                 continue;
             }
-            if (cameraScale < INTRA_DIR_BELOW) {
+            if (cameraScale < lod.intraDirBelow) {
                 const dirFrom = fileToDir.get(fromF);
                 const dirTo = fileToDir.get(toF);
                 if (dirFrom != null && dirFrom === dirTo) continue;
@@ -4729,7 +5163,7 @@ function drawSemanticEdges(
         // LOD-culled) the edge would just dangle from a lifted ancestor, so
         // require the calling node itself to be directly visible.
         // (`extends`/`implements` still lift to a visible ancestor.)
-        if (edge.kind === "calls" && (cameraScale < CALLS_BELOW || !visibleById.has(edge.fromId))) {
+        if (edge.kind === "calls" && (cameraScale < lod.callsBelow || !visibleById.has(edge.fromId))) {
             continue;
         }
         const from = findVisibleAnchor(edge.fromId, visibleById, treeLookup);
@@ -4765,7 +5199,7 @@ function drawSemanticEdges(
         // so the line bows into open space, and the arrowhead is oriented along
         // the curve's end tangent. The called element also gets a thin outline
         // in the edge color so the reference target is easy to spot.
-        const style = SEMANTIC_EDGE_STYLE[edge.kind];
+        const style = activeSemanticEdge[edge.kind];
         let edgeAlpha = style.alpha;
         let dashed = false;
         if (edge.kind === "calls") {
@@ -4800,7 +5234,7 @@ function drawSemanticEdges(
             const fcy = from.y + from.h / 2;
             const tcx = to.x + to.w / 2;
             const tcy = to.y + to.h / 2;
-            edgeAlpha *= edgeLengthAlphaMultiplier(fcx, fcy, tcx, tcy, cameraScale);
+            edgeAlpha *= edgeLengthAlphaMultiplier(fcx, fcy, tcx, tcy, cameraScale, lod);
         }
         // Routing the extends/implements line THROUGH the import binding when
         // the source file is expanded: subclass → local imported name → real
@@ -5048,6 +5482,33 @@ interface CameraDeps {
     // is passed in so the host can pick a sensible pivot (e.g. the
     // nearest file) when the cursor isn't on anything specific.
     getZoomPivot?: (cursorWorld: {x: number; y: number}) => {worldX: number; worldY: number} | null;
+    // File-drag protocol. Called the moment the user crosses the
+    // DRAG_DEADZONE while pointer-down is on a file HitRect. If
+    // `onFileDragStart` returns a SimFileNode, wireCamera switches
+    // to file-drag mode for the rest of the gesture (no camera pan,
+    // no click on release). Returning null falls through to the
+    // normal camera-pan behaviour.
+    //
+    // `onFileDragMove` is called every pointermove with the desired
+    // world position of the file (computed delta-style so the
+    // file's grab-point under the cursor is preserved). The host
+    // mutates sim.x / sim.y / sim.connX / sim.connY / sim.fx /
+    // sim.fy / sim.offX / sim.offY and may bump simulation alpha.
+    //
+    // `onFileDragEnd` fires on pointerup; the host marks the file
+    // userPinned and reheats so neighbours settle.
+    onFileDragStart?: (id: string) => SimFileNode | null;
+    onFileDragMove?: (sim: SimFileNode, worldX: number, worldY: number) => void;
+    onFileDragEnd?: (sim: SimFileNode) => void;
+    // Folder-drag protocol. Called when the user moves past the
+    // drag deadzone while pointer-down on a 'folder' HitRect
+    // (a directory-hull label). The host resolves the folder dir
+    // → file list and returns it; wireCamera then translates every
+    // member by the same delta on each pointermove (via the
+    // per-file onFileDragMove) and finalises every pin on
+    // pointerup (via onFileDragEnd). Returning null falls through
+    // to camera pan.
+    onFolderDragStart?: (folderId: string) => SimFileNode[] | null;
 }
 
 function wireCamera(deps: CameraDeps): () => void {
@@ -5062,6 +5523,27 @@ function wireCamera(deps: CameraDeps): () => void {
     let worldStart = {x: 0, y: 0};
     let movedDistance = 0;
     let pendingTarget: HitRect | null = null;
+    // File-drag state. When the pointer crosses DRAG_DEADZONE on a
+    // file HitRect and the host accepts via onFileDragStart, the
+    // gesture stops being a camera pan and becomes a file move.
+    // draggingFile non-null = we're in file-drag mode; the camera
+    // pan branch in onMove is skipped, and the click branch in onUp
+    // is skipped.
+    let draggingFile: SimFileNode | null = null;
+    // World coords where the pointer was when this gesture began.
+    // Combined with the file's sim position at down (dragFileStart),
+    // we move the file by the same delta the cursor has travelled —
+    // so whatever point on the icon the user grabbed stays under the
+    // cursor (no snap-to-center jitter).
+    let downWorld = {x: 0, y: 0};
+    let dragFileStart = {x: 0, y: 0};
+    // Folder-drag state. When the user crosses the deadzone on a
+    // 'folder' HitRect and the host returns a non-empty member
+    // list, we drag every member by the same world-space delta.
+    // The per-file START positions are snapshotted at drag-start so
+    // the move math stays delta-based (file's grab-point under the
+    // cursor) instead of accumulating per-frame jitter.
+    let draggingFolder: {sim: SimFileNode; startX: number; startY: number}[] | null = null;
 
     const screenToWorld = (sx: number, sy: number) => ({
         x: (sx - world.x) / world.scale.x,
@@ -5075,6 +5557,9 @@ function wireCamera(deps: CameraDeps): () => void {
         movedDistance = 0;
         pointerStart = {x: e.global.x, y: e.global.y};
         worldStart = {x: world.x, y: world.y};
+        downWorld = {x: w.x, y: w.y};
+        draggingFile = null;
+        draggingFolder = null;
         container.style.cursor = "grabbing";
     };
 
@@ -5084,9 +5569,74 @@ function wireCamera(deps: CameraDeps): () => void {
             const dx = e.global.x - pointerStart.x;
             const dy = e.global.y - pointerStart.y;
             movedDistance = Math.max(movedDistance, Math.hypot(dx, dy));
-            if (movedDistance > DRAG_DEADZONE) {
-                pendingTarget = null;
-                onUserCameraMove();
+
+            // Past the deadzone for the first time: decide what kind
+            // of drag this is. If the pointer-down landed on a FILE
+            // or FOLDER HitRect and the host accepts the drag-start
+            // callback, we switch to that drag mode for the rest of
+            // the gesture. Otherwise it's a camera pan (existing
+            // path).
+            if (
+                movedDistance > DRAG_DEADZONE &&
+                draggingFile === null &&
+                draggingFolder === null &&
+                pendingTarget !== null
+            ) {
+                if (pendingTarget.kind === "file" && deps.onFileDragStart) {
+                    const sim = deps.onFileDragStart(pendingTarget.fileId);
+                    if (sim) {
+                        draggingFile = sim;
+                        dragFileStart = {x: sim.x, y: sim.y};
+                        onUserCameraMove();
+                        pendingTarget = null;
+                    }
+                } else if (pendingTarget.kind === "folder" && deps.onFolderDragStart) {
+                    const sims = deps.onFolderDragStart(pendingTarget.id);
+                    if (sims && sims.length > 0) {
+                        // Snapshot each member's start position so
+                        // the per-pointermove math is purely
+                        // delta-based — none of "the file is now
+                        // wherever it ended up last frame, plus the
+                        // delta" jitter that would accumulate if we
+                        // recomputed from current sim positions.
+                        draggingFolder = sims.map((sim) => ({
+                            sim,
+                            startX: sim.x,
+                            startY: sim.y,
+                        }));
+                        onUserCameraMove();
+                        pendingTarget = null;
+                    }
+                }
+                if (!draggingFile && !draggingFolder) {
+                    // Not a file/folder drag — commit to camera pan
+                    // and forget the pending click target so onUp
+                    // won't mis-fire onClick at the end of the
+                    // gesture.
+                    pendingTarget = null;
+                    onUserCameraMove();
+                }
+            }
+
+            if (draggingFile) {
+                // Move the file by the same world-space delta the
+                // cursor has travelled — preserves the grab point.
+                const w = screenToWorld(e.global.x, e.global.y);
+                const nx = dragFileStart.x + (w.x - downWorld.x);
+                const ny = dragFileStart.y + (w.y - downWorld.y);
+                deps.onFileDragMove?.(draggingFile, nx, ny);
+            } else if (draggingFolder) {
+                // Translate every member by the same world-space
+                // delta. Reuses the existing per-file move callback
+                // — folder drag is just a fan-out, the host's
+                // file-move logic is unchanged.
+                const w = screenToWorld(e.global.x, e.global.y);
+                const dxw = w.x - downWorld.x;
+                const dyw = w.y - downWorld.y;
+                for (const m of draggingFolder) {
+                    deps.onFileDragMove?.(m.sim, m.startX + dxw, m.startY + dyw);
+                }
+            } else if (movedDistance > DRAG_DEADZONE) {
                 world.x = worldStart.x + dx;
                 world.y = worldStart.y + dy;
             }
@@ -5106,7 +5656,23 @@ function wireCamera(deps: CameraDeps): () => void {
     };
 
     const onUp = () => {
-        if (dragging && movedDistance < DRAG_DEADZONE) {
+        if (draggingFile) {
+            // File-drag end: finalise the pin on the host side.
+            // Skip the click path entirely — the user repositioned
+            // a file, they didn't click it.
+            deps.onFileDragEnd?.(draggingFile);
+            draggingFile = null;
+        } else if (draggingFolder) {
+            // Folder-drag end: fan out the per-file finalise across
+            // every member. onFileDragEnd marks userPinned and bumps
+            // sim alpha once per call; alpha-bumping is idempotent
+            // (it max-clamps to 0.6) so the redundant calls are
+            // harmless.
+            for (const m of draggingFolder) {
+                deps.onFileDragEnd?.(m.sim);
+            }
+            draggingFolder = null;
+        } else if (dragging && movedDistance < DRAG_DEADZONE) {
             onClick(pendingTarget);
         }
         dragging = false;
@@ -5125,7 +5691,11 @@ function wireCamera(deps: CameraDeps): () => void {
         const rect = container.getBoundingClientRect();
         const px = e.clientX - rect.left;
         const py = e.clientY - rect.top;
-        const factor = Math.exp(-e.deltaY * 0.0015);
+        // Normalise the delta across devices: some report LINES (deltaMode 1)
+        // or PAGES (2) instead of pixels, which would make zoom crawl. Convert
+        // to a pixel-equivalent first.
+        const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? container.clientHeight || 800 : 1;
+        const factor = Math.exp(-e.deltaY * unit * 0.0015);
         const next = clamp(world.scale.x * factor, 0.05, 32);
         const cursorWorld = screenToWorld(px, py);
         const pivot = deps.getZoomPivot?.(cursorWorld) ?? null;

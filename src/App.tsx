@@ -1,13 +1,16 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Group, Panel, Separator } from 'react-resizable-panels';
 import { openProject, subscribeToWatch, type WatchEvent } from './api/client';
 import { useGraphStore } from './graph/store';
-import { PixiCanvas } from './render/PixiCanvas';
+import { PixiCanvas, type CameraApi } from './render/PixiCanvas';
+import { ZoomControls } from './ui/ZoomControls';
+import { PinControls } from './ui/PinControls';
 import { EdgeFilterPills } from './ui/EdgeFilterPills';
 import { HoverTooltip } from './ui/HoverTooltip';
 import { SearchPalette } from './ui/SearchPalette';
 import { EditorPane } from './ui/EditorPane';
 import { FolderPicker } from './ui/FolderPicker';
+import { SettingsPanel } from './ui/settings/SettingsPanel';
 import type { AstNode, FileNode, ProjectResponse } from './api/types';
 
 export function App() {
@@ -18,6 +21,8 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // Imperative camera handle the PixiCanvas fills in; drives the zoom buttons.
+  const cameraApiRef = useRef<CameraApi | null>(null);
 
   // Last-opened path is restored from localStorage so a dev-server reload
   // (triggered by editing force-graph tunables — see the HMR hook in
@@ -172,9 +177,12 @@ export function App() {
           <Group orientation="horizontal" style={{ width: '100%', height: '100%' }}>
             <Panel defaultSize="62%" minSize="30%">
               <div style={{ position: 'relative', width: '100%', height: '100%' }}>
-                <PixiCanvas project={project} />
+                <PixiCanvas project={project} cameraApiRef={cameraApiRef} />
                 <SelectionPanel />
                 <EdgeFilterPills />
+                <SettingsPanel />
+                <ZoomControls api={cameraApiRef} />
+                <PinControls api={cameraApiRef} />
                 <HoverTooltip />
                 <SearchPalette
                   open={searchOpen}
@@ -252,33 +260,12 @@ function Hints() {
       }}
     >
       <div style={{ opacity: 0.7 }}>
-        drag = pan · wheel = zoom · click file = expand/collapse · click AST rect = select
+        drag bg = pan · drag file/folder = pin · wheel = zoom · click file = expand/collapse · click AST rect = select
       </div>
-      <div style={{ display: 'flex', gap: '0.9rem' }}>
-        <LegendDot color="#666670" label="imports" />
-        <LegendDot color="#ff8b3d" label="calls" />
-        <LegendDot color="#9aa3ff" label="extends" />
-        <LegendDot color="#60d0c0" label="implements" />
+      <div style={{ opacity: 0.7 }}>
+        U = unpin hovered · R = reset all pins · P = pin visible · ⇧P = pin all
       </div>
     </div>
-  );
-}
-
-function LegendDot({ color, label }: { color: string; label: string }) {
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
-      <span
-        aria-hidden
-        style={{
-          display: 'inline-block',
-          width: 18,
-          height: 2,
-          background: color,
-          borderRadius: 1,
-        }}
-      />
-      {label}
-    </span>
   );
 }
 
@@ -322,7 +309,8 @@ function findAstNode(
 
 const PANEL_STYLE: React.CSSProperties = {
   position: 'absolute',
-  top: '1rem',
+  // Sits below the settings gear (top-right) so the gear stays clickable.
+  top: '3.2rem',
   right: '1rem',
   background: 'rgba(28,28,32,0.92)',
   border: '1px solid #38383c',

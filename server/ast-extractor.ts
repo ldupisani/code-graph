@@ -23,6 +23,13 @@ const PASSTHROUGH_KINDS = new Set<ts.SyntaxKind>([
   // attributes then render INSIDE the `<div>` opening-tag rect, which
   // is how the user reads the source.
   ts.SyntaxKind.JsxAttributes,
+  // JsxOpeningElement is the `<Foo …>` tag of a JsxElement. We elide it so its
+  // attributes reparent directly onto the JsxElement — the element then lays
+  // out like a function definition (tag name in the header band, attributes
+  // bracketed on the left, children on the right; see jsxLayout). The tag-name
+  // identifier and the matching JsxClosingElement are inlined when the
+  // JsxElement's label is synthesised, so neither re-emits as a stray child.
+  ts.SyntaxKind.JsxOpeningElement,
   // JsxExpression is the `{…}` braces wrapping an attribute value or
   // JSX child expression — purely syntactic, the EXPRESSION inside is
   // what the user cares about. Without this, `ref={ref}` rendered as a
@@ -67,6 +74,14 @@ export function extractAst(
   // effect of friendlyName / synthesizeCallLabel / synthesizeAccessLabel and
   // consulted in visit() to skip the redundant child rect.
   const inlined = new Set<Node>();
+  // Method-call-chain flattening (`a.f(x).g(y)` → one flat `[a] ▷f (x) ▷g (y)`
+  // flow). `chainReparent` holds the intermediate CallExpression / access nodes
+  // whose children reparent onto the outermost call (consulted in visit() like
+  // PASSTHROUGH_KINDS); `chainData` maps each chain ROOT to its ordered segments
+  // (read in pushAndRecurse to stamp `chain` on the emitted node). See
+  // flattenCallChain / synthesizeCallLabel.
+  const chainReparent = new Set<Node>();
+  const chainData = new Map<Node, ChainSegmentInfo[]>();
   let seq = 0;
 
   // IDs are sequential within a file walk because parent and child can share a
@@ -88,7 +103,7 @@ export function extractAst(
       id,
       parentId,
       syntaxKind: syntaxKindName(node.getKind()),
-      name: friendlyName(node, inlined),
+      name: friendlyName(node, inlined, chainReparent, chainData),
       op: operatorOf(node),
       role: forClauseRole(node),
       exported: exportedOf(node),
@@ -98,8 +113,12 @@ export function extractAst(
       accessibility: accessibilityOf(node),
       extendsName: extendsNameOf(node),
       isType: typeFlag,
-      signature: signatureOf(node) ?? callSignatureOf(node),
+      signature: signatureOf(node) ?? callSignatureOf(node) ?? propertyTypeOf(node),
       returnType: returnTypeOf(node),
+      // friendlyName (above) ran synthesizeCallLabel, which populates chainData
+      // for a method-chain root — read it back here. Object props evaluate
+      // top-to-bottom, so `name` is computed before this.
+      chain: chainData.get(node),
       start: node.getStart(),
       end: node.getEnd(),
     });
@@ -109,9 +128,22 @@ export function extractAst(
   function visit(node: Node, parentId: string | null): void {
     const kind = node.getKind();
     if (skipTrivialTokens && isTrivialToken(kind)) return;
+    // Whitespace-only JsxText — the newlines/indentation between tags — carries
+    // no information; skip it so it doesn't litter a JSX element with empty
+    // boxes. Text with actual content (`<p>Hello</p>`) still emits.
+    if (kind === ts.SyntaxKind.JsxText && node.getText().trim() === '') return;
     // Already captured by an ancestor's synthesised label (the callee of a
     // collapsed Call/New, or any segment of a flattened access chain).
     if (inlined.has(node)) return;
+    // Method-chain intermediate (an inner CallExpression or its callee access):
+    // elide it and reparent its children onto the chain ROOT, so the base
+    // receiver and every argument bubble up as direct children of the one
+    // flattened call node (see flattenCallChain). The method-name identifiers
+    // are in `inlined`, so only the base + args survive.
+    if (chainReparent.has(node)) {
+      node.forEachChild((child) => visit(child, parentId));
+      return;
+    }
     // Skip the Identifier (or BindingPattern) that occupies the .name slot of
     // a named declaration — the declaration itself already carries that name
     // as its label, so emitting a separate block adds visual noise without
@@ -157,6 +189,89 @@ function forClauseRole(node: Node): 'init' | 'cond' | 'update' | undefined {
   return undefined;
 }
 
+// One segment of a flattened method-call chain: the method/property name (the
+// `▷ marker` glyph) and how many arguments that call took (so the client can
+// interleave `( arg, … )` glyph/child tokens). Matches AstNode.chain.
+export interface ChainSegmentInfo {
+  marker: string;
+  argCount: number;
+}
+
+// Flatten a method-call chain rooted at `outerCall` into ordered segments
+// (LEFT-TO-RIGHT) for the flat fluent-chain layout. Walks outer→inner: at each
+// level the callee must be a `recv.method`(or `recv[lit]`) access — record the
+// method as a segment, mark the access node into `chainReparent` (so its
+// receiver reparents onto the call) and inline the method-name node; if the
+// receiver is itself a CallExpression, mark IT into chainReparent and continue.
+// The first non-call receiver is the BASE — it emits normally as the head box.
+// Returns segments (L→R) or null if any callee isn't a clean method access
+// (e.g. a bare-identifier call, or an element access with a non-literal key) —
+// the caller then leaves the node to its existing generic rendering.
+function flattenCallChain(
+  outerCall: Node,
+  inlined: Set<Node>,
+  chainReparent: Set<Node>,
+): ChainSegmentInfo[] | null {
+  const segments: ChainSegmentInfo[] = [];
+  let cur: Node = outerCall;
+  for (;;) {
+    const callee = getCalleeExpression(cur);
+    if (!callee) return null;
+    const ck = callee.getKind();
+    let marker: string;
+    let nameNode: Node;
+    let receiver: Node;
+    if (ck === ts.SyntaxKind.PropertyAccessExpression) {
+      const a = callee as unknown as { getNameNode: () => Node; getExpression: () => Node };
+      try {
+        nameNode = a.getNameNode();
+        receiver = a.getExpression();
+      } catch {
+        return null;
+      }
+      marker = nameNode.getText();
+    } else if (ck === ts.SyntaxKind.ElementAccessExpression) {
+      const a = callee as unknown as {
+        getArgumentExpression: () => Node | undefined;
+        getExpression: () => Node;
+      };
+      let arg: Node | undefined;
+      try {
+        arg = a.getArgumentExpression();
+        receiver = a.getExpression();
+      } catch {
+        return null;
+      }
+      if (!arg) return null;
+      const ak = arg.getKind();
+      const isLiteralKey =
+        ak === ts.SyntaxKind.StringLiteral ||
+        ak === ts.SyntaxKind.NoSubstitutionTemplateLiteral ||
+        ak === ts.SyntaxKind.NumericLiteral;
+      if (!isLiteralKey) return null;
+      marker = `[${arg.getText()}]`;
+      nameNode = arg;
+    } else {
+      return null;
+    }
+    const argCount =
+      (cur as unknown as { getArguments?: () => Node[] }).getArguments?.().length ?? 0;
+    // Prepend: we walk outer→inner but want source (L→R) order.
+    segments.unshift({ marker, argCount });
+    chainReparent.add(callee);
+    inlined.add(nameNode);
+    for (const d of nameNode.getDescendants()) inlined.add(d);
+    if (receiver.getKind() === ts.SyntaxKind.CallExpression) {
+      // Another call in the chain — reparent its children up and keep walking.
+      chainReparent.add(receiver);
+      cur = receiver;
+      continue;
+    }
+    // Reached the base receiver — it renders as the head box. Done.
+    return segments.length > 0 ? segments : null;
+  }
+}
+
 // Synthesised labels for `CallExpression` / `NewExpression`. When the callee
 // is collapsible — a bare Identifier (`foo()`) or a member-access chain
 // (`a.b.c()`, `this.foo()`, `obj["k"].bar()`) — emit a single label like
@@ -171,7 +286,12 @@ function forClauseRole(node: Node): 'init' | 'cond' | 'update' | undefined {
 // Returns null when the callee can't be cleanly captured (e.g. mixed
 // call+access chains like `a.b().c()`); the client then falls back to the
 // generic "call"/"new" kind label and the access subtree renders normally.
-function synthesizeCallLabel(node: Node, inlined: Set<Node>): string | null {
+function synthesizeCallLabel(
+  node: Node,
+  inlined: Set<Node>,
+  chainReparent: Set<Node>,
+  chainData: Map<Node, ChainSegmentInfo[]>,
+): string | null {
   const kind = node.getKind();
   if (kind !== ts.SyntaxKind.NewExpression && kind !== ts.SyntaxKind.CallExpression) {
     return null;
@@ -206,7 +326,18 @@ function synthesizeCallLabel(node: Node, inlined: Set<Node>): string | null {
       }
     }
   }
-  if (head === null) return null;
+  if (head === null) {
+    // The callee didn't collapse to a single label — it's a method call on a
+    // complex receiver (`[arr].filter(x)`) or a multi-call chain
+    // (`a.f(x).g(y)`). Flatten the whole chain into one node laid out as a flat
+    // fluent flow (`[base] ▷f (x) ▷g (y)`); the segments are stamped onto the
+    // node via chainData and the intermediate nodes reparent via chainReparent.
+    if (kind === ts.SyntaxKind.CallExpression) {
+      const segments = flattenCallChain(node, inlined, chainReparent);
+      if (segments) chainData.set(node, segments);
+    }
+    return null;
+  }
 
   // Type arguments fold into the head: `forwardRef<HTMLInputElement,
   // Props>` reads as one label instead of three separate rects (the
@@ -344,27 +475,36 @@ function isTypeImportBinding(node: Node): boolean {
 // Covers:
 //   * TypeReference: `Player`, `Map<string, Foo>`, `MyNs.Inner`
 //   * ArrayType:     `Pulse[]`, `string[][]`
-// (UnionType / IntersectionType are NOT flattened — the user wants
-//  the members visible with a `|` or `&` between them, which the
-//  treemap's relational layout handles via `op`.)
+//   * UnionType / IntersectionType: `string | number | readonly string[] | undefined`
+//
+// Unions/intersections flatten to their full source text because their bare
+// keyword members (`string`, `number`, `undefined`, …) are trivial KEYWORD
+// tokens that visit() drops — so the old "render members as `A | B` boxes"
+// path collapsed `string | number | undefined` down to whichever single member
+// happened to be non-trivial (e.g. just `string[]`). Flat text keeps the whole
+// union readable, exactly as written.
 function synthesizeFlatTypeLabel(node: Node, inlined: Set<Node>): string | null {
   const k = node.getKind();
-  if (k !== ts.SyntaxKind.TypeReference && k !== ts.SyntaxKind.ArrayType) {
+  const isUnionish =
+    k === ts.SyntaxKind.UnionType || k === ts.SyntaxKind.IntersectionType;
+  if (k !== ts.SyntaxKind.TypeReference && k !== ts.SyntaxKind.ArrayType && !isUnionish) {
     return null;
   }
-  // Bail out if an inline object type literal `{...}` sits anywhere
-  // inside this type — flattening would inline the TypeLiteral and
-  // its members away, but the user wants to drill into those members
-  // like an ObjectLiteralExpression. Letting the type emit as its
-  // own container (label falls back to '[]' / 'type') keeps the
-  // TypeLiteral reachable as a child rect.
-  for (const d of node.getDescendants()) {
-    if (d.getKind() === ts.SyntaxKind.TypeLiteral) return null;
+  // TypeReference / ArrayType bail out if an inline object type literal `{...}`
+  // sits anywhere inside — flattening would inline the TypeLiteral and its
+  // members away, but the user wants to drill into those members like an
+  // ObjectLiteralExpression. Letting the type emit as its own container keeps
+  // the TypeLiteral reachable as a child rect. Unions/intersections ALWAYS
+  // flatten (a union must read completely, even with an object-type member).
+  if (!isUnionish) {
+    for (const d of node.getDescendants()) {
+      if (d.getKind() === ts.SyntaxKind.TypeLiteral) return null;
+    }
   }
   // Use the array form so every descendant — type-argument identifiers,
   // TypeQuery exprNames, qualified-name segments, the inner element
-  // type of an ArrayType — is unambiguously included before visit()
-  // reaches them via forEachChild.
+  // type of an ArrayType, every union member — is unambiguously included
+  // before visit() reaches them via forEachChild.
   for (const d of node.getDescendants()) inlined.add(d);
   return node.getText();
 }
@@ -461,16 +601,33 @@ function synthesizeJsxLabel(node: Node, inlined: Set<Node>): string | null {
   // so the tag is still identifiable; expanded, the inner opening /
   // children / closing emit as their own rects.
   if (kind === ts.SyntaxKind.JsxElement) {
-    const opening = (node as unknown as {
+    const elementHost = node as unknown as {
       getOpeningElement?: () => Node | undefined;
-    }).getOpeningElement?.();
+      getClosingElement?: () => Node | undefined;
+    };
+    const opening = elementHost.getOpeningElement?.();
     if (!opening) return null;
     const openingTagHost = opening as unknown as {
       getTagNameNode?: () => Node | undefined;
     };
     const tagNode = openingTagHost.getTagNameNode?.();
     if (!tagNode) return null;
-    return `<${tagNode.getText()}>…</${tagNode.getText()}>`;
+    // The opening element is a pass-through (its attributes reparent onto this
+    // JsxElement), so inline its tag-name subtree here — otherwise the bare
+    // `Foo` identifier would surface as a stray child once the wrapper is
+    // elided. Inline the WHOLE closing element too (`</Foo>`): it's redundant
+    // with this header and the user doesn't want a separate closing block.
+    inlined.add(tagNode);
+    for (const d of tagNode.getDescendants()) inlined.add(d);
+    const closing = elementHost.getClosingElement?.();
+    if (closing) {
+      inlined.add(closing);
+      for (const d of closing.getDescendants()) inlined.add(d);
+    }
+    // Header reads `<Foo />` — the component identity, like `ƒ name` for a
+    // function. Children render to the right (see jsxLayout), so the tag is a
+    // marker, not literal self-closing syntax.
+    return `<${tagNode.getText()} />`;
   }
   if (
     kind !== ts.SyntaxKind.JsxOpeningElement &&
@@ -829,58 +986,124 @@ function signatureOf(node: Node): string | undefined {
 }
 
 // Signature of the function/constructor being CALLED, surfaced in the hover
-// tooltip for a `CallExpression` / `NewExpression`. Unlike signatureOf (a pure
-// source-text snapshot of the node itself), this has to follow the callee to
-// its declaration, so it DOES involve the type checker — but only for call
-// nodes, a small subset of the tree. Resolution order:
-//   1. From the callee's type, take the first call (or construct) signature
-//      and reuse signatureOf on its declaration — so hovering `foo()` shows
-//      exactly what hovering `function foo` shows: concise, author-written
-//      types, no checker-expanded inferred blobs.
-//   2. Fall back to synthesising `(p: T): R` from the Signature API for
-//      callable values signatureOf can't read as source (call-signature
-//      members, function-type aliases, library .d.ts overloads).
-// Defensive throughout: the checker can throw on unresolved/malformed nodes,
-// and a missing signature simply means "no tooltip for this call."
+// tooltip for a `CallExpression` / `NewExpression`.
+//
+// PERF — this must NOT materialise types. An earlier version called
+// `callee.getType().getCallSignatures()`, which forces the checker to expand
+// full type information for the callee; doing that per call site across a
+// large solution-style project exhausted memory and crashed the server.
+// Instead we resolve the callee's SYMBOL to its declaration — the same bounded
+// operation semantic-edges.ts already performs for every call — and read the
+// declaration's SOURCE TEXT via signatureOf (pure getText, no type work). The
+// trade-off vs. the old approach: no overload selection, no generic
+// instantiation, and un-annotated returns aren't inferred — the tooltip shows
+// exactly what the author wrote at the declaration, which is also what hovering
+// the definition shows.
+//
+// Defensive throughout: symbol resolution can throw on unresolved/malformed
+// nodes, and a missing signature simply means "no tooltip for this call."
 function callSignatureOf(node: Node): string | undefined {
   if (!Node.isCallExpression(node) && !Node.isNewExpression(node)) return undefined;
   const callee = getCalleeExpression(node);
   if (!callee) return undefined;
+  const isNew = Node.isNewExpression(node);
   try {
-    const t = callee.getType();
-    const sigs = Node.isNewExpression(node)
-      ? t.getConstructSignatures()
-      : t.getCallSignatures();
-    const sig = sigs[0];
-    if (!sig) return undefined;
-    const decl = sig.getDeclaration();
-    const fromSource = signatureOf(decl);
-    if (fromSource) {
-      // signatureOf omits the return when the author wrote no annotation. On a
-      // CALL hover the return type is the most useful part, so backfill it from
-      // the checker's inferred signature — except for constructors, whose
-      // "return" is just the instance type (`new Vec(...)` shouldn't read
-      // `: Vec`).
-      const hasReturnNode = !!(
-        decl as { getReturnTypeNode?: () => Node | undefined }
-      ).getReturnTypeNode?.();
-      const isCtor =
-        Node.isConstructorDeclaration(decl) || Node.isConstructSignatureDeclaration(decl);
-      if (!hasReturnNode && !isCtor) {
-        const ret = sig.getReturnType().getText(node);
-        if (ret) return `${fromSource}: ${ret}`;
-      }
-      return fromSource;
+    let symbol = callee.getSymbol();
+    if (!symbol) return undefined;
+    const aliased = symbol.getAliasedSymbol?.();
+    if (aliased) symbol = aliased;
+    for (const decl of symbol.getDeclarations()) {
+      const sig = declarationCallSignature(decl, isNew);
+      if (sig) return sig;
     }
-    const params = sig.getParameters().map((p) => {
-      const d = p.getValueDeclaration();
-      return d ? d.getText() : p.getName();
-    });
-    const ret = sig.getReturnType().getText(node);
-    return ret ? `(${params.join(', ')}): ${ret}` : `(${params.join(', ')})`;
+    return undefined;
   } catch {
     return undefined;
   }
+}
+
+// Source-text call signature for the DECLARATION a callee symbol resolves to.
+// Pure getText() — never materialises a type. Handles the shapes a callee
+// commonly points at:
+//   * function-likes directly (function / method / arrow / ctor / get / set /
+//     call-signature member) via signatureOf
+//   * a const / property / parameter whose initializer is a function or arrow
+//   * a class (only for `new`) -> its constructor's parameter list, or `()`
+function declarationCallSignature(decl: Node, isNew: boolean): string | undefined {
+  // signatureOf yields `(...)`/`(...): R` for function-likes and `: T` for
+  // typed value declarations — only the parenthesised form is a call signature.
+  const direct = signatureOf(decl);
+  if (direct && direct.startsWith('(')) return direct;
+
+  const init = (decl as { getInitializer?: () => Node | undefined }).getInitializer?.();
+  if (init && (Node.isArrowFunction(init) || Node.isFunctionExpression(init))) {
+    const s = signatureOf(init);
+    if (s) return s;
+  }
+
+  if (isNew && Node.isClassDeclaration(decl)) {
+    const ctor = decl.getConstructors()[0];
+    const s = ctor ? signatureOf(ctor) : undefined;
+    return s ?? '()';
+  }
+  return undefined;
+}
+
+// Type hint for a destructured property — the `: T` shown in the hover tooltip
+// for a `BindingElement` like `name` in `({ name, id }: Props) => …`. The type
+// isn't written at the element; it lives on the PATTERN's annotation (`: Props`
+// / `: { … }`). We resolve it the same SAFE way as call signatures — symbol
+// resolution + source text, never `getType()` materialisation (which OOM'd a
+// large project). Best-effort: returns undefined for shapes it can't read from
+// source (intersections, mapped types, inherited members), per "if possible".
+function propertyTypeOf(node: Node): string | undefined {
+  if (!Node.isBindingElement(node)) return undefined;
+  // The property being destructured: the rename source (`{ a: b }` -> `a`) when
+  // present, else the bound name itself (`{ name }` -> `name`).
+  const propName = (node.getPropertyNameNode() ?? node.getNameNode())?.getText();
+  if (!propName) return undefined;
+  const pattern = node.getParent();
+  if (!pattern || !Node.isObjectBindingPattern(pattern)) return undefined;
+  // The pattern's typed declaration (Parameter / VariableDeclaration).
+  const typeNode = (
+    pattern.getParent() as { getTypeNode?: () => Node | undefined } | undefined
+  )?.getTypeNode?.();
+  if (!typeNode) return undefined;
+  try {
+    const t = memberTypeText(typeNode, propName);
+    return t ? `: ${t}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Source text of property `name`'s type as declared in `typeNode` — an inline
+// object type (`{ name: string }`) or a reference to an interface / type alias.
+// `getProperty` lives on TypeElementMemberedNode, shared by both TypeLiteral
+// and InterfaceDeclaration. Pure getText — no type materialisation.
+function memberTypeText(typeNode: Node, name: string): string | undefined {
+  if (Node.isTypeLiteral(typeNode)) {
+    return typeNode.getProperty(name)?.getTypeNode()?.getText();
+  }
+  if (Node.isTypeReference(typeNode)) {
+    let symbol = typeNode.getTypeName().getSymbol();
+    if (!symbol) return undefined;
+    const aliased = symbol.getAliasedSymbol?.();
+    if (aliased) symbol = aliased;
+    for (const decl of symbol.getDeclarations()) {
+      if (Node.isInterfaceDeclaration(decl)) {
+        const t = decl.getProperty(name)?.getTypeNode()?.getText();
+        if (t) return t;
+      } else if (Node.isTypeAliasDeclaration(decl)) {
+        const tn = decl.getTypeNode();
+        if (tn && Node.isTypeLiteral(tn)) {
+          const t = tn.getProperty(name)?.getTypeNode()?.getText();
+          if (t) return t;
+        }
+      }
+    }
+  }
+  return undefined;
 }
 
 // Accessibility scope: 'private' / 'protected' / undefined (public).
@@ -956,7 +1179,12 @@ const REFERENCE_KINDS_TO_SKIP = new Set<ts.SyntaxKind>([
 // rewrite applies to every label-source (synthesizeCallLabel,
 // Identifier, synthesizeAccessLabel, getName fallback) by sitting at
 // the wrapper level rather than inside each branch.
-function friendlyName(node: Node, inlined: Set<Node>): string | null {
+function friendlyName(
+  node: Node,
+  inlined: Set<Node>,
+  chainReparent: Set<Node>,
+  chainData: Map<Node, ChainSegmentInfo[]>,
+): string | null {
   if (node.getKind() === ts.SyntaxKind.Decorator) {
     // The Decorator wrapper has no label; its child (the call /
     // identifier / member access) becomes the rect via the single-
@@ -964,7 +1192,7 @@ function friendlyName(node: Node, inlined: Set<Node>): string | null {
     // there.
     return null;
   }
-  const raw = rawFriendlyName(node, inlined);
+  const raw = rawFriendlyName(node, inlined, chainReparent, chainData);
   // If THIS node is the immediate expression of a Decorator, prefix
   // with `@` (matching the source syntax). Strip our common label
   // prefixes so we don't end up with `@▷ Foo`.
@@ -979,12 +1207,18 @@ function friendlyName(node: Node, inlined: Set<Node>): string | null {
   return raw;
 }
 
-function rawFriendlyName(node: Node, inlined: Set<Node>): string | null {
+function rawFriendlyName(
+  node: Node,
+  inlined: Set<Node>,
+  chainReparent: Set<Node>,
+  chainData: Map<Node, ChainSegmentInfo[]>,
+): string | null {
   const kind = node.getKind();
 
   // Synthesised "new Foo" / "call bar" / "call a.b.c" labels for Call/New.
-  // On success the callee subtree is added to `inlined`.
-  const synthesised = synthesizeCallLabel(node, inlined);
+  // On success the callee subtree is added to `inlined`. A method chain that
+  // doesn't collapse to one label returns null here but stamps chainData.
+  const synthesised = synthesizeCallLabel(node, inlined, chainReparent, chainData);
   if (synthesised !== null) return synthesised;
 
   // Type-position nodes (TypeReference, ArrayType, …) render as a

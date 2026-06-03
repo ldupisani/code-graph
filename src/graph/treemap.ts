@@ -65,6 +65,15 @@ export interface TreemapNode {
   // (see `AstLayoutOpts.collapseChildren`), used to give a coarse-zoom
   // overview that omits the body's interior detail.
   collapsed?: boolean;
+  // Set when this cell was stretched taller than its natural size to match the
+  // tallest cell in its wrapped row (see the row-equalisation pass in `size`).
+  // The renderer pins the label to the top band instead of centring it, so a
+  // stretched leaf's label lines up with its taller siblings' headers.
+  labelTop?: boolean;
+  // Present when this CallExpression is a flattened method-call chain (see
+  // AstNode.chain). The renderer reads it to suppress the yellow call bracket —
+  // the chain renders as a flat fluent flow of glyphs + child boxes instead.
+  chain?: { marker: string; argCount: number }[];
 }
 
 export interface TreemapLayout {
@@ -144,8 +153,15 @@ export interface AstLayoutOpts {
   syntaxTokens?: (
     kind: string,
     kids: { syntaxKind: string; role?: string }[],
-    node: { syntaxKind: string; name: string | null; returnType?: string },
-  ) => Array<{ kw: string; color: number; size?: number } | { child: number }> | null;
+    node: {
+      syntaxKind: string;
+      name: string | null;
+      returnType?: string;
+      chain?: { marker: string; argCount: number }[];
+    },
+  ) =>
+    | Array<{ kw: string; color: number; size?: number; glue?: boolean } | { child: number; glue?: boolean }>
+    | null;
   // Kinds whose label must NOT reserve a top header band when the node is
   // expanded (has children) — e.g. an object literal `{ … }` shown inline in a
   // ternary branch, where the `{}` is redundant with the kind outline and the
@@ -159,6 +175,10 @@ export interface AstLayoutOpts {
   // functionLayout): parameters grouped into a bracketed block on the left,
   // the return type + body stacked on the right, name in a band on top.
   groupedSignature?: (kind: string) => boolean;
+  // Kinds laid out with the JSX variant of the two-column shape (see
+  // jsxLayout): the tag name in a band on top (`<Foo />`), attributes bracketed
+  // on the left, child elements stacked on the right.
+  jsxSignature?: (kind: string) => boolean;
   // Colour for the return-type glyph in a grouped function signature (the
   // editor's type teal). Injected so treemap stays free of the syntax theme.
   returnTypeColor?: number;
@@ -214,6 +234,9 @@ interface Sized {
   // a small kind-outlined leaf and its actual children are not in
   // `kids`. Flag flows to TreemapNode.collapsed during assign.
   collapsed?: boolean;
+  // Set by the row-equalisation pass when this cell was stretched to its row's
+  // height. Flows to TreemapNode.labelTop during assign.
+  labelTop?: boolean;
 }
 
 // Lay every AstNode out as a nested box sized bottom-up to its own label and
@@ -334,8 +357,8 @@ export function layoutAst(
   // One item in a templated construct's flow: either an inline keyword/punct
   // glyph (carrying its own measured box) or an already-sized child box.
   type FlowItem =
-    | { glyph: { text: string; color?: number; size?: number; w: number; h: number } }
-    | { sized: Sized };
+    | { glyph: { text: string; color?: number; size?: number; w: number; h: number }; glue?: boolean }
+    | { sized: Sized; glue?: boolean };
 
   // Pack an interleaved sequence of glyphs and child boxes into wrapped rows
   // (same wrap width / gap as the generic packer). Glyphs get a centered
@@ -360,7 +383,10 @@ export function layoutAst(
     let row = 0;
     for (const it of items) {
       const w = widthOf(it);
-      if (rowX > 0 && rowX + w > wrapWidth) {
+      // `glue` items must stay on the same row as their predecessor (a chain
+      // segment's `method ( args )` glued to its `▷`), so a break is only legal
+      // before a NON-glued item — keeps matching parens from splitting rows.
+      if (rowX > 0 && !it.glue && rowX + w > wrapWidth) {
         row++;
         rowX = 0;
       }
@@ -431,6 +457,12 @@ export function layoutAst(
     // return type + body on the right, name in the band on top.
     if (opts.groupedSignature?.(node.syntaxKind)) {
       return functionLayout(node, kids, lb);
+    }
+
+    // JSX element → two-column shape: attributes bracketed on the left, child
+    // elements stacked on the right, tag name in the band on top (`<Foo />`).
+    if (opts.jsxSignature?.(node.syntaxKind)) {
+      return jsxLayout(node, kids, lb);
     }
 
     // Templated construct → flow of keyword glyphs + child boxes that reads
@@ -573,6 +605,23 @@ export function layoutAst(
     }
     blockW = Math.max(blockW, rowX - GAP);
     const blockH = rowY + rowH;
+    // Equalise cell heights within each wrapped row: every cell grows to its
+    // row's tallest, so a row reads as a clean band even when one member (e.g.
+    // a property whose value is a nested object) is far taller than its
+    // siblings. Items in a row share the same `y` (the row top), so group by it.
+    // The row already reserved `rowH` for vertical advance, so this only fills
+    // already-reserved space — blockH is unchanged. Stretched cells are flagged
+    // so the renderer pins their label to the top band (aligned with the tall
+    // sibling's header) rather than centring it in the now-taller box.
+    const rowMaxH = new Map<number, number>();
+    for (const p of placed) rowMaxH.set(p.y, Math.max(rowMaxH.get(p.y) ?? 0, p.sized.h));
+    for (const p of placed) {
+      const target = rowMaxH.get(p.y)!;
+      if (target > p.sized.h) {
+        p.sized.h = target;
+        p.sized.labelTop = true;
+      }
+    }
     // Inset the packed children by the side padding so the block has symmetric
     // left/right margins (the content is widened to match below).
     if (sidePad > 0) for (const p of placed) p.x += sidePad;
@@ -647,7 +696,7 @@ export function layoutAst(
   // shapes). `assign()` offsets the flow below the band via `labelH`.
   const constructLayout = (
     node: AstNode,
-    tokens: Array<{ kw: string; color: number; size?: number } | { child: number }>,
+    tokens: Array<{ kw: string; color: number; size?: number; glue?: boolean } | { child: number; glue?: boolean }>,
     kids: AstNode[],
     lb: { w: number; h: number },
   ): Sized => {
@@ -657,7 +706,7 @@ export function layoutAst(
     for (const t of tokens) {
       if ('child' in t) {
         const child = kids[t.child];
-        if (child) items.push({ sized: sizeOrCollapse(child, node.syntaxKind) });
+        if (child) items.push({ sized: sizeOrCollapse(child, node.syntaxKind), glue: t.glue });
       } else {
         // A sized glyph (e.g. the 2× return symbol) reserves a footprint at its
         // own size via the tight glyph measure; normal-size glyphs keep the
@@ -671,7 +720,7 @@ export function layoutAst(
         // (~1em) so it can't overflow its slot and overlap the next item when
         // scaled out to full size (it's drawn centered in this footprint).
         const gw = t.size != null ? Math.max(gb.w, t.size) : gb.w;
-        items.push({ glyph: { text: t.kw, color: t.color, size: t.size, w: gw, h: gb.h } });
+        items.push({ glyph: { text: t.kw, color: t.color, size: t.size, w: gw, h: gb.h }, glue: t.glue });
       }
     }
     kids.forEach((k, i) => {
@@ -771,6 +820,62 @@ export function layoutAst(
     };
   };
 
+  // Two-column layout for a JSX element (see AstLayoutOpts.jsxSignature),
+  // mirroring functionLayout: the tag name sits in the band on top (lb, e.g.
+  // `<Foo />`); below it the ATTRIBUTES stack into a bracketed group on the
+  // LEFT (each a borderless chip; the renderer strokes groupRect as the same
+  // open-topped rounded bracket as a param list), and the RIGHT column stacks
+  // the element's CHILD nodes (nested elements / expressions). A self-closing
+  // element has attributes only — no right column.
+  const jsxLayout = (
+    node: AstNode,
+    kids: AstNode[],
+    lb: { w: number; h: number },
+  ): Sized => {
+    const isAttr = (k: AstNode) =>
+      k.syntaxKind === 'JsxAttribute' || k.syntaxKind === 'JsxSpreadAttribute';
+    const attrs = kids.filter(isAttr);
+    const children = kids.filter((k) => !isAttr(k));
+
+    // LEFT: attributes stacked vertically inside the bracket group.
+    let py = GROUP_VPAD;
+    let innerW = 0;
+    const placed: { sized: Sized; x: number; y: number }[] = [];
+    for (const a of attrs) {
+      const sa = size(a);
+      placed.push({ sized: sa, x: GROUP_INSET, y: py });
+      py += sa.h + GAP;
+      innerW = Math.max(innerW, sa.w);
+    }
+    const groupW = attrs.length ? innerW + GROUP_INSET * 2 : 0;
+    const groupH = attrs.length ? py - GAP + GROUP_VPAD : 0;
+
+    // RIGHT: child elements stacked vertically (reads like nested JSX). With no
+    // attributes there's no left group, so the column starts at the left edge.
+    const rightX = attrs.length ? groupW + COL_GAP : 0;
+    let ry = 0;
+    let rightW = 0;
+    for (const c of children) {
+      const sc = sizeOrCollapse(c, node.syntaxKind);
+      placed.push({ sized: sc, x: rightX, y: ry });
+      ry += sc.h + GAP;
+      rightW = Math.max(rightW, sc.w);
+    }
+    const rightH = children.length ? ry - GAP : 0;
+
+    const blockH = Math.max(groupH, rightH);
+    const contentW = Math.max(lb.w, rightX + rightW);
+    const contentH = lb.h + (lb.h > 0 ? GAP : 0) + blockH;
+    return {
+      node,
+      labelH: lb.h,
+      w: contentW + PAD * 2,
+      h: contentH + PAD * 2,
+      kids: placed,
+      groupRect: attrs.length ? { x: 0, y: 0, w: groupW, h: groupH } : undefined,
+    };
+  };
+
   const rootSized = size(rootAst);
 
   // ---- Phase 2: translate the sized tree to absolute rects --------------
@@ -796,6 +901,8 @@ export function layoutAst(
       rect: { x, y, w: s.w, h: s.h },
       depth,
       collapsed: s.collapsed,
+      labelTop: s.labelTop,
+      chain: s.node.chain,
     };
     if (s.glyphs && s.glyphs.length > 0) {
       tn.glyphs = s.glyphs.map((g) => ({

@@ -186,6 +186,10 @@ export const KIND_OUTLINE: Record<string, number> = {
     // stays significant (never collapses as a pass-through) and the bracket
     // strokes inherit this colour.
     ArrayBindingPattern: COLORS.astOutlineObject,
+    // Array literals (`[x, y]`) read as `[ … ]` square brackets too — same
+    // yellow as the destructuring pattern and object braces, so every bracket/
+    // brace container shares one visual idiom. See BRACKET_KINDS.
+    ArrayLiteralExpression: COLORS.astOutlineObject,
     Parameter: COLORS.astOutlineParam,
     // Type definitions (interfaces, type aliases). They used to render
     // as a dashed green circle with every member visible; now they're
@@ -227,11 +231,11 @@ export const KIND_OUTLINE: Record<string, number> = {
 
 // Kinds whose box is stroked as a literal pair of square brackets — solid
 // left/right verticals with short serifs at each corner — instead of a full
-// rectangle, so the container itself reads as `[ … ]`. Used for array
-// destructuring (`const [a, b] = …`), where the brackets ARE the syntax and a
-// "[]" text label over an empty band just duplicated them. The stroke colour
-// comes from KIND_OUTLINE above.
-export const BRACKET_KINDS = new Set(["ArrayBindingPattern"]);
+// rectangle, so the container itself reads as `[ … ]`. Covers array
+// destructuring (`const [a, b] = …`) AND array literals (`[x, y]`), where the
+// brackets ARE the syntax and a "[]" text label over the band just duplicates
+// them. The stroke colour comes from KIND_OUTLINE above.
+export const BRACKET_KINDS = new Set(["ArrayBindingPattern", "ArrayLiteralExpression"]);
 export function isBracketKind(kind: string): boolean {
     return BRACKET_KINDS.has(kind);
 }
@@ -274,9 +278,13 @@ export const KIND_FILL_TINT: Record<string, {color: number; blend: number}> = {
 // pass-through — if it shows a label OR carries a kind outline. (A magenta
 // `block` or yellow `object` must survive even as a single-child wrapper,
 // otherwise its outline would never be drawn.)
-export function isSignificant(node: {name: string | null; syntaxKind: string}): boolean {
+export function isSignificant(node: {name: string | null; syntaxKind: string; chain?: unknown[]}): boolean {
     return (
         labelFor(node) !== null ||
+        // A flattened method-call chain has no single label (its flow is built
+        // from chain tokens), so it must be kept significant explicitly — else a
+        // single-child chain (`[arr].pop()`) would collapse into its base.
+        (node.chain != null && node.chain.length > 0) ||
         // Templated constructs (control flow, return/throw, await, `as`, …) no
         // longer carry a static label — their keyword is an inline glyph — so
         // labelFor() returns null for them. They must still survive as their
@@ -383,7 +391,13 @@ export const SYNTAX = {
 // template (a loop / catch body), wrapping below the keyword header. This is
 // what turns the old `[for…of [x][arr][{}]]` (a prefix label over anonymous
 // boxes) into `for [x] of [arr] { … }`. Colours come from SYNTAX above.
-export type SyntaxToken = { kw: string; color: number; size?: number } | { child: number };
+// `glue: true` means "do NOT allow a row break BEFORE this token" — the flow
+// packer keeps it on the same row as the preceding token. Used to keep a
+// method-call segment's `method ( args )` together so matching parens never
+// split across a wrap (only the leading `▷` marker is a legal break point).
+export type SyntaxToken =
+    | { kw: string; color: number; size?: number; glue?: boolean }
+    | { child: number; glue?: boolean };
 export type SyntaxTemplate = (
     kids: { syntaxKind: string; role?: string }[],
     node: { syntaxKind: string; name: string | null; returnType?: string },
@@ -485,14 +499,49 @@ export function isFunctionSignatureKind(kind: string): boolean {
     return FUNCTION_SIGNATURE_KINDS.has(kind);
 }
 
+// JSX elements rendered with the same two-column signature shape as functions
+// (see jsxLayout in treemap.ts): the tag name in a header band (`<Foo />`),
+// attributes bracketed on the LEFT, child elements stacked on the RIGHT. The
+// opening/closing tags are folded away server-side, so a `<Foo>…</Foo>` reads
+// as one element instead of three blocks. Covers both the wrapper element and
+// the self-closing form (`<Bar … />`, attributes only, no children).
+export const JSX_SIGNATURE_KINDS = new Set(["JsxElement", "JsxSelfClosingElement"]);
+export function isJsxSignatureKind(kind: string): boolean {
+    return JSX_SIGNATURE_KINDS.has(kind);
+}
+
 // Adapter passed to layoutAst (AstLayoutOpts.syntaxTokens): resolve a kind's
 // template and run it against the node's children, or null for untemplated
 // kinds so the layout falls back to the label + wrapped-packing path.
 export function syntaxTokens(
     kind: string,
     kids: {syntaxKind: string; role?: string}[],
-    node: {syntaxKind: string; name: string | null; returnType?: string},
+    node: {syntaxKind: string; name: string | null; returnType?: string; chain?: {marker: string; argCount: number}[]},
 ): SyntaxToken[] | null {
+    // Flattened method-call chain → a flat fluent flow that reads like source:
+    // `[base] ▷ filter ( arg ) ▷ join ( arg )`. The node's children are
+    // `[base, ...args]` in order; each segment contributes a keyword-blue `▷`
+    // marker + func-yellow method name + grey `( … )` around its arg child
+    // boxes. Built dynamically (the markers/arg-counts vary per node), unlike
+    // the static SYNTAX_TEMPLATES below.
+    if (node.chain && node.chain.length > 0) {
+        const tokens: SyntaxToken[] = [{child: 0}]; // base receiver = head box
+        let idx = 1;
+        for (const seg of node.chain) {
+            // The `▷` marker is the ONLY legal wrap point in a segment; glue
+            // everything after it so `method ( … )` stays on one row and the
+            // parens never split across a wrap.
+            tokens.push({kw: "▷ ", color: SYNTAX.keyword});
+            tokens.push({kw: seg.marker, color: SYNTAX.func, glue: true});
+            tokens.push({kw: "(", color: SYNTAX.default, glue: true});
+            for (let a = 0; a < seg.argCount; a++) {
+                if (a > 0) tokens.push({kw: ",", color: SYNTAX.default, glue: true});
+                tokens.push({child: idx++, glue: true});
+            }
+            tokens.push({kw: ")", color: SYNTAX.default, glue: true});
+        }
+        return tokens;
+    }
     const t = SYNTAX_TEMPLATES[kind];
     return t ? t(kids, node) : null;
 }

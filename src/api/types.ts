@@ -141,6 +141,13 @@ export interface AstNode {
   // (primitive returns emit none), so the client can render it inline after the
   // `:` in the function's signature flow. See returnTypeOf in ast-extractor.ts.
   returnType?: string;
+  // Method-call chain flattened into one node, in left-to-right order: e.g.
+  // `[arr].filter(Boolean).join(' ')` becomes a single CallExpression with
+  // chain `[{marker:'filter',argCount:1},{marker:'join',argCount:1}]`, children
+  // `[base, …filterArgs, …joinArgs]`. The client renders it as a flat fluent
+  // flow `[base] ▷ filter ( … ) ▷ join ( … )` (see syntaxTokens / constructLayout).
+  // `argCount` per segment lets the client interleave the arg child boxes.
+  chain?: { marker: string; argCount: number }[];
   start: number;          // char offset in source, inclusive
   end: number;            // char offset, exclusive
 }

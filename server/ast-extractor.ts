@@ -98,7 +98,7 @@ export function extractAst(
       accessibility: accessibilityOf(node),
       extendsName: extendsNameOf(node),
       isType: typeFlag,
-      signature: signatureOf(node),
+      signature: signatureOf(node) ?? callSignatureOf(node),
       returnType: returnTypeOf(node),
       start: node.getStart(),
       end: node.getEnd(),
@@ -826,6 +826,61 @@ function signatureOf(node: Node): string | undefined {
     return tn ? `: ${tn.getText()}` : undefined;
   }
   return undefined;
+}
+
+// Signature of the function/constructor being CALLED, surfaced in the hover
+// tooltip for a `CallExpression` / `NewExpression`. Unlike signatureOf (a pure
+// source-text snapshot of the node itself), this has to follow the callee to
+// its declaration, so it DOES involve the type checker — but only for call
+// nodes, a small subset of the tree. Resolution order:
+//   1. From the callee's type, take the first call (or construct) signature
+//      and reuse signatureOf on its declaration — so hovering `foo()` shows
+//      exactly what hovering `function foo` shows: concise, author-written
+//      types, no checker-expanded inferred blobs.
+//   2. Fall back to synthesising `(p: T): R` from the Signature API for
+//      callable values signatureOf can't read as source (call-signature
+//      members, function-type aliases, library .d.ts overloads).
+// Defensive throughout: the checker can throw on unresolved/malformed nodes,
+// and a missing signature simply means "no tooltip for this call."
+function callSignatureOf(node: Node): string | undefined {
+  if (!Node.isCallExpression(node) && !Node.isNewExpression(node)) return undefined;
+  const callee = getCalleeExpression(node);
+  if (!callee) return undefined;
+  try {
+    const t = callee.getType();
+    const sigs = Node.isNewExpression(node)
+      ? t.getConstructSignatures()
+      : t.getCallSignatures();
+    const sig = sigs[0];
+    if (!sig) return undefined;
+    const decl = sig.getDeclaration();
+    const fromSource = signatureOf(decl);
+    if (fromSource) {
+      // signatureOf omits the return when the author wrote no annotation. On a
+      // CALL hover the return type is the most useful part, so backfill it from
+      // the checker's inferred signature — except for constructors, whose
+      // "return" is just the instance type (`new Vec(...)` shouldn't read
+      // `: Vec`).
+      const hasReturnNode = !!(
+        decl as { getReturnTypeNode?: () => Node | undefined }
+      ).getReturnTypeNode?.();
+      const isCtor =
+        Node.isConstructorDeclaration(decl) || Node.isConstructSignatureDeclaration(decl);
+      if (!hasReturnNode && !isCtor) {
+        const ret = sig.getReturnType().getText(node);
+        if (ret) return `${fromSource}: ${ret}`;
+      }
+      return fromSource;
+    }
+    const params = sig.getParameters().map((p) => {
+      const d = p.getValueDeclaration();
+      return d ? d.getText() : p.getName();
+    });
+    const ret = sig.getReturnType().getText(node);
+    return ret ? `(${params.join(', ')}): ${ret}` : `(${params.join(', ')})`;
+  } catch {
+    return undefined;
+  }
 }
 
 // Accessibility scope: 'private' / 'protected' / undefined (public).

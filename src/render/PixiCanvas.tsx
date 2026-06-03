@@ -399,6 +399,15 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // the cell the user clicked.
             const blockCellsThisFrame = new Map<string, {x: number; y: number; w: number; h: number}>();
 
+            // Per-expanded-block drag offset (world units) from its origin cell.
+            // The user drags an overlay's close handle to reposition it; the
+            // overlay renders at originCell + offset and a connector line is
+            // drawn from the handle back to the origin. `overlayDragBase` holds
+            // the offset captured at the start of the current drag so movement
+            // accumulates from there. Cleared when a block collapses.
+            const overlayDragOffsets = new Map<string, {x: number; y: number}>();
+            let overlayDragBase = {x: 0, y: 0};
+
             // When a node is selected the camera eases toward a fixed world
             // point so it lands centered on what the user just clicked, even
             // if the sim is still settling. `followStartAt` defers the start
@@ -1976,8 +1985,12 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     }
                 }
 
-                const x = cell.x;
-                const y = cell.y;
+                // The overlay anchors at its origin cell, plus any drag offset
+                // the user applied by dragging the close handle. When offset, a
+                // connector line is drawn from the handle back to the origin.
+                const dragOff = overlayDragOffsets.get(blockId);
+                const x = cell.x + (dragOff?.x ?? 0);
+                const y = cell.y + (dragOff?.y ?? 0);
 
                 // Overlay background + outline. FULLY opaque — even a few
                 // percent of transparency lets strokes from the layer below
@@ -2056,6 +2069,44 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     const handleInset = 4 / cameraScale;
                     const hx = x + handleInset;
                     const hy = y + handleInset;
+                    // Connector line from the close handle back to the origin
+                    // cell when the overlay has been dragged away — drawn in the
+                    // block's outline colour, so e.g. a code block leads a pink
+                    // line to where it was expanded. Drawn before the handle so
+                    // the handle sits on top of the line's start.
+                    //
+                    // BOTH ends terminate at a border, not a centre: cast a ray
+                    // along the handle-centre→cell-centre axis and clip it to
+                    // each box's edge. For a centred rect of half-extents
+                    // (W, H), the exit scale along direction d is
+                    // t = 1 / max(|dx|/W, |dy|/H) — the dominant axis hits the
+                    // edge exactly. The handle is a square (half-extent
+                    // handleSize/2). Only draw when the handle is OUTSIDE the
+                    // cell (otherwise the overlay still covers its origin and a
+                    // connector is meaningless / would point outward).
+                    const hcx = hx + handleSize / 2;
+                    const hcy = hy + handleSize / 2;
+                    const handleOutsideCell =
+                        hcx < cell.x || hcx > cell.x + cell.w || hcy < cell.y || hcy > cell.y + cell.h;
+                    if (dragOff && (dragOff.x !== 0 || dragOff.y !== 0) && handleOutsideCell) {
+                        const ccx = cell.x + cell.w / 2;
+                        const ccy = cell.y + cell.h / 2;
+                        // Direction from cell centre to handle centre.
+                        const dx = hcx - ccx;
+                        const dy = hcy - ccy;
+                        // Cell edge, walking out from the cell centre toward the handle.
+                        const tCell = 1 / Math.max(Math.abs(dx) / (cell.w / 2), Math.abs(dy) / (cell.h / 2));
+                        const endX = ccx + dx * tCell;
+                        const endY = ccy + dy * tCell;
+                        // Handle edge, walking out from the handle centre toward the cell.
+                        const tHandle = handleSize / 2 / Math.max(Math.abs(dx), Math.abs(dy));
+                        const startX = hcx - dx * tHandle;
+                        const startY = hcy - dy * tHandle;
+                        worldGfx
+                            .moveTo(startX, startY)
+                            .lineTo(endX, endY)
+                            .stroke({color: stroke, width: 1.5 / cameraScale, alpha: 0.9});
+                    }
                     const isHandleHovered = hoveredHit?.kind === "ast-toggle" && hoveredHit.id === blockId;
                     const lineW = (isHandleHovered ? 1.6 : 1) / cameraScale;
                     worldGfx
@@ -3993,6 +4044,21 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     userDragActive = true;
                     return sims;
                 },
+                onOverlayDragStart: (id) => {
+                    // Only accept the drag if the block is actually expanded
+                    // (the handle is only drawn for overlays anyway). Capture the
+                    // current offset so this drag accumulates from where it sat.
+                    if (!useGraphStore.getState().expandedAstNodes.has(id)) return false;
+                    overlayDragBase = overlayDragOffsets.get(id) ?? {x: 0, y: 0};
+                    return true;
+                },
+                onOverlayDragMove: (id, dx, dy) => {
+                    overlayDragOffsets.set(id, {x: overlayDragBase.x + dx, y: overlayDragBase.y + dy});
+                },
+                onOverlayDragEnd: () => {
+                    // Offset persists (the overlay stays where dropped) until the
+                    // block is collapsed; nothing to finalize here.
+                },
             });
 
             // Pin-release shortcuts. U unpins the file currently
@@ -4137,6 +4203,10 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         prevW = target.w;
                         prevH = target.h;
                     }
+                    // NB: the drag offset is intentionally KEPT in
+                    // overlayDragOffsets across a collapse, so re-expanding the
+                    // same block restores it to wherever the user last dragged
+                    // it rather than snapping back to the origin.
                     state.toggleAstNode(target.id);
                     startBlockAnim(target.id, prevW, prevH);
                     // Defer the camera pan until the overlay-grow animation is

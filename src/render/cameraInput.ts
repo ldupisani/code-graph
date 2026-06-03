@@ -54,6 +54,16 @@ export interface CameraDeps {
     // pointerup (via onFileDragEnd). Returning null falls through
     // to camera pan.
     onFolderDragStart?: (folderId: string) => SimFileNode[] | null;
+    // Overlay-drag protocol. Called when the user moves past the deadzone while
+    // pointer-down on an 'ast-toggle' HitRect (an expanded block's close handle).
+    // `onOverlayDragStart` returns true to take over the gesture as an overlay
+    // move (no camera pan, no click/collapse on release). `onOverlayDragMove`
+    // gets the cumulative world-space delta from the grab point each pointermove;
+    // the host repositions the overlay relative to its origin. `onOverlayDragEnd`
+    // fires on release.
+    onOverlayDragStart?: (id: string) => boolean;
+    onOverlayDragMove?: (id: string, dx: number, dy: number) => void;
+    onOverlayDragEnd?: (id: string) => void;
 }
 
 export function wireCamera(deps: CameraDeps): () => void {
@@ -89,6 +99,9 @@ export function wireCamera(deps: CameraDeps): () => void {
     // the move math stays delta-based (file's grab-point under the
     // cursor) instead of accumulating per-frame jitter.
     let draggingFolder: {sim: SimFileNode; startX: number; startY: number}[] | null = null;
+    // Overlay-drag state. Non-null = we're moving an expanded block's overlay
+    // (its id). The camera-pan branch and the click/collapse branch are skipped.
+    let draggingOverlay: string | null = null;
 
     const screenToWorld = (sx: number, sy: number) => ({
         x: (sx - world.x) / world.scale.x,
@@ -105,6 +118,7 @@ export function wireCamera(deps: CameraDeps): () => void {
         downWorld = {x: w.x, y: w.y};
         draggingFile = null;
         draggingFolder = null;
+        draggingOverlay = null;
         container.style.cursor = "grabbing";
     };
 
@@ -125,9 +139,18 @@ export function wireCamera(deps: CameraDeps): () => void {
                 movedDistance > DRAG_DEADZONE &&
                 draggingFile === null &&
                 draggingFolder === null &&
+                draggingOverlay === null &&
                 pendingTarget !== null
             ) {
-                if (pendingTarget.kind === "file" && deps.onFileDragStart) {
+                if (pendingTarget.kind === "ast-toggle" && deps.onOverlayDragStart) {
+                    // Grabbed an expanded block's close handle and moved — take
+                    // over as an overlay move (so the click branch won't collapse).
+                    if (deps.onOverlayDragStart(pendingTarget.id)) {
+                        draggingOverlay = pendingTarget.id;
+                        onUserCameraMove();
+                        pendingTarget = null;
+                    }
+                } else if (pendingTarget.kind === "file" && deps.onFileDragStart) {
                     const sim = deps.onFileDragStart(pendingTarget.fileId);
                     if (sim) {
                         draggingFile = sim;
@@ -153,8 +176,8 @@ export function wireCamera(deps: CameraDeps): () => void {
                         pendingTarget = null;
                     }
                 }
-                if (!draggingFile && !draggingFolder) {
-                    // Not a file/folder drag — commit to camera pan
+                if (!draggingFile && !draggingFolder && !draggingOverlay) {
+                    // Not a file/folder/overlay drag — commit to camera pan
                     // and forget the pending click target so onUp
                     // won't mis-fire onClick at the end of the
                     // gesture.
@@ -163,7 +186,12 @@ export function wireCamera(deps: CameraDeps): () => void {
                 }
             }
 
-            if (draggingFile) {
+            if (draggingOverlay) {
+                // Move the overlay by the cumulative world-space delta from the
+                // grab point; the host adds it to the overlay's origin.
+                const w = screenToWorld(e.global.x, e.global.y);
+                deps.onOverlayDragMove?.(draggingOverlay, w.x - downWorld.x, w.y - downWorld.y);
+            } else if (draggingFile) {
                 // Move the file by the same world-space delta the
                 // cursor has travelled — preserves the grab point.
                 const w = screenToWorld(e.global.x, e.global.y);
@@ -201,7 +229,12 @@ export function wireCamera(deps: CameraDeps): () => void {
     };
 
     const onUp = () => {
-        if (draggingFile) {
+        if (draggingOverlay) {
+            // Overlay-drag end: the overlay keeps its new offset; no click, so
+            // the close handle isn't triggered (a plain click still collapses).
+            deps.onOverlayDragEnd?.(draggingOverlay);
+            draggingOverlay = null;
+        } else if (draggingFile) {
             // File-drag end: finalise the pin on the host side.
             // Skip the click path entirely — the user repositioned
             // a file, they didn't click it.

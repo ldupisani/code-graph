@@ -34,12 +34,16 @@ export function HoverTooltip() {
 
   // Anchor: just below the rect, left edge aligned. Capped to the
   // viewport so the tooltip doesn't fall off the right edge of the
-  // screen for rects near the canvas's right side.
+  // screen for rects near the canvas's right side. The box grows to fit
+  // its (one-line) signature up to `maxWidth`; longer ones wrap rather
+  // than overflow the background. The right-edge clamp uses that same
+  // maxWidth so a worst-case-width box still fits on screen.
   const PAD = 6;
+  const maxWidth = Math.min(window.innerWidth - 2 * PAD, 760);
   const top = hoveredScreenRect.y + hoveredScreenRect.h + PAD;
   const left = Math.max(
     PAD,
-    Math.min(window.innerWidth - 320 - PAD, hoveredScreenRect.x),
+    Math.min(window.innerWidth - maxWidth - PAD, hoveredScreenRect.x),
   );
 
   return (
@@ -48,7 +52,8 @@ export function HoverTooltip() {
         position: 'fixed',
         top,
         left,
-        maxWidth: 480,
+        width: 'fit-content',
+        maxWidth,
         padding: '0.35rem 0.6rem',
         background: 'rgba(28, 28, 32, 0.95)',
         color: '#d4d4d4',
@@ -64,7 +69,11 @@ export function HoverTooltip() {
         // pointer → hoveredId clears → tooltip hides → repeat).
         pointerEvents: 'none',
         zIndex: 50,
-        whiteSpace: 'pre',
+        // pre-wrap (not pre): keep the signature on one line while it fits the
+        // box, but WRAP rather than overflow the background when it's longer
+        // than maxWidth. overflowWrap handles a single long token (no spaces).
+        whiteSpace: 'pre-wrap',
+        overflowWrap: 'anywhere',
         userSelect: 'none',
       }}
     >

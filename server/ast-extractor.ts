@@ -31,6 +31,12 @@ const PASSTHROUGH_KINDS = new Set<ts.SyntaxKind>([
   // one piece of information. Skipping the JsxExpression collapses to
   // `[ref [ref]]`, matching how the source reads.
   ts.SyntaxKind.JsxExpression,
+  // CaseBlock is the `{ … }` wrapper around a switch's clauses — purely
+  // structural. Eliding it reparents the CaseClause / DefaultClause nodes
+  // directly onto the SwitchStatement, so the client's `switch [expr]`
+  // template can flow the cases right below the header instead of inside an
+  // extra anonymous box.
+  ts.SyntaxKind.CaseBlock,
 ]);
 
 export interface ExtractAstOptions {
@@ -84,6 +90,7 @@ export function extractAst(
       syntaxKind: syntaxKindName(node.getKind()),
       name: friendlyName(node, inlined),
       op: operatorOf(node),
+      role: forClauseRole(node),
       exported: exportedOf(node),
       abstract: abstractOf(node),
       static: staticOf(node),
@@ -92,6 +99,7 @@ export function extractAst(
       extendsName: extendsNameOf(node),
       isType: typeFlag,
       signature: signatureOf(node),
+      returnType: returnTypeOf(node),
       start: node.getStart(),
       end: node.getEnd(),
     });
@@ -123,6 +131,30 @@ export function extractAst(
   function nextId(): string {
     return `${fileId}#${seq++}`;
   }
+}
+
+// Tag the three clauses of a C-style `for (init; cond; update)` with their
+// role so the client can render the loop as `for [init] ; [cond] ; [update]`
+// even when a clause is omitted — positional inference alone can't tell
+// `for (;cond;)` from `for (init;;)`. Climbs through pass-through wrappers
+// first: the initializer is usually a VariableDeclarationList, which visit()
+// elides while reparenting its VariableDeclaration(s) onto the ForStatement,
+// so we compare the ForStatement's own initializer / condition / incrementor
+// against the emitted node's nearest non-pass-through ancestor. Returns
+// undefined for every node that isn't a direct for-clause.
+function forClauseRole(node: Node): 'init' | 'cond' | 'update' | undefined {
+  let child: Node = node;
+  let parent = node.getParent();
+  while (parent && PASSTHROUGH_KINDS.has(parent.getKind())) {
+    child = parent;
+    parent = parent.getParent();
+  }
+  if (!parent || parent.getKind() !== ts.SyntaxKind.ForStatement) return undefined;
+  const f = parent.asKindOrThrow(ts.SyntaxKind.ForStatement);
+  if (f.getInitializer() === child) return 'init';
+  if (f.getCondition() === child) return 'cond';
+  if (f.getIncrementor() === child) return 'update';
+  return undefined;
 }
 
 // Synthesised labels for `CallExpression` / `NewExpression`. When the callee
@@ -747,6 +779,23 @@ function readonlyOf(node: Node): true | undefined {
 //     Pulled from getTypeNode().getText(). No annotation → undefined.
 // Hover tooltip renders this. Cheap textual snapshot — no checker
 // involvement.
+// Return-type text of a function-like (`VisibleEntityState[]`, `boolean`, …),
+// independent of whether the type is emitted as a child node — primitive
+// returns (`boolean`) are trivial keywords and emit no child, so this string
+// is the uniform source the client renders inline after the `:` in the
+// signature. Today scoped to the named function kinds the client templates;
+// widen alongside SYNTAX_TEMPLATES if more are added.
+function returnTypeOf(node: Node): string | undefined {
+  if (
+    Node.isFunctionDeclaration(node) ||
+    Node.isMethodDeclaration(node) ||
+    Node.isArrowFunction(node)
+  ) {
+    return node.getReturnTypeNode()?.getText();
+  }
+  return undefined;
+}
+
 function signatureOf(node: Node): string | undefined {
   // Function-likes: parenthesised parameter list + optional return.
   if (
@@ -765,12 +814,13 @@ function signatureOf(node: Node): string | undefined {
       ? `(${params.join(', ')}): ${rt}`
       : `(${params.join(', ')})`;
   }
-  // Typed declarations: just the `: T` slot.
+  // Typed declarations: just the `: T` slot. Parameters are EXCLUDED — their
+  // type is already baked into the name (`hull: ShipHull`, see friendlyName),
+  // so adding a `: T` signature would duplicate it in the hover tooltip.
   if (
     Node.isPropertyDeclaration(node) ||
     Node.isPropertySignature(node) ||
-    Node.isVariableDeclaration(node) ||
-    Node.isParameterDeclaration(node)
+    Node.isVariableDeclaration(node)
   ) {
     const tn = node.getTypeNode();
     return tn ? `: ${tn.getText()}` : undefined;
@@ -958,9 +1008,55 @@ function rawFriendlyName(node: Node, inlined: Set<Node>): string | null {
         const n = d.getName();
         if (n) names.push(n);
       }
-      if (names.length > 0) return names.join(', ');
+      if (names.length > 0) {
+        // Lead with the declaration keyword (`const` / `let` / `var`) so the
+        // collapsed cell reads like the source — `const Icon` instead of a
+        // bare `Icon` that could be mistaken for a reference. getDeclarationKind
+        // returns the keyword string directly.
+        return `${declList.getDeclarationKind()} ${names.join(', ')}`;
+      }
     }
     return null;
+  }
+
+  // Function-likes (named functions/methods AND arrow functions): inline the
+  // return-type node (it renders inline after the `:` from the `returnType`
+  // field, not as its own child box). Named ones return their name for the
+  // header band; an arrow is anonymous, so the client shows the `⇒` marker.
+  if (
+    Node.isFunctionDeclaration(node) ||
+    Node.isMethodDeclaration(node) ||
+    Node.isArrowFunction(node)
+  ) {
+    const rt = node.getReturnTypeNode();
+    if (rt) {
+      inlined.add(rt);
+      for (const d of rt.getDescendants()) inlined.add(d);
+    }
+    if (Node.isArrowFunction(node)) return null;
+    return node.getName() || null;
+  }
+
+  // Parameters render as compact `name: Type` chips: bake the type annotation
+  // into the label and inline the type node so it doesn't also emit as a
+  // nested box. Destructured params (binding-pattern name) fall through to the
+  // pattern handling below, which renders the pattern as its own cell.
+  if (Node.isParameterDeclaration(node)) {
+    const nameNode = node.getNameNode();
+    const nk = nameNode.getKind();
+    if (
+      nk !== ts.SyntaxKind.ObjectBindingPattern &&
+      nk !== ts.SyntaxKind.ArrayBindingPattern
+    ) {
+      const typeNode = node.getTypeNode();
+      const base = nameNode.getText();
+      if (typeNode) {
+        inlined.add(typeNode);
+        for (const d of typeNode.getDescendants()) inlined.add(d);
+        return `${base}: ${typeNode.getText()}`;
+      }
+      return base || null;
+    }
   }
 
   // ts-morph uses structural typing for "named" nodes — many declarations

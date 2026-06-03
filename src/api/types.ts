@@ -94,6 +94,13 @@ export interface AstNode {
   // (`=`, `+`, `===`, …) or `=` for a VariableDeclaration initializer.
   // The renderer draws it between the two related operand boxes.
   op?: string;
+  // Semantic role of this node within its parent construct, when positional
+  // inference alone is ambiguous. Only set today for the three clauses of a
+  // C-style `for (init; cond; update)`, whose clauses can each be omitted —
+  // the layout reads it to place the `;` separators correctly (the loop
+  // variable / iterable of for-of/for-in, by contrast, are always present so
+  // their templates infer roles from position; see SYNTAX_TEMPLATES).
+  role?: 'init' | 'cond' | 'update';
   // True when this node is part of the module's public surface (an exported
   // declaration, `export`/`export default`). Used for zoomed-out LOD: only
   // high-level constructs keep their label when text no longer fits.
@@ -129,6 +136,11 @@ export interface AstNode {
   // class's API by mousing across its members without expanding
   // each one.
   signature?: string;
+  // Return-type text of a function-like (`VisibleEntityState[]`, `boolean`, …).
+  // Set independently of whether the return type is emitted as a child node
+  // (primitive returns emit none), so the client can render it inline after the
+  // `:` in the function's signature flow. See returnTypeOf in ast-extractor.ts.
+  returnType?: string;
   start: number;          // char offset in source, inclusive
   end: number;            // char offset, exclusive
 }

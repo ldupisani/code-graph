@@ -13,7 +13,7 @@ import {buildAstForceLayout, type AstForceLayout, type ContainerForceLayout} fro
 import type {FileAstResponse, ProjectResponse} from "../api/types";
 import type {SimFileNode} from "../graph/types";
 import {blendColor, DEFAULT_FILL_ALPHA, depthTint, EXPORT_FILL_ALPHA, EXPORT_FILL_BLEND, EXPORT_FILL_COLOR, hslToHex, liveTheme} from "./theme";
-import {composeModifierPrefix, isExpandableKind, isHighLevel, isSignificant, KIND_FILL_TINT, KIND_OUTLINE, labelFor, NAME_LIKE_KINDS, SYNTAX, syntaxColor} from "./astStyle";
+import {composeModifierPrefix, isBracketKind, isBraceLabelKind, isExpandableKind, isFunctionSignatureKind, isHighLevel, isSignificant, KIND_FILL_TINT, KIND_OUTLINE, labelFor, NAME_LIKE_KINDS, splitCallMarker, splitDeclarationKeyword, splitTypeAnnotation, SYNTAX, syntaxColor, syntaxTokens} from "./astStyle";
 import {findVisibleAnchor, smallestContaining, type HitRect} from "./hitTest";
 import {drawEdges, drawSemanticEdges, emitDashed} from "./edges";
 import {wireCamera} from "./cameraInput";
@@ -346,6 +346,19 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // boundary actually drawn. Pure breathing room — the file's name is
             // drawn outside (above) the boundary, not inside it.
             const FILE_RIM = 10;
+            // The arrow-function `⇒` glyph is visually smaller than the ƒ / ▷
+            // markers at the standard 11px, so it's drawn a touch larger to match.
+            const ARROW_GLYPH_SIZE = 14;
+            // Vertical gap between statement rows inside an expanded code Block —
+            // wider than the usual sibling gap so a row-separator line (drawn in
+            // drawOverlay) sits between rows with breathing room, cueing the
+            // left→right, line-by-line reading order. The block also reserves a
+            // matching margin below its last row (see the bottomExtra in
+            // treemap's packer) so the bottom stays balanced with these gaps.
+            const BLOCK_ROW_GAP = 24;
+            // Extra horizontal inset on each side of a code block's statements,
+            // beyond the normal padding, so they don't hug the box edges.
+            const BLOCK_SIDE_PAD = 12;
 
             // Per-file AST layouts now live in `layoutsByFileId` (declared
             // below) — keyed by fileId and holding BOTH the `full` and
@@ -1004,6 +1017,21 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // Exactly the box the renderer's LOD gate checks below, so a
                     // cell sized here shows its label at 1:1 and nothing larger.
                     measure: labelScreenBox,
+                    // Render control flow, return/throw, await, `as`, … as
+                    // inline keyword glyphs interleaved with their operand
+                    // boxes so the rect reads like source (`for [x] of [a]`).
+                    syntaxTokens,
+                    // Object/array/type literals shown EXPANDED inline drop
+                    // their `{}` / `[]` header band so members sit at the top
+                    // (no empty gap); the outline conveys the braces.
+                    labelBandless: isBraceLabelKind,
+                    // Functions lay out two-column: params bracketed on the
+                    // left, return type + body on the right (see functionLayout).
+                    groupedSignature: isFunctionSignatureKind,
+                    returnTypeColor: SYNTAX.type,
+                    measureGlyph: (t, s) => measureMono(t, s ?? AST_LABEL_FONT),
+                    rowGap: (kind) => (kind === "Block" ? BLOCK_ROW_GAP : undefined),
+                    sidePad: (kind) => (kind === "Block" ? BLOCK_SIDE_PAD : undefined),
                     // Every Block is ALWAYS collapsed in the main layout — the
                     // file's footprint never grows when a user expands a Block.
                     // Expanded Blocks are rendered as OVERLAYS on top of the
@@ -1070,6 +1098,13 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         reserveBand: (n) => n.syntaxKind === "Constructor",
                         rowGroup: (n) => (n.syntaxKind === "HeritageClause" ? "extends" : "n"),
                         measure: labelScreenBox,
+                        syntaxTokens,
+                        labelBandless: isBraceLabelKind,
+                        groupedSignature: isFunctionSignatureKind,
+                        returnTypeColor: SYNTAX.type,
+                        measureGlyph: (t, s) => measureMono(t, s ?? AST_LABEL_FONT),
+                        rowGap: (kind) => (kind === "Block" ? BLOCK_ROW_GAP : undefined),
+                        sidePad: (kind) => (kind === "Block" ? BLOCK_SIDE_PAD : undefined),
                         // Inside an overlay, nested expandable containers STAY
                         // collapsed so the user can open them as their own
                         // overlay too (same model as nested Blocks). The
@@ -1982,6 +2017,34 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                             drawAstNode(k, x, y, fileId, overlayTree, selectionSet);
                         }
                     }
+                    // Row separators: a thin line between consecutive statement
+                    // rows of a code block (the widened BLOCK_ROW_GAP gives it
+                    // breathing room) — a visual cue that code reads left→right,
+                    // line by line. Only for Block roots; objects/classes skip.
+                    if (kids && kids.length > 1 && blockNode.syntaxKind === "Block") {
+                        const rowBottomByTop = new Map<number, number>();
+                        let gMinX = Infinity;
+                        let gMaxX = -Infinity;
+                        for (const k of kids) {
+                            const top = Math.round(k.rect.y);
+                            const bottom = k.rect.y + k.rect.h;
+                            rowBottomByTop.set(top, Math.max(rowBottomByTop.get(top) ?? bottom, bottom));
+                            if (k.rect.x < gMinX) gMinX = k.rect.x;
+                            if (k.rect.x + k.rect.w > gMaxX) gMaxX = k.rect.x + k.rect.w;
+                        }
+                        const tops = [...rowBottomByTop.keys()].sort((a, b) => a - b);
+                        const lw = 1 / cameraScale;
+                        // Brighter than the faint border: blend the border colour
+                        // toward white (~2× luminance) at a higher alpha.
+                        const sepColor = blendColor(liveTheme.colors.astBorder, 0xffffff, 0.25);
+                        for (let i = 1; i < tops.length; i++) {
+                            const midY = y + (rowBottomByTop.get(tops[i - 1])! + tops[i]) / 2;
+                            worldGfx
+                                .moveTo(x + gMinX, midY)
+                                .lineTo(x + gMaxX, midY)
+                                .stroke({color: sepColor, width: lw, alpha: 0.8});
+                        }
+                    }
                 }
 
                 // Collapse handle: top-LEFT of the overlay (per the user's
@@ -2030,6 +2093,33 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 const hOnScreen = node.rect.h * cameraScale;
                 const minScreen = Math.min(wOnScreen, hOnScreen);
                 if (minScreen < cfg.lod.cullPx) return;
+
+                // Stroke a box as a rounded BRACKET — solid rounded left & right
+                // sides with short serifs at each corner, OPEN at the top/bottom
+                // middle. Shared by the function-definition parameter group and
+                // the function-call outline (just different colours). Counter-
+                // scaled to a constant ~1px on screen.
+                const drawRoundedBracket = (gx: number, gy: number, w: number, h: number, color: number): void => {
+                    const r = Math.min(7 / cameraScale, h / 3, w / 3);
+                    const serif = Math.max(0, Math.min(10 / cameraScale, w / 2 - r - 2 / cameraScale));
+                    const lw = 1 / cameraScale;
+                    worldGfx
+                        .moveTo(gx + r + serif, gy)
+                        .lineTo(gx + r, gy)
+                        .arcTo(gx, gy, gx, gy + r, r)
+                        .lineTo(gx, gy + h - r)
+                        .arcTo(gx, gy + h, gx + r, gy + h, r)
+                        .lineTo(gx + r + serif, gy + h)
+                        .stroke({color, width: lw, alpha: 1});
+                    worldGfx
+                        .moveTo(gx + w - r - serif, gy)
+                        .lineTo(gx + w - r, gy)
+                        .arcTo(gx + w, gy, gx + w, gy + r, r)
+                        .lineTo(gx + w, gy + h - r)
+                        .arcTo(gx + w, gy + h, gx + w - r, gy + h, r)
+                        .lineTo(gx + w - r - serif, gy + h)
+                        .stroke({color, width: lw, alpha: 1});
+                };
 
                 // (The Block grow/shrink animation now lives in drawOverlay —
                 // the underlying main-scene cell stays at its layout size and
@@ -2113,29 +2203,47 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                             h: node.rect.h,
                         });
                     }
-                    // If this collapsed cell has a kind label (e.g. '{}' for
-                    // ObjectLiteralExpression) AND the cell is large enough on
-                    // screen to fit it, draw the label centered. Otherwise the
-                    // cell renders as a bare outline — fine for Block (the
-                    // magenta kind outline IS the signal) but uninformative for
-                    // ObjectLiteralExpression where the user wants to see '{}'
-                    // confirming what kind of thing the rect represents. Same
-                    // fits-on-screen gate as the regular-cell label below.
+                    // If this collapsed cell has a kind label (e.g. '{}' for an
+                    // ObjectLiteralExpression or a code Block) AND the cell is
+                    // large enough on screen to fit it, draw the label centered.
+                    // Both brace-delimited scopes read as `{}`; their KIND_OUTLINE
+                    // colour (yellow object vs pink Block) is what tells them
+                    // apart. Cells with no label (or too small for it) render as
+                    // a bare outline. Same fits-on-screen gate as the regular-cell
+                    // label below.
                     const collapsedLabel = labelFor(node);
                     if (collapsedLabel) {
                         const lb = labelScreenBox(collapsedLabel);
                         const f = astLabelOnScreenFactor(cameraScale);
                         if (wOnScreen >= lb.w * f && hOnScreen >= lb.h * f) {
-                            labelPool.put({
-                                text: collapsedLabel,
-                                worldX: x + node.rect.w / 2,
-                                worldY: y + node.rect.h / 2,
-                                color: syntaxColor(node),
-                                size: 11,
-                                anchorX: 0.5,
-                                anchorY: 0.5,
-                                scale: astLabelScale(cameraScale),
-                            });
+                            const scale = astLabelScale(cameraScale);
+                            const cy = y + node.rect.h / 2;
+                            // `const entity` reads like an editor: the
+                            // declaration keyword in keyword-blue, the declared
+                            // name(s) in the variable colour. Drawn as two
+                            // left-anchored segments, centered as a group so the
+                            // cell still reads centered like the plain case.
+                            const decl = node.syntaxKind === "VariableStatement" ? splitDeclarationKeyword(collapsedLabel) : null;
+                            if (decl) {
+                                const kwText = decl.keyword + " ";
+                                const kwW = measureMono(kwText, 11).w;
+                                const totalW = kwW + measureMono(decl.rest, 11).w;
+                                let cx = x + node.rect.w / 2 - (totalW * scale) / 2;
+                                labelPool.put({text: kwText, worldX: cx, worldY: cy, color: SYNTAX.keyword, size: 11, anchorX: 0, anchorY: 0.5, scale});
+                                cx += kwW * scale;
+                                labelPool.put({text: decl.rest, worldX: cx, worldY: cy, color: SYNTAX.variable, size: 11, anchorX: 0, anchorY: 0.5, scale});
+                            } else {
+                                labelPool.put({
+                                    text: collapsedLabel,
+                                    worldX: x + node.rect.w / 2,
+                                    worldY: cy,
+                                    color: syntaxColor(node),
+                                    size: 11,
+                                    anchorX: 0.5,
+                                    anchorY: 0.5,
+                                    scale,
+                                });
+                            }
                         }
                     }
                     return;
@@ -2191,6 +2299,12 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 const argParent = node.parentId ? tree.byId.get(node.parentId) : undefined;
                 const isCallArg = argParent?.syntaxKind === "CallExpression" || argParent?.syntaxKind === "NewExpression";
                 const paramLike = node.syntaxKind === "Parameter" || isCallArg;
+                // A parameter inside a function definition draws NO box of its
+                // own — the function's parameter GROUP carries the (open-topped,
+                // rounded) bracket border, so each param is just a borderless
+                // `name: Type` text chip inside it (see functionLayout + the
+                // groupRect bracket below). Call arguments keep their own box.
+                const inFnGroup = node.syntaxKind === "Parameter" && argParent != null && isFunctionSignatureKind(argParent.syntaxKind);
                 // Kind outlines have their own (much lower) zoom threshold so they
                 // reappear well before the rest of the detail does. A call argument
                 // with no outline of its own gets the parameter light-blue.
@@ -2218,6 +2332,17 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // Constructor: white box outline + a white wrench badge inside, on
                 // the same cheap-cue zoom gate as the kind outlines.
                 const isCtor = node.syntaxKind === "Constructor" && cameraScale >= cfg.lod.outlineBelow;
+                // Array destructuring pattern — its box is stroked as a pair of
+                // square brackets (left/right verticals + corner serifs) rather
+                // than a full rect, so it reads as `[ … ]`. Same zoom gate as the
+                // other kind outlines; colour/width come from the KIND_OUTLINE
+                // branch below (ArrayBindingPattern is listed there).
+                const bracketOutline = isBracketKind(node.syntaxKind) && cameraScale >= cfg.lod.outlineBelow;
+                // Function CALL / `new`: frame the box with the same rounded
+                // brace as a function definition's parameter group, but YELLOW —
+                // the interior (args, nested calls, expandable sections) renders
+                // exactly as before; only the border style changes.
+                const callBracket = (node.syntaxKind === "CallExpression" || node.syntaxKind === "NewExpression") && cameraScale >= cfg.lod.outlineBelow;
                 let borderColor: number = liveTheme.colors.astBorder;
                 let borderWidth = 0.5;
                 let borderAlpha = 0.9;
@@ -2259,7 +2384,23 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // Parameters (and call arguments — parameter blocks for a call) get
                 // just-slightly-rounded corners, a subtle nod to the round brackets
                 // a parameter list lives in — small enough the label stays inside.
-                if (paramLike) {
+                if (callBracket) {
+                    // Fill only — NO whole-box border. The yellow brace is drawn
+                    // around just the ARGUMENT region below (see the call-args
+                    // bracket block after this chain), so the callee label sits
+                    // above an open `▷ foo ( args )` brace. Checked first so a
+                    // nested call (also a call-arg) gets its own brace, not the
+                    // borderless arg treatment below.
+                    worldGfx.rect(x, y, node.rect.w, node.rect.h).fill({color: fillColor, alpha: fillAlpha});
+                } else if (inFnGroup || isCallArg) {
+                    // No box. Function-definition params are framed by the
+                    // parameter-group brace; call arguments by the call's yellow
+                    // argument brace. Either way each is a borderless chip — no
+                    // individual light-blue box around it.
+                } else if (paramLike) {
+                    // Remaining param-likes: constructor / accessor parameters
+                    // (functions not yet laid out as a group). Keep the rounded
+                    // light-blue box.
                     const radius = Math.min(
                         4 / cameraScale, // ~4px on screen — a gentle curve, not a pill
                         Math.min(node.rect.w, node.rect.h) / 2,
@@ -2271,6 +2412,24 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     const outset = isSelected ? borderWidth / 2 : 0;
                     worldGfx
                         .roundRect(x - outset, y - outset, node.rect.w + outset * 2, node.rect.h + outset * 2, radius + outset)
+                        .stroke({color: borderColor, width: borderWidth, alpha: borderAlpha});
+                } else if (bracketOutline) {
+                    // Fill, then stroke ONLY the square-bracket strokes: full
+                    // left & right verticals plus a short serif at each corner,
+                    // leaving the middle of the top/bottom edges open so the box
+                    // reads as `[ … ]`. Serif is a quarter of the width, capped
+                    // so it stays short (bracket-like) on wide boxes.
+                    const w = node.rect.w;
+                    const h = node.rect.h;
+                    worldGfx.rect(x, y, w, h).fill({color: fillColor, alpha: fillAlpha});
+                    const serif = Math.min(w / 4, 12 / cameraScale);
+                    worldGfx
+                        .moveTo(x, y).lineTo(x, y + h) // left vertical
+                        .moveTo(x + w, y).lineTo(x + w, y + h) // right vertical
+                        .moveTo(x, y).lineTo(x + serif, y) // top-left serif
+                        .moveTo(x + w - serif, y).lineTo(x + w, y) // top-right serif
+                        .moveTo(x, y + h).lineTo(x + serif, y + h) // bottom-left serif
+                        .moveTo(x + w - serif, y + h).lineTo(x + w, y + h) // bottom-right serif
                         .stroke({color: borderColor, width: borderWidth, alpha: borderAlpha});
                 } else if (abstractOutline) {
                     // Abstract definition: dashed/dotted box outline. Abstract
@@ -2310,6 +2469,44 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // label, so they're drawn on the rect's edge as before.
                     const outset = isSelected ? borderWidth / 2 : 0;
                     worldGfx.rect(x - outset, y - outset, node.rect.w + outset * 2, node.rect.h + outset * 2).stroke({color: borderColor, width: borderWidth, alpha: borderAlpha});
+                }
+
+                // Parameter-group bracket (function definitions): a rounded
+                // border around the param chips, OPEN at the top/bottom middle
+                // — solid rounded left & right sides with short serifs at each
+                // corner — so the whole parameter list reads as one block, like
+                // an array `[ … ]` but rounded. Drawn from the function's
+                // groupRect (world via baseX/baseY); same zoom gate + light-blue
+                // param colour as the other kind outlines.
+                if (node.groupRect && cameraScale >= cfg.lod.outlineBelow) {
+                    const g = node.groupRect;
+                    drawRoundedBracket(baseX + g.x, baseY + g.y, g.w, g.h, liveTheme.colors.astOutlineParam);
+                }
+
+                // Function-call ARGUMENT bracket: a yellow rounded brace around
+                // ONLY the argument region (the call's children bounding box),
+                // not the whole call box — so it reads `▷ callee ( args )` with
+                // the callee label above an open brace. The interior layout is
+                // untouched (calls can hold nested logic / expandable sections).
+                if (callBracket) {
+                    const argKids = tree.childrenByParent.get(node.id);
+                    if (argKids && argKids.length) {
+                        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                        for (const k of argKids) {
+                            if (k.rect.x < minX) minX = k.rect.x;
+                            if (k.rect.y < minY) minY = k.rect.y;
+                            if (k.rect.x + k.rect.w > maxX) maxX = k.rect.x + k.rect.w;
+                            if (k.rect.y + k.rect.h > maxY) maxY = k.rect.y + k.rect.h;
+                        }
+                        const pad = 5 / cameraScale;
+                        drawRoundedBracket(
+                            baseX + minX - pad,
+                            baseY + minY - pad,
+                            maxX - minX + pad * 2,
+                            maxY - minY + pad * 2,
+                            isSelected ? liveTheme.colors.astSelected : liveTheme.colors.astOutlineObject,
+                        );
+                    }
                 }
 
                 pushRect({
@@ -2399,6 +2596,20 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         cx += measureMono(s.t, 11).w * segScale;
                     }
                 };
+                // Generic multi-colour label: draw `segs` left-to-right (as a
+                // centered group when `centered`). Used for the `▷ callee` call
+                // marker (triangle keyword-blue, callee in its own colour) so it
+                // matches the `ƒ` definition icon.
+                const drawSegments = (segs: {t: string; c: number}[], startX: number, midY: number, centered: boolean): void => {
+                    let total = 0;
+                    for (const s of segs) total += measureMono(s.t, 11).w;
+                    let cx = centered ? startX - (total * segScale) / 2 : startX;
+                    for (const s of segs) {
+                        if (!s.t) continue;
+                        labelPool.put({text: s.t, worldX: cx, worldY: midY, color: s.c, size: 11, anchorX: 0, anchorY: centered ? 0.5 : 0, scale: segScale});
+                        cx += measureMono(s.t, 11).w * segScale;
+                    }
+                };
                 const composite = node.extendsName != null && node.name != null;
                 // The " extends Base" suffix and the modifier keywords are
                 // non-name detail; both drop in the simplified tier along
@@ -2451,81 +2662,158 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         // In the simplified tier the multi-colour header collapses
                         // to just the name (labelText is a narrowed string in this
                         // block). Drops the modifier prefix AND the " extends Base"
-                        // suffix in one step.
-                        const headerText = simplified && node.name ? node.name : labelText;
+                        // suffix in one step. A property key keeps its `:` though —
+                        // that's part of the definition, not droppable detail — so
+                        // mirror labelFor's colon rule here instead of bare name.
+                        const headerText =
+                            simplified && node.name
+                                ? node.syntaxKind === "PropertyAssignment"
+                                    ? `${node.name}:`
+                                    : node.name
+                                : labelText;
                         const hasKids = !!tree.childrenByParent.get(node.id)?.length;
                         if (hasKids) {
-                            // Container: the label titles the children, top-left.
-                            if (useSegments) {
+                            // Expanded brace-label containers (`{}` object/type
+                            // literals, `[]` array literals, blocks) draw NO
+                            // header: the kind outline already conveys the braces
+                            // and the layout reserved no band for them (see
+                            // labelBandless), so members sit at the top of the
+                            // box. Drawing the label here would overprint them.
+                            if (isBraceLabelKind(node.syntaxKind)) {
+                                /* no header — outline conveys the braces */
+                            } else if (node.syntaxKind === "ArrowFunction") {
+                                // Arrow function: same two-column body as named
+                                // functions, but the header is just the `⇒` marker
+                                // (keyword-blue, sized to match ƒ/▷) — the binding's
+                                // name, if any, lives on the enclosing const.
+                                labelPool.put({text: "⇒", worldX: x + 4 / cameraScale, worldY: y + 3 / cameraScale, color: SYNTAX.keyword, size: ARROW_GLYPH_SIZE, anchorX: 0, anchorY: 0, scale: labelScale});
+                            } else if (isFunctionSignatureKind(node.syntaxKind)) {
+                                // `ƒ [modifiers] name` header for a function /
+                                // method definition: the ƒ marker (keyword-blue)
+                                // ALWAYS shows so a function is unmistakable in
+                                // every zoom tier; modifiers (`static`…) ride along
+                                // in keyword-blue when not simplified; the name in
+                                // func-yellow. The signature flow —
+                                // ( params ) : ReturnType — is the glyph loop below.
+                                // Uses node.name (not headerText) for the name so
+                                // modifiers aren't doubled (labelFor folds them in).
+                                const fsegs: {t: string; c: number}[] = [{t: "ƒ ", c: SYNTAX.keyword}];
+                                if (showModifiers && modifierPrefix) fsegs.push({t: modifierPrefix + " ", c: SYNTAX.keyword});
+                                if (node.name) fsegs.push({t: node.name, c: syntaxColor(node)});
+                                let fcx = x + 4 / cameraScale;
+                                const fy = y + 3 / cameraScale;
+                                for (const s of fsegs) {
+                                    labelPool.put({text: s.t, worldX: fcx, worldY: fy, color: s.c, size: 11, anchorX: 0, anchorY: 0, scale: labelScale});
+                                    fcx += measureMono(s.t, 11).w * labelScale;
+                                }
+                            } else if (useSegments) {
+                                // Container: the label titles the children, top-left.
                                 drawHeaderSegments(x + 4 / cameraScale, y + 3 / cameraScale, false);
                             } else {
-                                labelPool.put({
-                                    text: headerText,
-                                    worldX: x + 4 / cameraScale,
-                                    worldY: y + 3 / cameraScale,
-                                    color: syntaxColor(node),
-                                    size: 11,
-                                    anchorX: 0,
-                                    anchorY: 0,
-                                    scale: labelScale,
-                                });
+                                // Function CALL (`▷ callee`): the triangle marker
+                                // in keyword-blue (matching the ƒ icon), callee in
+                                // its own colour. Other labels: single colour.
+                                const call = node.syntaxKind === "CallExpression" ? splitCallMarker(headerText) : null;
+                                if (call) {
+                                    drawSegments([{t: call.marker, c: SYNTAX.keyword}, {t: call.rest, c: syntaxColor(node)}], x + 4 / cameraScale, y + 3 / cameraScale, false);
+                                } else {
+                                    labelPool.put({
+                                        text: headerText,
+                                        worldX: x + 4 / cameraScale,
+                                        worldY: y + 3 / cameraScale,
+                                        color: syntaxColor(node),
+                                        // The lone `⇒` arrow-function glyph reads
+                                        // smaller than the ƒ / ▷ markers at 11px,
+                                        // so bump it to sit at the same visual size.
+                                        size: node.syntaxKind === "ArrowFunction" ? ARROW_GLYPH_SIZE : 11,
+                                        anchorX: 0,
+                                        anchorY: 0,
+                                        scale: labelScale,
+                                    });
+                                }
                             }
                         } else if (useSegments) {
                             // Leaf class (empty body) OR modifier-only leaf:
                             // centered multi-colour header.
                             drawHeaderSegments(x + node.rect.w / 2, y + node.rect.h / 2, true);
                         } else {
-                            // Leaf / value (an operand like `20`, `i`, `j`): center it in
-                            // its box, symmetric with the left chip and the operator glyph.
-                            labelPool.put({
-                                text: headerText,
-                                worldX: x + node.rect.w / 2,
-                                worldY: y + node.rect.h / 2,
-                                color: syntaxColor(node),
-                                size: 11,
-                                anchorX: 0.5,
-                                anchorY: 0.5,
-                                scale: labelScale,
-                            });
+                            // Leaf / value. A parameter chip reads `name: Type`
+                            // two-toned — name in the variable colour, type in
+                            // teal, like an editor (the type was baked into the
+                            // name server-side, so it survives the simplified
+                            // tier). Everything else is a single-colour centered
+                            // label (an operand like `20`, `i`, `j`).
+                            const paramSplit = node.syntaxKind === "Parameter" ? splitTypeAnnotation(headerText) : null;
+                            if (paramSplit) {
+                                const sep = ": ";
+                                const nameW = measureMono(paramSplit.name, 11).w;
+                                const sepW = measureMono(sep, 11).w;
+                                const typeW = measureMono(paramSplit.type, 11).w;
+                                const cyc = y + node.rect.h / 2;
+                                let cxc = x + node.rect.w / 2 - ((nameW + sepW + typeW) * labelScale) / 2;
+                                labelPool.put({text: paramSplit.name, worldX: cxc, worldY: cyc, color: SYNTAX.variable, size: 11, anchorX: 0, anchorY: 0.5, scale: labelScale});
+                                cxc += nameW * labelScale;
+                                labelPool.put({text: sep, worldX: cxc, worldY: cyc, color: SYNTAX.default, size: 11, anchorX: 0, anchorY: 0.5, scale: labelScale});
+                                cxc += sepW * labelScale;
+                                labelPool.put({text: paramSplit.type, worldX: cxc, worldY: cyc, color: SYNTAX.type, size: 11, anchorX: 0, anchorY: 0.5, scale: labelScale});
+                            } else {
+                                // No-arg function CALL (`▷ callee`): triangle in
+                                // keyword-blue, callee in its colour, centered.
+                                const call = node.syntaxKind === "CallExpression" ? splitCallMarker(headerText) : null;
+                                if (call) {
+                                    drawSegments([{t: call.marker, c: SYNTAX.keyword}, {t: call.rest, c: syntaxColor(node)}], x + node.rect.w / 2, y + node.rect.h / 2, true);
+                                } else {
+                                    labelPool.put({
+                                        text: headerText,
+                                        worldX: x + node.rect.w / 2,
+                                        worldY: y + node.rect.h / 2,
+                                        color: syntaxColor(node),
+                                        size: node.syntaxKind === "ArrowFunction" ? ARROW_GLYPH_SIZE : 11,
+                                        anchorX: 0.5,
+                                        anchorY: 0.5,
+                                        scale: labelScale,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
 
-                // The operator glyph, drawn centered between the two operand boxes
-                // (`[i] = [j]`, `[[i] + [1]] + [j]`). Counter-scaled so it stays
-                // a constant on-screen size and gated only on fitting its box:
-                // operators carry the same semantic weight as the variable names
-                // they sit between (an `=` between `i` and `j` is what makes the
-                // pair an assignment), so they survive the simplified-tier drop
-                // as long as there's room for the glyph. Dropping them with the
-                // generic kind labels was leaving "[i] [j]" hanging in mid-air.
-                if (node.op && node.opAnchor) {
-                    const opBox = labelScreenBox(node.op);
-                    if (wOnScreen >= opBox.w * labelOnScreenFactor && hOnScreen >= opBox.h * labelOnScreenFactor) {
+                // Inline syntax glyphs, drawn centered between/around the operand
+                // boxes: a BinaryExpression's operator (`[i] = [j]`), a ternary's
+                // `?`/`:`, and a templated construct's keyword sequence
+                // (`for [x] of [items]`, `case [v] :`). Counter-scaled so each
+                // stays a constant on-screen size and gated only on fitting its
+                // box — these carry the same semantic weight as the names they sit
+                // between (the `=` is what makes `[i] [j]` an assignment; the `for`
+                // and `of` are what make the loop a loop), so they survive the
+                // simplified-tier drop as long as there's room. A glyph's own
+                // `color` wins (control keywords render pink); operators and
+                // punctuation fall back to the default foreground.
+                if (node.glyphs) {
+                    for (const g of node.glyphs) {
+                        // A glyph may carry its own size (e.g. the 2× return
+                        // symbol); default to the normal label size. It always
+                        // counter-scales by labelScale, so it scales WITH the
+                        // other labels/blocks at every zoom.
+                        const gSize = g.size ?? AST_LABEL_FONT;
+                        // Normal glyphs hide when they no longer fit their box on
+                        // screen. Explicitly-sized glyphs are important (the
+                        // return symbol) — skip that gate so they stay visible as
+                        // long as the node is drawn, rather than vanishing at a
+                        // zoom-out threshold while surrounding text is still shown.
+                        if (g.size == null) {
+                            const gBox = labelScreenBox(g.text);
+                            if (wOnScreen < gBox.w * labelOnScreenFactor || hOnScreen < gBox.h * labelOnScreenFactor) {
+                                continue;
+                            }
+                        }
                         labelPool.put({
-                            text: node.op,
-                            worldX: baseX + node.opAnchor.x,
-                            worldY: baseY + node.opAnchor.y,
-                            color: SYNTAX.default,
-                            size: 11,
-                            anchorX: 0.5,
-                            anchorY: 0.5,
-                            scale: labelScale,
-                        });
-                    }
-                }
-                // Second operator (ternary `:` after `?`). Drawn the same
-                // way as op above; opAnchor2 was filled by the treemap's
-                // ternary layout. Unset for every non-ternary node.
-                if (node.op2 && node.opAnchor2) {
-                    const op2Box = labelScreenBox(node.op2);
-                    if (wOnScreen >= op2Box.w * labelOnScreenFactor && hOnScreen >= op2Box.h * labelOnScreenFactor) {
-                        labelPool.put({
-                            text: node.op2,
-                            worldX: baseX + node.opAnchor2.x,
-                            worldY: baseY + node.opAnchor2.y,
-                            color: SYNTAX.default,
-                            size: 11,
+                            text: g.text,
+                            worldX: baseX + g.anchor.x,
+                            worldY: baseY + g.anchor.y,
+                            color: g.color ?? SYNTAX.default,
+                            size: gSize,
                             anchorX: 0.5,
                             anchorY: 0.5,
                             scale: labelScale,

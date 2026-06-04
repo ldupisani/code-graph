@@ -50,6 +50,13 @@ export interface LayoutTier {
 // in Phase 6.
 export interface BehavioralConfig {
     selectionExpands: boolean;
+    // In focus/detail mode (when isolate hides the files outside your focus):
+    // true keeps every PINNED file on screen as well — "see all pinned items".
+    // False lets pinned files hide along with the rest, so you see only the
+    // active focus — "only what is active". Either way the pinned files are NOT
+    // force-expanded and still obey the normal isolation dimming and filename
+    // zoom-LOD rules — this only governs whether a pin survives isolate-hiding.
+    showAllPinnedInDetail: boolean;
     // Keep the pin icon (badge) bright even when its file box is dimmed by
     // focus, so a pin stays a clear anchor on a faded file. When false, the pin
     // icon dims along with its box. (The box itself always dims normally.)

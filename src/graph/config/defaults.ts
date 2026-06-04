@@ -31,6 +31,10 @@ const DEFAULT_BEHAVIORAL: BehavioralConfig = {
     // Master toggle for zoom-driven file expansion: when true, a selected file
     // auto-expands once zoom crosses the expand threshold.
     selectionExpands: true,
+    // On by default: pinned files stay on screen through focus mode (the
+    // original behaviour — a pin is a "keep this visible" anchor). Turn off to
+    // let pins hide with everything else and see only the active focus.
+    showAllPinnedInDetail: true,
     // Keep the pin icon bright on dimmed files (a clear anchor); the file box
     // itself still dims normally.
     highlightPins: true,

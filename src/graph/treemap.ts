@@ -163,7 +163,7 @@ export interface AstLayoutOpts {
       chain?: { marker: string; argCount: number }[];
     },
   ) =>
-    | Array<{ kw: string; color: number; size?: number; glue?: boolean } | { child: number; glue?: boolean }>
+    | Array<{ kw: string; color: number; size?: number; glue?: boolean; breakBefore?: boolean } | { child: number; glue?: boolean; breakBefore?: boolean }>
     | null;
   // Kinds whose label must NOT reserve a top header band when the node is
   // expanded (has children) — e.g. an object literal `{ … }` shown inline in a
@@ -360,8 +360,8 @@ export function layoutAst(
   // One item in a templated construct's flow: either an inline keyword/punct
   // glyph (carrying its own measured box) or an already-sized child box.
   type FlowItem =
-    | { glyph: { text: string; color?: number; size?: number; w: number; h: number }; glue?: boolean }
-    | { sized: Sized; glue?: boolean };
+    | { glyph: { text: string; color?: number; size?: number; w: number; h: number }; glue?: boolean; breakBefore?: boolean }
+    | { sized: Sized; glue?: boolean; breakBefore?: boolean };
 
   // Pack an interleaved sequence of glyphs and child boxes into wrapped rows
   // (same wrap width / gap as the generic packer). Glyphs get a centered
@@ -386,10 +386,12 @@ export function layoutAst(
     let row = 0;
     for (const it of items) {
       const w = widthOf(it);
-      // `glue` items must stay on the same row as their predecessor (a chain
-      // segment's `method ( args )` glued to its `▷`), so a break is only legal
-      // before a NON-glued item — keeps matching parens from splitting rows.
-      if (rowX > 0 && !it.glue && rowX + w > wrapWidth) {
+      // `breakBefore` items ALWAYS start a new row (the `else` keyword, so a
+      // conditional reads line by line). Otherwise, `glue` items must stay on
+      // the same row as their predecessor (a chain segment's `method ( args )`
+      // glued to its `▷`), so a break is only legal before a NON-glued item that
+      // overflows the wrap width — keeps matching parens from splitting rows.
+      if (rowX > 0 && (it.breakBefore || (!it.glue && rowX + w > wrapWidth))) {
         row++;
         rowX = 0;
       }
@@ -699,7 +701,7 @@ export function layoutAst(
   // shapes). `assign()` offsets the flow below the band via `labelH`.
   const constructLayout = (
     node: AstNode,
-    tokens: Array<{ kw: string; color: number; size?: number; glue?: boolean } | { child: number; glue?: boolean }>,
+    tokens: Array<{ kw: string; color: number; size?: number; glue?: boolean; breakBefore?: boolean } | { child: number; glue?: boolean; breakBefore?: boolean }>,
     kids: AstNode[],
     lb: { w: number; h: number },
   ): Sized => {
@@ -709,7 +711,7 @@ export function layoutAst(
     for (const t of tokens) {
       if ('child' in t) {
         const child = kids[t.child];
-        if (child) items.push({ sized: sizeOrCollapse(child, node.syntaxKind), glue: t.glue });
+        if (child) items.push({ sized: sizeOrCollapse(child, node.syntaxKind), glue: t.glue, breakBefore: t.breakBefore });
       } else {
         // A sized glyph (e.g. the 2× return symbol) reserves a footprint at its
         // own size via the tight glyph measure; normal-size glyphs keep the
@@ -723,7 +725,7 @@ export function layoutAst(
         // (~1em) so it can't overflow its slot and overlap the next item when
         // scaled out to full size (it's drawn centered in this footprint).
         const gw = t.size != null ? Math.max(gb.w, t.size) : gb.w;
-        items.push({ glyph: { text: t.kw, color: t.color, size: t.size, w: gw, h: gb.h }, glue: t.glue });
+        items.push({ glyph: { text: t.kw, color: t.color, size: t.size, w: gw, h: gb.h }, glue: t.glue, breakBefore: t.breakBefore });
       }
     }
     kids.forEach((k, i) => {

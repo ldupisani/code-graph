@@ -18,6 +18,7 @@ export function BehavioralControls() {
     return (
         <div style={{display: "flex", flexDirection: "column", gap: "0.45rem"}}>
             <ToggleField label="Selection expands files" value={b.selectionExpands} help="Auto-expand a selected file once zoomed in" onChange={(v) => setConfig({behavioral: {selectionExpands: v}})} />
+            <ToggleField label="Detail view: keep pinned files visible" value={b.showAllPinnedInDetail} help="On: pinned files stay on screen in focus mode (dimmed, not expanded). Off: pins hide with everything else, so you see only the active focus." onChange={(v) => setConfig({behavioral: {showAllPinnedInDetail: v}})} />
             <ToggleField label="Highlight pin icons on dim files" value={b.highlightPins} help="Keep the pin icon bright when its file box is dimmed by focus (off = the icon dims with the box)" onChange={(v) => setConfig({behavioral: {highlightPins: v}})} />
             <ToggleField label="Isolate: imports (↓)" value={b.isolateImports} help="Isolate follows outgoing edges (what this depends on)" onChange={(v) => setConfig({behavioral: {isolateImports: v}})} />
             <ToggleField label="Isolate: exports (↑)" value={b.isolateExports} help="Isolate follows incoming edges (what depends on this)" onChange={(v) => setConfig({behavioral: {isolateExports: v}})} />

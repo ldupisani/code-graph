@@ -407,9 +407,12 @@ export const SYNTAX = {
 // packer keeps it on the same row as the preceding token. Used to keep a
 // method-call segment's `method ( args )` together so matching parens never
 // split across a wrap (only the leading `▷` marker is a legal break point).
+// `breakBefore: true` is the opposite — ALWAYS start a new row at this token,
+// regardless of remaining width. Used for the `else` / `else if` keyword so a
+// conditional reads `if [cond] [then]` / `else [elseBranch]` on separate lines.
 export type SyntaxToken =
-    | { kw: string; color: number; size?: number; glue?: boolean }
-    | { child: number; glue?: boolean };
+    | { kw: string; color: number; size?: number; glue?: boolean; breakBefore?: boolean }
+    | { child: number; glue?: boolean; breakBefore?: boolean };
 export type SyntaxTemplate = (
     kids: { syntaxKind: string; role?: string }[],
     node: { syntaxKind: string; name: string | null; returnType?: string },
@@ -449,9 +452,12 @@ export const SYNTAX_TEMPLATES: Record<string, SyntaxTemplate> = {
     // --- Conditionals & switch ---
     // `if [cond] { then } else { else }` — the `else` glyph sits before the
     // else branch (child 2), which may itself be another `if` (else-if chain).
+    // `breakBefore` forces the `else` onto its own line so the conditional reads
+    // `if [cond] [then]` / `else [elseBranch]` (and `else if …`) line by line,
+    // rather than the `else` trailing the then-branch on the same row.
     IfStatement: (kids) =>
         kids.length >= 3
-            ? [{kw: "if", color: C}, {child: 0}, {child: 1}, {kw: "else", color: C}, {child: 2}]
+            ? [{kw: "if", color: C}, {child: 0}, {child: 1}, {kw: "else", color: C, breakBefore: true}, {child: 2}]
             : [{kw: "if", color: C}, {child: 0}],
     SwitchStatement: () => [{kw: "switch", color: C}, {child: 0}],
     CaseClause: () => [{kw: "case", color: C}, {child: 0}, {kw: ":", color: P}],

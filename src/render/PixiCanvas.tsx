@@ -1317,11 +1317,14 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     }
                     if (isolateActive && liveFiles) {
                         for (const sim of layout.nodes) {
-                            // Same rule applies to isolation hiding:
-                            // a pinned file is a persistent "point
-                            // of interest" indicator that must stay
-                            // on screen regardless of focus mode.
-                            if (sim.userPinned) continue;
+                            // A pinned file survives isolate-hiding ONLY when
+                            // "Detail view: all pinned" is on (a pin is then a
+                            // "keep this visible" anchor — it still dims with focus
+                            // and obeys the filename LOD, it just isn't hidden).
+                            // With it off, a pin is purely positional: the file
+                            // hides in focus mode like any other non-active file,
+                            // so focusing one file shows only it.
+                            if (sim.userPinned && cfg.behavioral.showAllPinnedInDetail) continue;
                             if (!liveFiles.has(sim.id) && !pathFileSet.has(sim.id)) {
                                 out.add(sim.id);
                             }
@@ -3880,6 +3883,44 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     unpinAll: unpinAllFiles,
                 };
             }
+
+            // __DEBUG_DRILLDOWN__ (temporary) — drive the real overlay-aware
+            // click path by AST node id, and inspect what's clickable.
+            (window as unknown as Record<string, unknown>).__cgClickId = (id: string) => {
+                const target =
+                    overlayHitRects.find((r) => r.id === id && r.kind === "ast") ??
+                    hitRects.find((r) => r.id === id && r.kind === "ast");
+                const before = [...useGraphStore.getState().expandedAstNodes];
+                if (target) handleClick(target);
+                const after = [...useGraphStore.getState().expandedAstNodes];
+                return {found: !!target, kind: target?.kind, before, after};
+            };
+            (window as unknown as Record<string, unknown>).__cgRects = () => {
+                const cr = app.canvas.getBoundingClientRect();
+                const toScreen = (r: HitRect) => ({
+                    id: r.id,
+                    kind: r.kind,
+                    sx: cr.left + world.x + r.x * world.scale.x,
+                    sy: cr.top + world.y + r.y * world.scale.y,
+                    sw: r.w * world.scale.x,
+                    sh: r.h * world.scale.y,
+                });
+                return {
+                    overlay: overlayHitRects.map(toScreen),
+                    main: hitRects.filter((r) => r.kind === "ast" || r.kind === "ast-toggle").map(toScreen),
+                };
+            };
+            // Run the REAL hitTest at a screen point (overlay-aware) and report
+            // what would be hit — to detect mis-targeted clicks.
+            (window as unknown as Record<string, unknown>).__cgHitAt = (sx: number, sy: number) => {
+                const cr = app.canvas.getBoundingClientRect();
+                const wx = (sx - cr.left - world.x) / world.scale.x;
+                const wy = (sy - cr.top - world.y) / world.scale.y;
+                const overlay = smallestContaining(overlayHitRects, wx, wy);
+                const direct = smallestContaining(hitRects, wx, wy);
+                const t = overlay ?? direct;
+                return t ? {id: t.id, kind: t.kind, via: overlay ? "overlay" : "main"} : null;
+            };
 
             const detachCamera = wireCamera({
                 app,

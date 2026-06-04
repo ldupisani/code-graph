@@ -78,7 +78,10 @@ export const SYNTAX_KIND_LABELS: Record<string, string> = {
     ExportDeclaration: "export",
     ImportClause: "imports",
     NamedImports: "named",
-    Parameter: "param",
+    // No generic "param" label: a named parameter bakes its `name: Type` into
+    // the label (see bakeNamedType), and a destructured one renders as
+    // `{…} : Type` via syntaxTokens — so a label-less Parameter needs no
+    // stand-in text (it would just read as a noisy "param" wrapper).
 };
 
 // Names ALWAYS take precedence. Unnamed nodes get a label only if their kind
@@ -565,6 +568,19 @@ export function syntaxTokens(
             tokens.push({kw: ")", color: SYNTAX.default, glue: true});
         }
         return tokens;
+    }
+    // Destructured parameter `({ … }: Type)` — render it as `{…} : Type`: the
+    // binding pattern collapses to a drillable `{…}` (via constructLayout's
+    // sizeOrCollapse), and the type annotation reads clearly as the object's
+    // type (a TypeReference, painted teal). Replaces the generic "param" box
+    // that wrapped the pattern + type. A baked `name: Type` param has its type
+    // folded into the name and NO children, so it never matches here.
+    if (
+        kind === "Parameter" &&
+        kids.length === 2 &&
+        (kids[0].syntaxKind === "ObjectBindingPattern" || kids[0].syntaxKind === "ArrayBindingPattern")
+    ) {
+        return [{child: 0}, {kw: ": ", color: SYNTAX.default}, {child: 1}];
     }
     const t = SYNTAX_TEMPLATES[kind];
     return t ? t(kids, node) : null;

@@ -1264,13 +1264,50 @@ const REFERENCE_KINDS_TO_SKIP = new Set<ts.SyntaxKind>([
   ts.SyntaxKind.NewExpression,
 ]);
 
+// Compact, single-line summary of a binding pattern for a collapsed-cell
+// label: `{ first, second, … }` (or `[a, b, … ]`). The full list of bindings
+// is visible when the declaration is expanded — a collapsed
+// `const { … } = useHook()` cell only needs to identify itself. Inlining every
+// destructured name VERBATIM (via getName(), which returns the pattern's source
+// text complete with the developer's newlines/indentation) produced a giant
+// multi-line label, and the layout couldn't place that huge cell sensibly — it
+// floated in open space. We cap the shown names by a small character budget.
+function compactBindingPattern(pattern: Node): string {
+  const isArray = pattern.getKind() === ts.SyntaxKind.ArrayBindingPattern;
+  const open = isArray ? '[' : '{';
+  const close = isArray ? ']' : '}';
+  const elements = (pattern as unknown as {getElements(): Node[]}).getElements();
+  const names: string[] = [];
+  for (const el of elements) {
+    if (Node.isBindingElement(el)) {
+      names.push((el.getDotDotDotToken() ? '...' : '') + el.getName());
+    }
+    // ArrayBindingPattern holes (OmittedExpression) contribute no name.
+  }
+  if (names.length === 0) return `${open}${close}`;
+  const BUDGET = 32;
+  let acc = '';
+  let shown = 0;
+  for (const nm of names) {
+    const next = acc ? `${acc}, ${nm}` : nm;
+    if (shown > 0 && next.length > BUDGET) break;
+    acc = next;
+    shown++;
+  }
+  const tail = shown < names.length ? ', …' : '';
+  return `${open} ${acc}${tail} ${close}`;
+}
+
 // Public entry point. Suppresses the Decorator wrapper itself and
 // rewrites its expression's label with an `@` prefix — turning the
 // previously redundant `[Decorator(name=Component)] > [▷ Component(...)]`
 // nesting into a single rect labelled `@Component(...)`. The prefix
 // rewrite applies to every label-source (synthesizeCallLabel,
 // Identifier, synthesizeAccessLabel, getName fallback) by sitting at
-// the wrapper level rather than inside each branch.
+// the wrapper level rather than inside each branch. A final whitespace
+// normalization collapses any newlines/indentation that leaked in from
+// source text (e.g. a multi-line type annotation) so EVERY label is a
+// single line — a label is a compact summary, never a verbatim excerpt.
 function friendlyName(
   node: Node,
   inlined: Set<Node>,
@@ -1284,7 +1321,10 @@ function friendlyName(
     // there.
     return null;
   }
-  const raw = rawFriendlyName(node, inlined, chainReparent, chainData);
+  const rawText = rawFriendlyName(node, inlined, chainReparent, chainData);
+  // Collapse any source whitespace (newlines/indentation) to single spaces so
+  // a label is always one line — see compactBindingPattern's note.
+  const raw = rawText == null ? rawText : rawText.replace(/\s+/g, ' ').trim();
   // If THIS node is the immediate expression of a Decorator, prefix
   // with `@` (matching the source syntax). Strip our common label
   // prefixes so we don't end up with `@▷ Foo`.
@@ -1386,8 +1426,19 @@ function rawFriendlyName(
     if (decls.length > 0) {
       const names: string[] = [];
       for (const d of decls) {
-        const n = d.getName();
-        if (n) names.push(n);
+        const nameNode = d.getNameNode();
+        const nk = nameNode.getKind();
+        // Destructuring decl (`const { a, b } = …`): summarise the pattern
+        // compactly instead of inlining its full multi-line source text.
+        if (
+          nk === ts.SyntaxKind.ObjectBindingPattern ||
+          nk === ts.SyntaxKind.ArrayBindingPattern
+        ) {
+          names.push(compactBindingPattern(nameNode));
+        } else {
+          const n = d.getName();
+          if (n) names.push(n);
+        }
       }
       if (names.length > 0) {
         // Lead with the declaration keyword (`const` / `let` / `var`) so the

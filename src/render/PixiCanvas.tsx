@@ -2748,7 +2748,15 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 ) {
                     const parent = node.parentId ? tree.byId.get(node.parentId) : null;
                     const parentLabel = parent ? labelFor(parent) : null;
-                    if (parentLabel !== labelText) {
+                    // Suppress a child whose label duplicates its parent's — e.g.
+                    // an ImportSpecifier and its inner Identifier re-emit one token,
+                    // so the child rect would just stack the same word. EXCEPT a JSX
+                    // attribute value: in `type={type}` / `id={id}` the value
+                    // legitimately repeats the attribute name. The name node was
+                    // inlined server-side (see ast-extractor's JsxAttribute branch),
+                    // so any remaining child IS the value — blanking it leaves an
+                    // empty box where the source reads `={type}`.
+                    if (parentLabel !== labelText || parent?.syntaxKind === "JsxAttribute") {
                         // In the simplified tier the multi-colour header collapses
                         // to just the name (labelText is a narrowed string in this
                         // block). Drops the modifier prefix AND the " extends Base"

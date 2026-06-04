@@ -13,7 +13,7 @@ import {buildAstForceLayout, type AstForceLayout, type ContainerForceLayout} fro
 import type {FileAstResponse, ProjectResponse} from "../api/types";
 import type {SimFileNode} from "../graph/types";
 import {blendColor, DEFAULT_FILL_ALPHA, depthTint, EXPORT_FILL_ALPHA, EXPORT_FILL_BLEND, EXPORT_FILL_COLOR, hslToHex, liveTheme} from "./theme";
-import {composeModifierPrefix, isBracketKind, isBraceLabelKind, isExpandableKind, isFunctionSignatureKind, isHighLevel, isJsxSignatureKind, isSignificant, KIND_FILL_TINT, KIND_OUTLINE, labelFor, NAME_LIKE_KINDS, splitCallMarker, splitDeclarationKeyword, splitTypeAnnotation, SYNTAX, syntaxColor, syntaxTokens} from "./astStyle";
+import {composeModifierPrefix, isBracketKind, isBraceLabelKind, isExpandableKind, isFunctionSignatureKind, isHighLevel, isJsxSignatureKind, isSignificant, KIND_FILL_TINT, KIND_OUTLINE, labelFor, NAME_LIKE_KINDS, splitCallMarker, splitDeclarationKeyword, splitDefaultExportPrefix, splitTypeAnnotation, SYNTAX, syntaxColor, syntaxTokens} from "./astStyle";
 import {findVisibleAnchor, smallestContaining, type HitRect} from "./hitTest";
 import {drawEdges, drawSemanticEdges, emitDashed} from "./edges";
 import {wireCamera} from "./cameraInput";
@@ -2297,31 +2297,34 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         if (wOnScreen >= lb.w * f && hOnScreen >= lb.h * f) {
                             const scale = astLabelScale(cameraScale);
                             const cy = y + node.rect.h / 2;
-                            // `const entity` reads like an editor: the
-                            // declaration keyword in keyword-blue, the declared
-                            // name(s) in the variable colour. Drawn as two
-                            // left-anchored segments, centered as a group so the
-                            // cell still reads centered like the plain case.
-                            const decl = node.syntaxKind === "VariableStatement" ? splitDeclarationKeyword(collapsedLabel) : null;
+                            // Editor-like two-tone, drawn as left-anchored
+                            // segments centered as a group: an `export default`
+                            // prefix (keyword-blue, when this is a merged default
+                            // export) + a `const`/`let`/`var` keyword (keyword-
+                            // blue) + the declared name (variable colour). Falls
+                            // back to a single coloured segment otherwise.
+                            const segs: {t: string; c: number}[] = [];
+                            let rest = collapsedLabel;
+                            if (node.defaultExport) {
+                                const de = splitDefaultExportPrefix(rest);
+                                if (de) {
+                                    segs.push({t: "export default ", c: SYNTAX.keyword});
+                                    rest = de.rest;
+                                }
+                            }
+                            const decl = node.syntaxKind === "VariableStatement" ? splitDeclarationKeyword(rest) : null;
                             if (decl) {
-                                const kwText = decl.keyword + " ";
-                                const kwW = measureMono(kwText, 11).w;
-                                const totalW = kwW + measureMono(decl.rest, 11).w;
-                                let cx = x + node.rect.w / 2 - (totalW * scale) / 2;
-                                labelPool.put({text: kwText, worldX: cx, worldY: cy, color: SYNTAX.keyword, size: 11, anchorX: 0, anchorY: 0.5, scale});
-                                cx += kwW * scale;
-                                labelPool.put({text: decl.rest, worldX: cx, worldY: cy, color: SYNTAX.variable, size: 11, anchorX: 0, anchorY: 0.5, scale});
+                                segs.push({t: decl.keyword + " ", c: SYNTAX.keyword});
+                                segs.push({t: decl.rest, c: SYNTAX.variable});
                             } else {
-                                labelPool.put({
-                                    text: collapsedLabel,
-                                    worldX: x + node.rect.w / 2,
-                                    worldY: cy,
-                                    color: syntaxColor(node),
-                                    size: 11,
-                                    anchorX: 0.5,
-                                    anchorY: 0.5,
-                                    scale,
-                                });
+                                segs.push({t: rest, c: syntaxColor(node)});
+                            }
+                            let totalW = 0;
+                            for (const s of segs) totalW += measureMono(s.t, 11).w;
+                            let cx = x + node.rect.w / 2 - (totalW * scale) / 2;
+                            for (const s of segs) {
+                                labelPool.put({text: s.t, worldX: cx, worldY: cy, color: s.c, size: 11, anchorX: 0, anchorY: 0.5, scale});
+                                cx += measureMono(s.t, 11).w * scale;
                             }
                         }
                     }
@@ -2784,7 +2787,13 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                                 // ( params ) : ReturnType — is the glyph loop below.
                                 // Uses node.name (not headerText) for the name so
                                 // modifiers aren't doubled (labelFor folds them in).
-                                const fsegs: {t: string; c: number}[] = [{t: "ƒ ", c: SYNTAX.keyword}];
+                                // `export default ƒ Foo` when a `export default Foo`
+                                // statement was merged onto this function (the ƒ
+                                // path uses bare node.name, so prepend the prefix
+                                // segment directly rather than via labelFor).
+                                const fsegs: {t: string; c: number}[] = [];
+                                if (node.defaultExport) fsegs.push({t: "export default ", c: SYNTAX.keyword});
+                                fsegs.push({t: "ƒ ", c: SYNTAX.keyword});
                                 if (showModifiers && modifierPrefix) fsegs.push({t: modifierPrefix + " ", c: SYNTAX.keyword});
                                 if (node.name) fsegs.push({t: node.name, c: syntaxColor(node)});
                                 let fcx = x + 4 / cameraScale;
@@ -2830,7 +2839,10 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                             // name server-side, so it survives the simplified
                             // tier). Everything else is a single-colour centered
                             // label (an operand like `20`, `i`, `j`).
-                            const paramSplit = node.syntaxKind === "Parameter" ? splitTypeAnnotation(headerText) : null;
+                            // Parameters AND interface/type-literal members read
+                            // `name: Type` two-toned (the type is baked into the
+                            // name server-side; see bakeNamedType).
+                            const paramSplit = (node.syntaxKind === "Parameter" || node.syntaxKind === "PropertySignature") ? splitTypeAnnotation(headerText) : null;
                             // When this cell was stretched to match a taller row
                             // sibling (labelTop), pin the label to the top band —
                             // same y as a sibling header (y + 3px) — instead of

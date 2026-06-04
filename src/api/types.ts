@@ -105,6 +105,11 @@ export interface AstNode {
   // declaration, `export`/`export default`). Used for zoomed-out LOD: only
   // high-level constructs keep their label when text no longer fits.
   exported?: boolean;
+  // True when this node IS the resolved local implementation of a default
+  // export — i.e. a `export default X` statement re-exported this declaration
+  // by name, and that statement was merged away. The renderer prefixes the
+  // label with `export default` (keyword colour). Set alongside `exported`.
+  defaultExport?: boolean;
   // True for an `abstract` declaration (class/method/property/accessor).
   // The renderer gives it a dashed box outline.
   abstract?: boolean;

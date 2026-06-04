@@ -37,6 +37,9 @@ export interface TreemapNode {
   rect: Rect;
   depth: number;
   exported?: boolean;
+  // The resolved local implementation of a merged default export (see
+  // AstNode.defaultExport) — renderer prefixes the label with `export default`.
+  defaultExport?: boolean;
   abstract?: boolean;
   static?: boolean;
   readonly?: boolean;
@@ -892,6 +895,7 @@ export function layoutAst(
       start: s.node.start,
       end: s.node.end,
       exported: s.node.exported,
+      defaultExport: s.node.defaultExport,
       abstract: s.node.abstract,
       static: s.node.static,
       readonly: s.node.readonly,

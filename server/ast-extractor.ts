@@ -82,6 +82,9 @@ export function extractAst(
   // flattenCallChain / synthesizeCallLabel.
   const chainReparent = new Set<Node>();
   const chainData = new Map<Node, ChainSegmentInfo[]>();
+  // id → emitted AstNode, so a later node (e.g. `export default X`) can flag an
+  // ALREADY-emitted node (the `const X` it re-exports) — see tryMergeDefaultExport.
+  const astById = new Map<string, AstNode>();
   let seq = 0;
 
   // IDs are sequential within a file walk because parent and child can share a
@@ -99,7 +102,7 @@ export function extractAst(
   function pushAndRecurse(node: Node, id: string, parentId: string | null): void {
     idByNode.set(node, id);
     const typeFlag = isTypeImportBinding(node) || undefined;
-    nodes.push({
+    const ast: AstNode = {
       id,
       parentId,
       syntaxKind: syntaxKindName(node.getKind()),
@@ -121,7 +124,9 @@ export function extractAst(
       chain: chainData.get(node),
       start: node.getStart(),
       end: node.getEnd(),
-    });
+    };
+    nodes.push(ast);
+    astById.set(id, ast);
     node.forEachChild((child) => visit(child, id));
   }
 
@@ -132,6 +137,18 @@ export function extractAst(
     // no information; skip it so it doesn't litter a JSX element with empty
     // boxes. Text with actual content (`<p>Hello</p>`) still emits.
     if (kind === ts.SyntaxKind.JsxText && node.getText().trim() === '') return;
+    // Empty template-literal text chunk — the `` `${variant}` `` tail (nothing
+    // between `}` and the closing backtick) or a head like `` `${x}…` ``. It
+    // carries no content; skip it so an interpolation doesn't trail a stray
+    // empty box. Non-empty chunks (the `button-` head) still emit.
+    if (
+      (kind === ts.SyntaxKind.TemplateHead ||
+        kind === ts.SyntaxKind.TemplateMiddle ||
+        kind === ts.SyntaxKind.TemplateTail) &&
+      !(node.compilerNode as ts.LiteralLikeNode).text
+    ) {
+      return;
+    }
     // Already captured by an ancestor's synthesised label (the callee of a
     // collapsed Call/New, or any segment of a flattened access chain).
     if (inlined.has(node)) return;
@@ -157,7 +174,61 @@ export function extractAst(
       node.forEachChild((child) => visit(child, parentId));
       return;
     }
+    // `export default <localName>` — fold this re-export INTO the local
+    // declaration it names (flag it as the default export) and skip emitting the
+    // separate export node, so a `const X = …; export default X;` reads as ONE
+    // node `export default const X` rather than two unrelated boxes.
+    if (tryMergeDefaultExport(node)) return;
     pushAndRecurse(node, nextId(), parentId);
+  }
+
+  // Returns true (and mutates the target's already-emitted AstNode) when `node`
+  // is `export default <Identifier>` re-exporting a LOCAL declaration — the
+  // caller then skips emitting this export node entirely. The local decl was
+  // emitted earlier (source order), so it's already in idByNode/astById.
+  function tryMergeDefaultExport(node: Node): boolean {
+    if (node.getKind() !== ts.SyntaxKind.ExportAssignment) return false;
+    const ea = node.asKindOrThrow(ts.SyntaxKind.ExportAssignment);
+    if (ea.isExportEquals()) return false; // TS `export = x`, not `export default`
+    let expr: Node;
+    try {
+      expr = ea.getExpression();
+    } catch {
+      return false;
+    }
+    if (expr.getKind() !== ts.SyntaxKind.Identifier) return false; // inline value, not a name ref
+    let symbol: ReturnType<Node['getSymbol']>;
+    try {
+      symbol = expr.getSymbol();
+    } catch {
+      return false;
+    }
+    if (!symbol) return false;
+    // Local same-file decl only — do NOT follow getAliasedSymbol (that would jump
+    // to an imported decl in another file). Map each declaration to its DISPLAYED
+    // node (a VariableDeclaration shows as its VariableStatement; a fn/class shows
+    // directly), then to the already-emitted AstNode.
+    for (const decl of symbol.getDeclarations()) {
+      const displayed =
+        decl.getKind() === ts.SyntaxKind.VariableDeclaration
+          ? decl.getFirstAncestorByKind(ts.SyntaxKind.VariableStatement)
+          : decl.getKind() === ts.SyntaxKind.FunctionDeclaration ||
+              decl.getKind() === ts.SyntaxKind.ClassDeclaration
+            ? decl
+            : undefined;
+      if (!displayed) continue;
+      const id = idByNode.get(displayed);
+      if (!id) continue;
+      const targetAst = astById.get(id);
+      if (!targetAst) continue;
+      targetAst.defaultExport = true;
+      // The const/fn/class itself wasn't `isExported()` (only the ExportAssignment
+      // was), so mark it exported now: amber fill + zoom-out landmark via the
+      // existing `exported`/isHighLevel machinery.
+      targetAst.exported = true;
+      return true;
+    }
+    return false;
   }
 
   function nextId(): string {
@@ -506,7 +577,31 @@ function synthesizeFlatTypeLabel(node: Node, inlined: Set<Node>): string | null 
   // type of an ArrayType, every union member — is unambiguously included
   // before visit() reaches them via forEachChild.
   for (const d of node.getDescendants()) inlined.add(d);
-  return node.getText();
+  return oneLineType(node);
+}
+
+// Collapse all whitespace (including newlines) in a type's source text to
+// single spaces, so a multi-line type baked into a label stays ONE line — a
+// multi-line label is MEASURED as a single wide line but RENDERS as several,
+// overflowing its box.
+function oneLineType(typeNode: Node): string {
+  return typeNode.getText().replace(/\s+/g, ' ').trim();
+}
+
+// Build a `name: Type` chip label, baking the type into the name and inlining
+// the type node — EXCEPT when the type is an inline object `{ … }`
+// (`TypeLiteral`): then leave it as a drillable `{}` child (return just
+// `name:`), so a big object type doesn't overflow the chip as flat,
+// un-highlightable, multi-line text. Used for both Parameters and interface /
+// type-literal members.
+function bakeNamedType(base: string, typeNode: Node | undefined, inlined: Set<Node>): string | null {
+  if (!typeNode) return base || null;
+  if (typeNode.getKind() === ts.SyntaxKind.TypeLiteral) {
+    return `${base}:`; // drillable `{}` child emits below the `name:` chip
+  }
+  inlined.add(typeNode);
+  for (const d of typeNode.getDescendants()) inlined.add(d);
+  return `${base}: ${oneLineType(typeNode)}`;
 }
 
 // Synthesised label for prefix / postfix unary expressions: `!id`,
@@ -971,14 +1066,11 @@ function signatureOf(node: Node): string | undefined {
       ? `(${params.join(', ')}): ${rt}`
       : `(${params.join(', ')})`;
   }
-  // Typed declarations: just the `: T` slot. Parameters are EXCLUDED — their
-  // type is already baked into the name (`hull: ShipHull`, see friendlyName),
-  // so adding a `: T` signature would duplicate it in the hover tooltip.
-  if (
-    Node.isPropertyDeclaration(node) ||
-    Node.isPropertySignature(node) ||
-    Node.isVariableDeclaration(node)
-  ) {
+  // Typed declarations: just the `: T` slot. Parameters AND PropertySignatures
+  // are EXCLUDED — their type is already baked into the name (`hull: ShipHull`,
+  // `disabled?: boolean`, see friendlyName/bakeNamedType), so a `: T` signature
+  // would duplicate it in the hover tooltip.
+  if (Node.isPropertyDeclaration(node) || Node.isVariableDeclaration(node)) {
     const tn = node.getTypeNode();
     return tn ? `: ${tn.getText()}` : undefined;
   }
@@ -1337,15 +1429,16 @@ function rawFriendlyName(
       nk !== ts.SyntaxKind.ObjectBindingPattern &&
       nk !== ts.SyntaxKind.ArrayBindingPattern
     ) {
-      const typeNode = node.getTypeNode();
-      const base = nameNode.getText();
-      if (typeNode) {
-        inlined.add(typeNode);
-        for (const d of typeNode.getDescendants()) inlined.add(d);
-        return `${base}: ${typeNode.getText()}`;
-      }
-      return base || null;
+      return bakeNamedType(nameNode.getText(), node.getTypeNode(), inlined);
     }
+  }
+
+  // Interface / type-literal members read as `name?: Type` chips, same as
+  // parameters — so the type is visible AND two-tone-highlightable, and an
+  // inline object member becomes a drillable `{}` instead of flat text.
+  if (Node.isPropertySignature(node)) {
+    const q = node.hasQuestionToken() ? '?' : '';
+    return bakeNamedType(node.getNameNode().getText() + q, node.getTypeNode(), inlined);
   }
 
   // ts-morph uses structural typing for "named" nodes — many declarations

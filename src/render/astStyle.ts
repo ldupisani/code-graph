@@ -34,17 +34,18 @@ export const SYNTAX_KIND_LABELS: Record<string, string> = {
     FunctionExpression: "fn",
     // AwaitExpression / YieldExpression / SpreadElement / AsExpression now
     // render via SYNTAX_TEMPLATES (`await [expr]`, `...[arr]`, `[x] as [T]`).
-    TemplateExpression: "`...`",
-    // The braces stand in for the object literal itself; non-empty
-    // objects show their members as kids INSIDE the rect, reading as
-    // `{ a: 1, b: 2 }` with the braces at top-left.
-    ObjectLiteralExpression: "{}",
-    // Code blocks read with the same `{}` braces as an object literal — a
-    // collapsed Block now shows `{}` centered instead of a bare square, so it's
-    // identifiable as a brace-delimited scope at a glance. The PINK kind
-    // outline (KIND_OUTLINE.Block) is what still distinguishes a code block
-    // from a yellow-outlined object/type literal.
-    Block: "{}",
+    TemplateExpression: "`${}`",
+    // The braces stand in for the object literal itself. These container kinds
+    // are EXPANDABLE (drill into an overlay), and they only ever draw this label
+    // when COLLAPSED — so the `…` reads as "there's content inside, click to
+    // expand" (the familiar collapsed-object affordance) rather than an empty
+    // `{}`. Expanded inline, the band is dropped (the outline conveys the braces).
+    ObjectLiteralExpression: "{…}",
+    // Code blocks read with the same braces as an object literal — a collapsed
+    // Block shows `{…}` so it's identifiable as an expandable brace-delimited
+    // scope. The PINK kind outline (KIND_OUTLINE.Block) is what still
+    // distinguishes a code block from a yellow-outlined object/type literal.
+    Block: "{…}",
     // `[]` reads as the array literal itself in both empty and
     // non-empty cases: an empty rect shows '[]', a non-empty rect
     // shows '[]' at top-left with the elements as kids inside it,
@@ -54,19 +55,18 @@ export const SYNTAX_KIND_LABELS: Record<string, string> = {
     // Other
     HeritageClause: "extends",
     TypeReference: "type",
-    // Type literal — the inline `{ a: string; b: number }` that
-    // appears as a property's type. Rendered as `{}` and treated as
-    // expandable, mirroring ObjectLiteralExpression so the user can
-    // drill into its member signatures.
-    TypeLiteral: "{}",
+    // Type literal — the inline `{ a: string; b: number }` that appears as a
+    // property's / parameter's type. Expandable; collapsed it shows `{…}` (drill
+    // to see its member signatures), mirroring ObjectLiteralExpression.
+    TypeLiteral: "{…}",
     // Array type — only labelled when synthesizeFlatTypeLabel bailed
     // out (because it contains an inline TypeLiteral). Plain
     // `Pulse[]` keeps its flattened text label.
     ArrayType: "[]",
     // Destructured object pattern — `({ a, b }: T)`, the typical React props
-    // shape. Renders as a brace cell that drills into its bindings the same
-    // way ObjectLiteralExpression / TypeLiteral do (expandable).
-    ObjectBindingPattern: "{}",
+    // shape. Expandable; collapsed it shows `{…}` and drills into its bindings
+    // the same way ObjectLiteralExpression / TypeLiteral do.
+    ObjectBindingPattern: "{…}",
     // ArrayBindingPattern (`const [x, y] = …`) intentionally has NO text label
     // — it renders as a literal square-bracket OUTLINE around its bindings (see
     // BRACKET_KINDS / KIND_OUTLINE), so the box itself reads as `[ x  y ]`
@@ -87,15 +87,17 @@ export const SYNTAX_KIND_LABELS: Record<string, string> = {
 // anything not curated) returns null, so it neither competes with a real
 // name nor reserves a label band. Such single-child wrappers are then
 // flattened away entirely by the layout (see layoutAst).
-export function labelFor(node: {name: string | null; syntaxKind: string; extendsName?: string; static?: boolean; readonly?: boolean; accessibility?: "private" | "protected"}): string | null {
+export function labelFor(node: {name: string | null; syntaxKind: string; extendsName?: string; static?: boolean; readonly?: boolean; accessibility?: "private" | "protected"; defaultExport?: boolean}): string | null {
     if (node.name) {
-        // Compose the full header text: "[private] [static] [readonly] name [extends Base]".
+        // Compose the full header text: "[export default] [private] [static] [readonly] name [extends Base]".
         // labelScreenBox measures THIS composite (single source of truth);
         // drawHeaderSegments below colours each part. Modifiers are tokens
         // separated by single spaces, source order matching how you'd write
-        // them in TypeScript.
+        // them in TypeScript. The `export default` prefix marks a default export
+        // that was merged onto its local implementation (see AstNode.defaultExport).
         const modifiers = composeModifierPrefix(node);
-        const head = modifiers ? `${modifiers} ${node.name}` : node.name;
+        const withMods = modifiers ? `${modifiers} ${node.name}` : node.name;
+        const head = node.defaultExport ? `export default ${withMods}` : withMods;
         if (node.extendsName) return `${head} extends ${node.extendsName}`;
         // An object-literal property key carries its `:` so it reads like the
         // source (`velocity:` not `velocity`). The colon is part of the label
@@ -117,6 +119,16 @@ const DECLARATION_KEYWORD = /^(const|let|var) (.+)$/;
 export function splitDeclarationKeyword(label: string): {keyword: string; rest: string} | null {
     const m = DECLARATION_KEYWORD.exec(label);
     return m ? {keyword: m[1], rest: m[2]} : null;
+}
+
+// Split the leading `export default ` off a label (see labelFor / AstNode.
+// defaultExport) so the renderer can colour it keyword-blue, then two-tone the
+// remainder (e.g. the `const X` keyword split) independently. Returns null when
+// there's no such prefix.
+const DEFAULT_EXPORT_PREFIX = /^(export default) (.+)$/;
+export function splitDefaultExportPrefix(label: string): {prefix: string; rest: string} | null {
+    const m = DEFAULT_EXPORT_PREFIX.exec(label);
+    return m ? {prefix: m[1], rest: m[2]} : null;
 }
 
 // Join the modifier keywords in TypeScript source order. Returns an
@@ -479,6 +491,12 @@ export const SYNTAX_TEMPLATES: Record<string, SyntaxTemplate> = {
     SpreadElement: () => [{kw: "...", color: P}],
     SpreadAssignment: () => [{kw: "...", color: P}],
     JsxSpreadAttribute: () => [{kw: "...", color: P}],
+    // A template-literal interpolation `${expr}`: render a `$` prefix glyph in
+    // front of the expression (child 0), so `` `button-${variant}` `` reads as
+    // `` `button-` `` then `$ [variant]`. The trailing literal chunk (child 1, a
+    // TemplateMiddle/Tail) auto-appends after when non-empty; empty chunks are
+    // dropped server-side so there's no stray empty box.
+    TemplateSpan: () => [{kw: "$", color: P}, {child: 0}],
     // `[expr] as [Type]` — both operands present (expression 0, type 1).
     AsExpression: () => [{child: 0}, {kw: "as", color: K}, {child: 1}],
     // NOTE: function definitions are NOT templated here — they use the

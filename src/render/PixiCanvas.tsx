@@ -303,18 +303,19 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             const semanticEdgeGfx = new Graphics();
             world.addChild(semanticEdgeGfx);
 
-            // Bounded — same cap as the multi-pass loop's `safety` counter
-            // below, so the pool can serve every overlay the loop is willing
-            // to draw. Each pane is created up-front and toggled via
-            // .visible per frame.
-            const MAX_OVERLAY_PANES = 8;
+            // Overlay panes are allocated LAZILY and GROW on demand: deep AST
+            // exploration can open many nested overlays at once (a block → a
+            // call's object arg → …), and a fixed cap meant the newest overlay
+            // (the one the user JUST clicked) silently got no pane and didn't
+            // render — reading as "I can't expand that block". A small pool is
+            // pre-created for the common case; the multi-pass loop adds more up
+            // to a hard runaway cap.
             interface OverlayPane {
                 container: Container;
                 gfx: Graphics;
                 labels: LabelPool;
             }
-            const overlayPanes: OverlayPane[] = [];
-            for (let i = 0; i < MAX_OVERLAY_PANES; i++) {
+            const createOverlayPane = (): OverlayPane => {
                 const container = new Container();
                 const gfx = new Graphics();
                 const labelsContainer = new Container();
@@ -322,12 +323,12 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 container.addChild(labelsContainer);
                 container.visible = false;
                 world.addChild(container);
-                overlayPanes.push({
-                    container,
-                    gfx,
-                    labels: new LabelPool(labelsContainer),
-                });
-            }
+                return {container, gfx, labels: new LabelPool(labelsContainer)};
+            };
+            const INITIAL_OVERLAY_PANES = 8;
+            const MAX_OVERLAY_PANES = 64; // hard guard against runaway pane growth
+            const overlayPanes: OverlayPane[] = [];
+            for (let i = 0; i < INITIAL_OVERLAY_PANES; i++) overlayPanes.push(createOverlayPane());
 
             // Top-layer semantic edges, above ALL overlay panes. Used only
             // for connectors that touch an overlay (either endpoint resolves
@@ -1447,14 +1448,22 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 for (const id of blockAnims.keys()) overlaysToDraw.add(id);
                 let paneCursor = 0;
                 let progress = true;
-                let safety = MAX_OVERLAY_PANES;
+                // One iteration per nesting level in the worst case; bounded by
+                // the number of overlays (a child can't render before its parent
+                // records its anchor cell, so deeply-nested chains need a retry).
+                let safety = overlaysToDraw.size + 2;
                 while (progress && safety-- > 0) {
                     progress = false;
                     for (const blockId of overlaysToDraw) {
                         if (renderedOverlays.has(blockId)) continue;
                         const cell = blockCellsThisFrame.get(blockId);
                         if (!cell) continue; // anchor not on this frame yet — wait
-                        if (paneCursor >= overlayPanes.length) break; // out of panes
+                        if (paneCursor >= overlayPanes.length) {
+                            // Grow the pool so the newest overlay still renders;
+                            // stop only at the runaway guard.
+                            if (overlayPanes.length >= MAX_OVERLAY_PANES) break;
+                            overlayPanes.push(createOverlayPane());
+                        }
                         const pane = overlayPanes[paneCursor];
                         pane.container.visible = true;
                         pane.gfx.clear();

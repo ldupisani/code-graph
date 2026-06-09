@@ -117,6 +117,7 @@ export function extractAst(
       extendsName: extendsNameOf(node),
       isType: typeFlag,
       signature: signatureOf(node) ?? callSignatureOf(node) ?? propertyTypeOf(node),
+      preview: previewOf(node),
       returnType: returnTypeOf(node),
       // friendlyName (above) ran synthesizeCallLabel, which populates chainData
       // for a method-chain root — read it back here. Object props evaluate
@@ -1048,6 +1049,51 @@ function returnTypeOf(node: Node): string | undefined {
   return undefined;
 }
 
+// SyntaxKind names the renderer collapses into a click-to-expand cell.
+// MUST mirror EXPANDABLE_KINDS in src/render/astStyle.ts — only these
+// kinds get a `preview`, since the tooltip's "peek at the collapsed
+// content" affordance is meaningless for nodes that already render in
+// full. Kept as a name set (not ts.SyntaxKind) so it reads identically
+// to the client list it shadows.
+const PREVIEW_KINDS = new Set<string>([
+  'Block',
+  'ObjectLiteralExpression',
+  'TypeLiteral',
+  'ObjectBindingPattern',
+  'InterfaceDeclaration',
+  'TypeAliasDeclaration',
+  'ClassDeclaration',
+  'VariableStatement',
+  'JsxElement',
+  'JsxFragment',
+]);
+
+// First source line of an expandable block's CONTENT, for the hover tooltip.
+// The structural wrapping braces are stripped — a leading `{` (a block/object
+// open) and any trailing `{`/`}` (a body opener like `class Foo {`, or a lone
+// closing brace) — so the peek reads as code, not delimiters: `const y = 2; …`
+// not `{ const y = 2; …`, `class Foo extends Bar` not `class Foo extends Bar {`.
+// We scan to the first line with content after stripping, since a block opens
+// on a bare `{` line. A trailing "…" signals more content lines follow.
+function previewOf(node: Node): string | undefined {
+  if (!PREVIEW_KINDS.has(syntaxKindName(node.getKind()))) return undefined;
+  const lines = node
+    .getSourceFile()
+    .getFullText()
+    .slice(node.getStart(), node.getEnd())
+    .split('\n');
+  const clean = (l: string) => l.replace(/^\s*\{\s*/, '').replace(/[\s{}]+$/, '').trim();
+  let idx = 0;
+  let firstLine = '';
+  for (; idx < lines.length; idx++) {
+    firstLine = clean(lines[idx]);
+    if (firstLine) break;
+  }
+  if (!firstLine) return undefined;
+  const more = lines.slice(idx + 1).some((l) => clean(l) !== '');
+  return more ? `${firstLine} …` : firstLine;
+}
+
 function signatureOf(node: Node): string | undefined {
   // Function-likes: parenthesised parameter list + optional return.
   if (
@@ -1546,6 +1592,16 @@ function rawFriendlyName(
     kind === ts.SyntaxKind.FalseKeyword
   ) {
     return node.getText();
+  }
+
+  // JSX text content (`<title>A right pointing chevron</title>`). Without this
+  // the text child gets no label and renders as an empty box inside the
+  // element. Collapse internal whitespace/newlines so multi-line JSX text reads
+  // as one line. (Whitespace-only JsxText is already filtered out in visit().)
+  if (kind === ts.SyntaxKind.JsxText) {
+    const text = node.getText().trim().replace(/\s+/g, ' ');
+    if (!text) return null;
+    return text.length > 60 ? text.slice(0, 57) + '…' : text;
   }
 
   // Literals carry useful content not visible from edges, so we still label

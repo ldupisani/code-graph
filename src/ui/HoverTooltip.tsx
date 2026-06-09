@@ -1,10 +1,13 @@
 import { useGraphStore } from '../graph/store';
 
 // Subscribes to the store's hoveredId + hoveredScreenRect (set by
-// PixiCanvas's onHover callback). When a hovered AST node carries a
-// signature (set by the server's signatureOf — function-likes get
-// `(p: T): R`, typed declarations get `: T`), shows it as a tooltip
-// anchored just below the rect.
+// PixiCanvas's onHover callback). Shows a tooltip anchored just below
+// the rect when the hovered AST node carries either:
+//   * a `preview` — the first source line of an expandable block (set
+//     by the server's previewOf), letting the user peek inside a
+//     collapsed `{…}` cell. Takes priority when present.
+//   * a `signature` (set by signatureOf — function-likes get
+//     `(p: T): R`, typed declarations get `: T`).
 //
 // The screen rect is captured once at hover-start; the tooltip
 // doesn't track per-frame canvas motion. That's intentional — a
@@ -30,7 +33,7 @@ export function HoverTooltip() {
   const ast = asts.get(fileId);
   if (!ast) return null;
   const node = ast.nodes.find((n) => n.id === hoveredId);
-  if (!node?.signature) return null;
+  if (!node || (!node.signature && !node.preview)) return null;
 
   // Anchor: just below the rect, left edge aligned. Capped to the
   // viewport so the tooltip doesn't fall off the right edge of the
@@ -77,8 +80,17 @@ export function HoverTooltip() {
         userSelect: 'none',
       }}
     >
-      <span style={{ color: '#9cdcfe' }}>{node.name ?? node.syntaxKind}</span>
-      <span style={{ color: '#888892' }}>{node.signature}</span>
+      {node.preview ? (
+        // Expandable block: show its first source line verbatim (server's
+        // previewOf already appended "…" when the block spans more lines)
+        // so the user can peek inside a collapsed `{…}` cell without drilling.
+        <span style={{ color: '#d4d4d4' }}>{node.preview}</span>
+      ) : (
+        <>
+          <span style={{ color: '#9cdcfe' }}>{node.name ?? node.syntaxKind}</span>
+          <span style={{ color: '#888892' }}>{node.signature}</span>
+        </>
+      )}
     </div>
   );
 }

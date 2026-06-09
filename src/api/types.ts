@@ -141,6 +141,14 @@ export interface AstNode {
   // class's API by mousing across its members without expanding
   // each one.
   signature?: string;
+  // First source line of an EXPANDABLE block (a Block, object/type
+  // literal, class/interface, JSX element, …) — a "peek" the hover
+  // tooltip shows so the user can read what a collapsed `{…}` cell
+  // contains without drilling into it. A trailing "…" marks that the
+  // block spans more than this one line. Only set for the kinds the
+  // renderer collapses (see EXPANDABLE_KINDS / previewOf). Unset for
+  // everything else, so the tooltip falls back to name + signature.
+  preview?: string;
   // Return-type text of a function-like (`VisibleEntityState[]`, `boolean`, …).
   // Set independently of whether the return type is emitted as a child node
   // (primitive returns emit none), so the client can render it inline after the

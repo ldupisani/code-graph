@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import { Group, Panel, Separator } from 'react-resizable-panels';
+import { Group, Panel, Separator, usePanelRef } from 'react-resizable-panels';
 import { openProject, subscribeToWatch, type WatchEvent } from './api/client';
 import { useGraphStore } from './graph/store';
 import { PixiCanvas, type CameraApi } from './render/PixiCanvas';
 import { ZoomControls } from './ui/ZoomControls';
 import { PinControls } from './ui/PinControls';
+import { SnapshotBar } from './ui/SnapshotBar';
+import { applySnapshot, captureSnapshot, overwriteSnapshot } from './graph/snapshots/capture';
+import { useSnapshotStore } from './graph/snapshots/store';
 import { EdgeFilterPills } from './ui/EdgeFilterPills';
 import { HoverTooltip } from './ui/HoverTooltip';
 import { SearchPalette } from './ui/SearchPalette';
@@ -23,6 +26,19 @@ export function App() {
   const [refreshing, setRefreshing] = useState(false);
   // Imperative camera handle the PixiCanvas fills in; drives the zoom buttons.
   const cameraApiRef = useRef<CameraApi | null>(null);
+
+  // Imperative handle for the right-hand editor Panel so a header button can
+  // collapse / expand it. `editorCollapsed` mirrors its state to flip the
+  // button label; kept in sync via the Panel's onResize. The PixiCanvas
+  // observes its own container, so collapsing/expanding auto-resizes the canvas.
+  const editorPanelRef = usePanelRef();
+  const [editorCollapsed, setEditorCollapsed] = useState(false);
+  function toggleEditor() {
+    const p = editorPanelRef.current;
+    if (!p) return;
+    if (p.isCollapsed()) p.expand();
+    else p.collapse();
+  }
 
   // Last-opened path is restored from localStorage so a dev-server reload
   // (triggered by editing force-graph tunables — see the HMR hook in
@@ -89,6 +105,34 @@ export function App() {
       }
       if (isTypingTarget(e.target)) return;
       const st = useGraphStore.getState();
+      // View snapshots — only meaningful with a project open. Read project
+      // from the store (not a stale closure) so this []-deps effect needn't
+      // re-register. Modifier combos are left alone (Cmd-S = browser save).
+      if (st.project && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (e.key === 's' || e.key === 'S') {
+          e.preventDefault();
+          if (e.shiftKey) {
+            // ⇧S overwrites the active view with the current one; if nothing's
+            // active yet, fall back to saving a new view.
+            const active = useSnapshotStore.getState().activeByProject[st.project.rootPath];
+            if (active) overwriteSnapshot(active, cameraApiRef.current);
+            else captureSnapshot(cameraApiRef.current);
+          } else {
+            captureSnapshot(cameraApiRef.current);
+          }
+          return;
+        }
+        if (e.key >= '1' && e.key <= '9') {
+          const snap = (useSnapshotStore.getState().byProject[st.project.rootPath] ?? [])[
+            e.key.charCodeAt(0) - 49 // '1' -> 0
+          ];
+          if (snap) {
+            e.preventDefault();
+            applySnapshot(snap, cameraApiRef.current);
+          }
+          return;
+        }
+      }
       if (e.key === 'Escape') {
         st.setSelection(null);
         st.setFocus(null);
@@ -170,6 +214,27 @@ export function App() {
           initialPath={initialPath}
         />
         {project ? <ProjectStats project={project} refreshing={refreshing} /> : null}
+        {project ? (
+          <button
+            type="button"
+            onClick={toggleEditor}
+            title={editorCollapsed ? 'Show code editor' : 'Hide code editor'}
+            style={{
+              marginLeft: 'auto',
+              appearance: 'none',
+              border: '1px solid #3a3a40',
+              borderRadius: 6,
+              background: '#26262b',
+              color: '#cfcfd6',
+              fontFamily: 'ui-monospace, monospace',
+              fontSize: '0.75rem',
+              padding: '0.25rem 0.6rem',
+              cursor: 'pointer',
+            }}
+          >
+            {editorCollapsed ? '‹ editor' : 'editor ›'}
+          </button>
+        ) : null}
       </header>
 
       <main style={{ position: 'relative', flex: 1, minHeight: 0 }}>
@@ -182,7 +247,9 @@ export function App() {
                 <EdgeFilterPills />
                 <SettingsPanel />
                 <ZoomControls api={cameraApiRef} />
-                <PinControls api={cameraApiRef} />
+                <PinControls api={cameraApiRef}>
+                  <SnapshotBar api={cameraApiRef} rootPath={project.rootPath} />
+                </PinControls>
                 <HoverTooltip />
                 <SearchPalette
                   open={searchOpen}
@@ -198,7 +265,14 @@ export function App() {
                 cursor: 'col-resize',
               }}
             />
-            <Panel defaultSize="38%" minSize="20%">
+            <Panel
+              defaultSize="38%"
+              minSize="20%"
+              collapsible
+              collapsedSize={0}
+              panelRef={editorPanelRef}
+              onResize={(size) => setEditorCollapsed(size.asPercentage === 0)}
+            >
               <EditorPane project={project} />
             </Panel>
           </Group>
@@ -264,6 +338,9 @@ function Hints() {
       </div>
       <div style={{ opacity: 0.7 }}>
         U = unpin hovered · R = reset all pins · P = pin visible · ⇧P = pin all
+      </div>
+      <div style={{ opacity: 0.7 }}>
+        S = save view · ⇧S = overwrite active view · 1–9 = jump to view
       </div>
     </div>
   );

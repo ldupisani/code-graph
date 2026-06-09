@@ -4,7 +4,7 @@ import type {CameraApi} from "../render/PixiCanvas";
 // Bulk pin actions (mirrors the P / ⇧P / R keyboard shortcuts): pin the files
 // currently on screen, pin every file, or release all pins. A pinned file is
 // held in place against the force layout.
-export function PinControls({api}: {api: {current: CameraApi | null}}) {
+export function PinControls({api, children}: {api: {current: CameraApi | null}; children?: React.ReactNode}) {
     return (
         <div style={wrapStyle}>
             <span style={{opacity: 0.6, marginRight: "0.1rem"}}>pin:</span>
@@ -17,13 +17,17 @@ export function PinControls({api}: {api: {current: CameraApi | null}}) {
             <button type="button" style={btnStyle} title="Release all pins (R)" onClick={() => api.current?.unpinAll()}>
                 unpin
             </button>
+            {/* Saved-view chips (SnapshotBar) share this pill row, flowing after unpin. */}
+            {children}
         </div>
     );
 }
 
 const wrapStyle: React.CSSProperties = {
     position: "absolute",
-    bottom: "3rem",
+    // Sits above the bottom-left hints footer (now 3 lines tall) so the two
+    // don't overlap.
+    bottom: "4.6rem",
     left: "0.8rem",
     display: "flex",
     alignItems: "center",

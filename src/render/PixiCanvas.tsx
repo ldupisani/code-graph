@@ -26,12 +26,43 @@ let savedCamera: {rootPath: string; x: number; y: number; scale: number} | null 
 
 // Imperative canvas controls exposed to the React HUD (zoom + pin buttons), so
 // device-independent actions exist alongside the wheel / keyboard.
+// A camera transform plus an optional content anchor. The force layout settles
+// to DIFFERENT absolute world coords on every load (its sim isn't seeded), so a
+// snapshot that stored only raw x/y would frame empty space after a reload. The
+// anchor — the file nearest the viewport centre at capture and the screen
+// position it occupied — lets restore re-frame relative to that file's LIVE
+// position, reproducing the view regardless of where the layout landed. Absent
+// (older snapshots / empty project) → fall back to the absolute x/y.
+export interface CameraState {
+    x: number;
+    y: number;
+    scale: number;
+    anchorId?: string | null;
+    anchorScreenX?: number;
+    anchorScreenY?: number;
+}
+
 export interface CameraApi {
     zoomBy: (factor: number) => void; // factor < 1 zooms out, > 1 zooms in
     fitView: () => void; // re-frame the overview layout
     pinAll: () => void; // pin every file box at its current position
     pinVisible: () => void; // pin only the files currently on screen
     unpinAll: () => void; // release every user pin
+    // Read the live camera transform (world-space pan + uniform zoom) plus a
+    // content anchor (see CameraState). Used by the snapshot feature to remember
+    // "where you were looking."
+    getCamera: () => CameraState;
+    // Move the camera to a saved transform. `animate` eases over ~320ms
+    // (deliberate "jump to a saved view"); omit it for an instant set. When the
+    // saved state carries an anchor that still exists, the camera re-frames
+    // relative to that file rather than using raw world coords.
+    setCamera: (cam: CameraState, opts?: {animate?: boolean}) => void;
+    // Read every user-pinned file as {id, world x, y}. Snapshots store these so a
+    // saved view restores which files were held in place and where.
+    getPins: () => {id: string; x: number; y: number}[];
+    // Replace the current pins with the given set: unpin everything, then pin
+    // each listed file (that still exists) at its saved world position.
+    setPins: (pins: {id: string; x: number; y: number}[]) => void;
 }
 
 interface CanvasProps {
@@ -88,6 +119,15 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             container.appendChild(app.canvas);
             app.canvas.style.display = "block";
             app.canvas.style.touchAction = "none";
+
+            // Pixi's `resizeTo` only re-resizes on WINDOW resize, so resizing or
+            // collapsing the adjacent editor pane (which changes this container's
+            // size without a window event) would leave the renderer the wrong
+            // size. A ResizeObserver re-syncs the renderer to the container on any
+            // size change. The camera transform is untouched, so content stays put
+            // — the viewport just grows/shrinks. Disconnected in cleanup.
+            const resizeObserver = new ResizeObserver(() => app.resize());
+            resizeObserver.observe(container);
 
             // cameraScale mirrors world.scale.x; stepLayout reads it each
             // frame to decide the rigid-layout blend (see rigidness()).
@@ -436,6 +476,36 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 targetScale: number;
                 pivot: {x: number; y: number};
             } | null = null;
+
+            // Active "jump to a saved view" animation (snapshot restore). Unlike
+            // followAt (targets screen-centre) and zoomFit (pivots around a fixed
+            // world point), this eases world.x/y AND world.scale toward an
+            // ABSOLUTE target transform together — the only thing that can
+            // reproduce an arbitrary saved pan+zoom. Null when idle. Cleared the
+            // instant the user pans/zooms themselves (onUserCameraMove) so their
+            // input always wins.
+            let cameraTween: {
+                fromX: number;
+                fromY: number;
+                fromScale: number;
+                toX: number;
+                toY: number;
+                toScale: number;
+                start: number;
+                durMs: number;
+                // When set, re-target toX/toY each frame from this file's live
+                // position so the camera tracks the anchor as the sim settles.
+                anchorId?: string | null;
+                anchorScreenX?: number;
+                anchorScreenY?: number;
+            } | null = null;
+
+            // After an anchored jump lands, hold the anchor file at its target
+            // screen position while the force sim keeps settling — neighbours
+            // rearrange but the thing you jumped to stays put, instead of
+            // drifting out from under the camera. Released when the sim settles,
+            // a safety deadline passes, or the user moves the camera.
+            let cameraAnchorHold: {id: string; screenX: number; screenY: number; scale: number; until: number} | null = null;
 
             // Directional `${fromFileId} ${toFileId}` keys for semantic edges
             // (calls/extends/implements) actually drawn this frame. drawSemanticEdges
@@ -3066,6 +3136,67 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 world.y = pivotScreenY - zoomFit.pivot.y * next;
             }
 
+            // Eases the camera toward a saved transform (snapshot restore). Lerps
+            // pan and scale together on a single easeOutCubic clock so the motion
+            // arrives gently. Snaps to the exact target on the final frame and
+            // releases. Time-based (not the 0.12 per-frame lerp the others use)
+            // so the duration is frame-rate independent.
+            function updateCameraTween(): void {
+                if (cameraTween === null) return;
+                // Re-target from the anchor's LIVE position each frame: the sim
+                // may still be settling (and re-arranges across reloads), so we
+                // chase wherever the anchor file is now rather than a stale world
+                // coord computed at jump-start.
+                if (cameraTween.anchorId) {
+                    const n = layout.byId.get(cameraTween.anchorId);
+                    if (n) {
+                        cameraTween.toX = (cameraTween.anchorScreenX ?? 0) - n.x * cameraTween.toScale;
+                        cameraTween.toY = (cameraTween.anchorScreenY ?? 0) - n.y * cameraTween.toScale;
+                    }
+                }
+                const t = Math.min(1, (performance.now() - cameraTween.start) / cameraTween.durMs);
+                const e = 1 - (1 - t) ** 3; // easeOutCubic
+                const s = cameraTween.fromScale + (cameraTween.toScale - cameraTween.fromScale) * e;
+                world.scale.set(s);
+                cameraScale = s;
+                world.x = cameraTween.fromX + (cameraTween.toX - cameraTween.fromX) * e;
+                world.y = cameraTween.fromY + (cameraTween.toY - cameraTween.fromY) * e;
+                if (t >= 1) {
+                    // Land on the exact target so repeated jumps are pixel-stable.
+                    world.scale.set(cameraTween.toScale);
+                    cameraScale = cameraTween.toScale;
+                    world.x = cameraTween.toX;
+                    world.y = cameraTween.toY;
+                    // Hand off to a hold so the anchor stays framed while the sim
+                    // finishes settling (the jump's selection/expansion reheated it).
+                    if (cameraTween.anchorId) {
+                        cameraAnchorHold = {
+                            id: cameraTween.anchorId,
+                            screenX: cameraTween.anchorScreenX ?? 0,
+                            screenY: cameraTween.anchorScreenY ?? 0,
+                            scale: cameraTween.toScale,
+                            until: performance.now() + 5000, // safety cap if the sim never fully settles
+                        };
+                    }
+                    cameraTween = null;
+                }
+            }
+
+            // Keep the anchor file pinned under its target pixel while the sim
+            // settles after an anchored jump. Runs AFTER stepLayout so it reads
+            // this frame's final node position (no 1-frame lag). Releases once
+            // the sim is quiet or the deadline passes.
+            function updateCameraHold(): void {
+                if (cameraAnchorHold === null) return;
+                const n = layout.byId.get(cameraAnchorHold.id);
+                if (!n || layout.simulation.alpha() <= layout.simulation.alphaMin() || performance.now() > cameraAnchorHold.until) {
+                    cameraAnchorHold = null;
+                    return;
+                }
+                world.x = cameraAnchorHold.screenX - n.x * cameraAnchorHold.scale;
+                world.y = cameraAnchorHold.screenY - n.y * cameraAnchorHold.scale;
+            }
+
             // --- Layout: connectivity sim ↔ rigid folder outline --------------
             //
             // Two layouts coexist. The d3-force sim produces the
@@ -3760,9 +3891,11 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // alpha takes effect this frame. stepLayout BEFORE draw so
                 // draw sees the interpolated positions. updateFollow AFTER
                 // draw so it can read visibleById.
+                updateCameraTween();
                 updateZoomFit();
                 syncExpansion();
                 stepLayout();
+                updateCameraHold(); // after positions update → anchor held without 1-frame lag
                 draw();
                 updateFollow();
             };
@@ -3877,6 +4010,8 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 cameraScale = clamped;
                 followId = null;
                 zoomFit = null;
+                cameraTween = null;
+                cameraAnchorHold = null;
             }
             if (cameraApiRef) {
                 cameraApiRef.current = {
@@ -3884,12 +4019,100 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     fitView: () => {
                         followId = null;
                         zoomFit = null;
+                        cameraTween = null;
+                        cameraAnchorHold = null;
                         fitProjectToViewport();
                         cameraScale = world.scale.x;
                     },
                     pinAll: pinAllFiles,
                     pinVisible: pinVisibleFiles,
                     unpinAll: unpinAllFiles,
+                    getPins: () =>
+                        layout.nodes
+                            .filter((n) => n.userPinned)
+                            .map((n) => ({id: n.id, x: n.connX, y: n.connY})),
+                    setPins: (pins) => {
+                        unpinAllFiles(); // clear current pins so the saved set fully replaces them
+                        let any = false;
+                        for (const p of pins) {
+                            const n = layout.byId.get(p.id); // skip ids for files that no longer exist
+                            if (!n) continue;
+                            n.connX = p.x;
+                            n.connY = p.y;
+                            n.fx = p.x;
+                            n.fy = p.y;
+                            n.offX = 0;
+                            n.offY = 0;
+                            n.userPinned = true;
+                            any = true;
+                        }
+                        if (any) layout.simulation.alpha(0.6);
+                    },
+                    getCamera: () => {
+                        const scale = world.scale.x;
+                        // Anchor = the file whose centre is nearest the viewport
+                        // centre right now. Stored with its screen position so a
+                        // later restore can put it back under the same pixel.
+                        const cx = app.screen.width / 2;
+                        const cy = app.screen.height / 2;
+                        let best: SimFileNode | null = null;
+                        let bestD = Infinity;
+                        for (const n of layout.nodes) {
+                            const d = (world.x + n.x * scale - cx) ** 2 + (world.y + n.y * scale - cy) ** 2;
+                            if (d < bestD) {
+                                bestD = d;
+                                best = n;
+                            }
+                        }
+                        return {
+                            x: world.x,
+                            y: world.y,
+                            scale,
+                            anchorId: best ? best.id : null,
+                            anchorScreenX: best ? world.x + best.x * scale : 0,
+                            anchorScreenY: best ? world.y + best.y * scale : 0,
+                        };
+                    },
+                    setCamera: (cam, opts) => {
+                        // Cancel any competing motion so the jump owns the camera.
+                        followId = null;
+                        followAt = null;
+                        zoomFit = null;
+                        cameraAnchorHold = null;
+                        const scale = Math.min(32, Math.max(0.05, cam.scale)); // same bounds as wheel/applyZoom
+                        // Resolve the target pan from the anchor when it still
+                        // exists (content-relative, survives layout drift);
+                        // otherwise use the raw saved world coords.
+                        const anchor = cam.anchorId ? layout.byId.get(cam.anchorId) : undefined;
+                        let toX = cam.x;
+                        let toY = cam.y;
+                        if (anchor) {
+                            toX = (cam.anchorScreenX ?? 0) - anchor.x * scale;
+                            toY = (cam.anchorScreenY ?? 0) - anchor.y * scale;
+                        }
+                        if (opts?.animate) {
+                            cameraTween = {
+                                fromX: world.x,
+                                fromY: world.y,
+                                fromScale: world.scale.x,
+                                toX,
+                                toY,
+                                toScale: scale,
+                                start: performance.now(),
+                                durMs: 320,
+                                // Keep tracking the anchor as the sim settles.
+                                anchorId: anchor ? cam.anchorId : null,
+                                anchorScreenX: cam.anchorScreenX,
+                                anchorScreenY: cam.anchorScreenY,
+                            };
+                        } else {
+                            cameraTween = null;
+                            world.x = toX;
+                            world.y = toY;
+                            world.scale.set(scale);
+                            cameraScale = scale;
+                        }
+                    },
                 };
             }
 
@@ -4037,8 +4260,11 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     followId = null;
                     followAt = null;
                     // User scrolled or dragged — drop any in-flight zoom-to-fit
-                    // so we don't fight their input.
+                    // or snapshot jump (animation OR post-jump anchor hold) so we
+                    // don't fight their input.
                     zoomFit = null;
+                    cameraTween = null;
+                    cameraAnchorHold = null;
                 },
                 // Pivot policy for wheel-zoom, by what the cursor is on:
                 //   * COLLAPSED file → anchor on the icon's centre so the
@@ -4549,6 +4775,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     scale: world.scale.x,
                 };
                 layout.simulation.stop();
+                resizeObserver.disconnect();
                 detachCamera();
                 window.removeEventListener("keydown", onShiftDown);
                 window.removeEventListener("keyup", onShiftUp);

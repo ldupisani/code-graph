@@ -87,9 +87,15 @@ export function activeTiers(cameraScale: number, fitScale: number, tiers: Layout
             return {a: i, b: null, w: 0};
         }
         if (r < bandHi) {
-            // Inside the overlap band: crossfade i → i+1 in log space.
-            const lo = Math.log(fit * bandLo);
-            const hi = Math.log(fit * bandHi);
+            // Inside the overlap band: crossfade i → i+1 in log space. Floor each
+            // band edge to 1e-4 BEFORE the log — a zoomFromMul (or zoomToMul) of 0
+            // is otherwise Math.log(0) = -Infinity, which makes `w` = smoothstep(
+            // Infinity/Infinity) = NaN. That NaN poisons the tier blend weights and
+            // every node's x/y downstream, so the whole graph vanishes and can't
+            // recover (NaN is sticky frame-to-frame). Mirrors the existing
+            // Math.max(1e-4, cameraScale) floor on the numerator.
+            const lo = Math.log(Math.max(1e-4, fit * bandLo));
+            const hi = Math.log(Math.max(1e-4, fit * bandHi));
             const w = hi <= lo ? 1 : smoothstep((Math.log(Math.max(1e-4, cameraScale)) - lo) / (hi - lo));
             return {a: i, b: i + 1, w};
         }

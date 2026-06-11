@@ -113,7 +113,13 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 resolution: window.devicePixelRatio || 1,
             });
             if (disposed) {
-                app.destroy(true, {children: true});
+                // {removeView:true} (not `true`): tears down THIS renderer but
+                // leaves Pixi's GLOBAL TexturePool singleton alone. Passing
+                // `true` would trigger GlobalResourceRegistry.release() →
+                // TexturePool.clear(), which wipes the pool shared with any
+                // overlapping Application (rapid project switches / StrictMode
+                // double-mount), crashing the other app's text-texture returns.
+                app.destroy({removeView: true}, {children: true});
                 return;
             }
             container.appendChild(app.canvas);
@@ -281,6 +287,59 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // cameraScale picks the new world.scale.x up at the `let
                 // cameraScale = world.scale.x` initialiser further down in
                 // this same IIFE — runs strictly after this function does.
+            }
+
+            // True if any file's on-screen rect overlaps the viewport at the
+            // current camera transform. Early-exits on the first hit, so the
+            // common (content visible) case is O(1)-ish.
+            function anyContentVisible(): boolean {
+                const W = app.screen.width;
+                const H = app.screen.height;
+                if (W <= 0 || H <= 0) return true; // unsized container — don't act
+                const scale = world.scale.x;
+                for (const n of layout.nodes) {
+                    const hw = (n.width / 2) * scale;
+                    const hh = (n.height / 2) * scale;
+                    const sx = world.x + n.x * scale;
+                    const sy = world.y + n.y * scale;
+                    if (sx + hw >= 0 && sx - hw <= W && sy + hh >= 0 && sy - hh <= H) return true;
+                }
+                return false;
+            }
+
+            // Backstop against a stranded blank canvas (see blankIdleFrames). Run
+            // last in the frame so it sees this frame's final camera + positions.
+            function recoverIfBlank(): void {
+                // A camera animation is in flight (zoom-fit, anchored jump, hold,
+                // or follow) — all of those aim at content, so a transient blank
+                // frame will resolve itself. Don't interfere; just keep the
+                // movement baseline current.
+                if (zoomFit || cameraTween || cameraAnchorHold || followAt) {
+                    blankIdleFrames = 0;
+                    lastCamX = world.x;
+                    lastCamY = world.y;
+                    lastCamScale = world.scale.x;
+                    return;
+                }
+                // Camera moved since last frame → the user is panning/zooming (or
+                // a prior recovery just ran). Don't fight live input; reset and
+                // wait for them to settle.
+                const moved = world.x !== lastCamX || world.y !== lastCamY || world.scale.x !== lastCamScale;
+                lastCamX = world.x;
+                lastCamY = world.y;
+                lastCamScale = world.scale.x;
+                if (moved || layout.nodes.length === 0 || anyContentVisible()) {
+                    blankIdleFrames = 0;
+                    return;
+                }
+                // Idle + nothing on screen. Re-frame after ~20 frames (~0.33s) so
+                // a brief pan across empty space doesn't trigger it, but a truly
+                // stuck blank view auto-recovers without a reload or manual drag.
+                if (++blankIdleFrames >= 20) {
+                    blankIdleFrames = 0;
+                    fitProjectToViewport();
+                    cameraScale = world.scale.x;
+                }
             }
 
             // Scene graph layering, bottom-up (Pixi child order = z-order):
@@ -506,6 +565,20 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // drifting out from under the camera. Released when the sim settles,
             // a safety deadline passes, or the user moves the camera.
             let cameraAnchorHold: {id: string; screenX: number; screenY: number; scale: number; until: number} | null = null;
+
+            // Blank-view auto-recovery. A layout-changing edit (e.g. swapping a
+            // tier's pattern or params) can shove every file out of the
+            // viewport, and a project reload restores the SAME off-screen camera
+            // (savedCamera / a re-settled sim land where the content no longer
+            // is) — so the user is stranded on an empty canvas until they pan
+            // back by hand. We watch for "camera idle AND nothing on screen" and
+            // re-frame after a short settle. Idle-gating means we never fight an
+            // active pan/zoom: while the camera is moving the counter resets, so
+            // recovery only fires once the user has come to rest on a blank view.
+            let blankIdleFrames = 0;
+            let lastCamX = 0;
+            let lastCamY = 0;
+            let lastCamScale = 0;
 
             // Directional `${fromFileId} ${toFileId}` keys for semantic edges
             // (calls/extends/implements) actually drawn this frame. drawSemanticEdges
@@ -3898,6 +3971,10 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 updateCameraHold(); // after positions update → anchor held without 1-frame lag
                 draw();
                 updateFollow();
+                // Last: with the frame's final camera + positions known, rescue
+                // the view if a layout edit (or a stale restored camera) left
+                // every file off-screen.
+                recoverIfBlank();
             };
             app.ticker.add(tickerCb);
 
@@ -4784,7 +4861,13 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 directoryLabelPool.destroy();
                 for (const pane of overlayPanes) pane.labels.destroy();
                 app.ticker.remove(tickerCb);
-                app.destroy(true, {children: true, texture: true});
+                // {removeView:true} rather than `true` so the GLOBAL TexturePool
+                // singleton survives: `true` runs GlobalResourceRegistry.release()
+                // → TexturePool.clear(), which empties `_texturePool` but leaves
+                // `_poolKeyHash` populated — any still-pending text-texture return
+                // (here or in an overlapping app on project switch) then does
+                // `_texturePool[key].push` on undefined and throws.
+                app.destroy({removeView: true}, {children: true, texture: true});
                 if (cameraApiRef) cameraApiRef.current = null;
             };
         })();

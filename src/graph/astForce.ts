@@ -286,88 +286,202 @@ function directionalAstForce(edges: readonly DirAstEdge[], axis: "x" | "y", stre
 // file whose body is nothing but imports + exports — the radius
 // is just big enough to fit the items on a half-arc.
 //
-// Slot assignment is by source order: the first import in the file
-// goes to the leftmost slot of the top arc, the last import to the
-// rightmost. Same for exports on the bottom. Stable across ticks
-// because the underlying list order doesn't change during a
-// simulation run.
-// Plan for one half (top or bottom): the outer radius R, plus a
-// list of rings each holding a slice of items. The OUTERMOST ring
-// (index 0) sits at radius R; ring k sits at R − k · ringSpacing.
-// The file's boundary radius is determined by the larger of the
-// two halves' R.
-interface ArcRingPlan {
-    radius: number;
-    rings: SimAstNode[][];
+// Slot assignment is by WIDTH, not source order: wide items sit near
+// the apex where the arc runs flat enough to host them, narrow items
+// tuck into the steep ends where only short footprints fit. Stable
+// across ticks because the width sort is deterministic (ties keep
+// source order) and the list doesn't change during a simulation run.
+// Plan for one half (top or bottom): the outer radius R plus explicit
+// slot placements — (ring index, fraction along the half-arc) per
+// item. Ring k sits at radius R − k · ringSpacing; the OUTERMOST ring
+// (index 0) is the file's drawn boundary. Plans are computed in the
+// TOP-half frame (negative y above the centre); a bottom-half plan is
+// the same thing mirrored y → −y, so callers mirror their obstacle
+// rects rather than the plan.
+interface ArcSlot {
+    node: SimAstNode;
+    ring: number;
+    frac: number;
 }
 
-// Pack N items into concentric half-rings AROUND A TARGET MIDDLE.
-// Algorithm:
-//   1. The OUTER ring sits at max(middleR + outerPad, slotW / π).
-//      The first term keeps the arc hugging the middle content; the
-//      second guarantees the ring is big enough for at least one
-//      item.
-//   2. Items fill the outer ring first, then spill INWARD onto
-//      ring k = 1 (radius R - ringSpacing), ring k = 2, etc. Each
-//      inner ring fits fewer items as the radius shrinks.
-//   3. If items don't fit even with all rings down to r = 0, bump
-//      the outer radius by 10% and retry.
-// The result: file size adapts to the BIGGER of the middle's
-// natural extent or the items' minimum packing requirement —
-// whichever dominates. For middle-dominated files (typical), the
-// boundary hugs the middle tightly and items stack inward.
+interface ArcRingPlan {
+    radius: number;
+    slots: ArcSlot[];
+    // Half the height of the half's shortest item: how far past its
+    // ring radius a node's outer edge may poke. A single-row import
+    // straddles the arc exactly as before; taller multi-specifier
+    // panels are pushed inward so they overhang the boundary by the
+    // same visual margin instead of escaping by their full half
+    // height.
+    overhang: number;
+}
+
+// Axis-aligned rect by centre + half-extents, used for the planner's
+// exact overlap tests.
+interface PlanRect {
+    cx: number;
+    cy: number;
+    hw: number;
+    hh: number;
+}
+
+// Centre of a node placed at `frac` along the half-arc of ring radius
+// ringR inside boundary radius R, in the TOP-half frame. The node is
+// pulled inward off the ring just enough that its outer extent pokes
+// past the ring by `overhang` — so a tall panel at the apex or a wide
+// box at a steep side tucks INSIDE the boundary instead of straddling
+// it by its own half extent.
+function slotCenter(
+    n: {rect: {w: number; h: number}},
+    frac: number,
+    ringR: number,
+    R: number,
+    overhang: number,
+): {x: number; y: number} {
+    const t = Math.PI + frac * Math.PI;
+    const ux = Math.cos(t);
+    const uy = Math.sin(t);
+    const radialHalf = (n.rect.w * Math.abs(ux) + n.rect.h * Math.abs(uy)) / 2;
+    const rEff = Math.max(0, Math.min(ringR, R - radialHalf + overhang));
+    return {x: rEff * ux, y: rEff * uy};
+}
+
+function rectAtSlot(
+    n: {rect: {w: number; h: number}},
+    frac: number,
+    ringR: number,
+    R: number,
+    overhang: number,
+): PlanRect {
+    const c = slotCenter(n, frac, ringR, R, overhang);
+    return {cx: c.x, cy: c.y, hw: n.rect.w / 2, hh: n.rect.h / 2};
+}
+
+function rectsClear(a: PlanRect, b: PlanRect, pad: number): boolean {
+    return (
+        Math.abs(a.cx - b.cx) >= a.hw + b.hw + pad ||
+        Math.abs(a.cy - b.cy) >= a.hh + b.hh + pad
+    );
+}
+
+function nodeRects(nodes: readonly SimAstNode[]): PlanRect[] {
+    return nodes.map((m) => ({
+        cx: m.x,
+        cy: m.y,
+        hw: m.rect.w / 2,
+        hh: m.rect.h / 2,
+    }));
+}
+
+function mirrorRects(rects: readonly PlanRect[]): PlanRect[] {
+    return rects.map((r) => ({...r, cy: -r.cy}));
+}
+
+// Greedy exact 2-D placement: items go widest-first; each takes the
+// outermost ring with a free slot, sweeping from the apex outward
+// (alternating sides) in ~12px arc steps until its rect clears every
+// previously placed rect AND every obstacle (the middle content, and
+// for the bottom half the already-planned top half). Exact AABB tests
+// replace the 1-D arc-length models tried before, all of which had a
+// systematic bias somewhere on the arc: charging width everywhere
+// overbilled the steep sides ~4–10× (vertical voids beside React /
+// Pill), the tangent projection let wide boxes jut inward through the
+// middle content (collide then scattered them), and the bounding
+// wedge blocked whole quadrants per item. Widest-first means wide
+// items get the flat apex while narrow ones tuck into the steep ends.
+// Returns null when some item fits on no ring at this R.
+function tryPlaceAll(
+    items: SimAstNode[],
+    R: number,
+    slotPad: number,
+    ringSpacing: number,
+    overhang: number,
+    obstacles: readonly PlanRect[],
+): ArcSlot[] | null {
+    // Stable sort: equal widths keep source order, so re-plans are
+    // deterministic.
+    const desc = [...items].sort((a, b) => b.rect.w - a.rect.w);
+    const placed: PlanRect[] = [];
+    const slots: ArcSlot[] = [];
+    for (const n of desc) {
+        let done = false;
+        for (let k = 0; !done; k++) {
+            const r = R - k * ringSpacing;
+            if (r <= 0) break;
+            const df = Math.max(0.002, 12 / (Math.PI * r));
+            for (let off = 0; off <= 0.5 + 1e-9 && !done; off += df) {
+                for (const frac of off === 0 ? [0.5] : [0.5 - off, 0.5 + off]) {
+                    if (frac < 0 || frac > 1) continue;
+                    const rect = rectAtSlot(n, frac, r, R, overhang);
+                    if (!placed.every((p) => rectsClear(rect, p, slotPad))) continue;
+                    if (!obstacles.every((o) => rectsClear(rect, o, slotPad))) continue;
+                    placed.push(rect);
+                    slots.push({node: n, ring: k, frac});
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if (!done) return null;
+    }
+    return slots;
+}
+
+// Find a feasible outer radius + slot placement for one half's items.
+// R starts tangent to the middle content and grows 10% per attempt
+// until everything fits — file size adapts to the BIGGER of the
+// middle's natural extent or the items' packing requirement.
 function planArcRings(
     items: SimAstNode[],
     slotPad: number,
     ringSpacing: number,
     middleR: number,
     outerPad: number,
+    obstacles: readonly PlanRect[],
 ): ArcRingPlan {
-    const N = items.length;
-    if (N === 0) return {radius: 0, rings: []};
+    if (items.length === 0) return {radius: 0, slots: [], overhang: 0};
 
     let maxW = 0;
+    let minH = Infinity;
     for (const n of items) {
         if (n.rect.w > maxW) maxW = n.rect.w;
+        if (n.rect.h < minH) minH = n.rect.h;
     }
-    const slotW = maxW + slotPad;
+    const overhang = minH / 2;
+    let R = Math.max(middleR + outerPad, (maxW + slotPad) / Math.PI + 1);
 
-    // Outer radius starts at the tighter of "middle + small pad" or
-    // "small enough to barely fit one slot at full half-arc".
-    // Math: π·R >= slotW ⇒ R >= slotW / π for one slot to fit on a
-    // half-arc.
-    let R = Math.max(middleR + outerPad, slotW / Math.PI + 1);
-
-    let rings: SimAstNode[][] = [];
     for (let attempt = 0; attempt < 50; attempt++) {
-        rings = [];
-        let i = 0;
-        let k = 0;
-        while (i < N) {
-            const r = R - k * ringSpacing;
-            if (r <= 0) break;
-            const cap = Math.floor((Math.PI * r) / slotW);
-            if (cap <= 0) break;
-            const take = Math.min(cap, N - i);
-            rings.push(items.slice(i, i + take));
-            i += take;
-            k++;
-        }
-        if (i >= N) return {radius: R, rings};
-        // Didn't fit — bump and retry. Bigger bump than before
-        // because each retry is "find a feasible R", not "find the
-        // optimum K".
+        const slots = tryPlaceAll(items, R, slotPad, ringSpacing, overhang, obstacles);
+        if (slots) return {radius: R, slots, overhang};
         R *= 1.1;
         if (R > 1e6) break;
     }
 
-    // Fallback: dump everything into a single oversized ring.
-    let maxWFinal = 0;
-    for (const n of items) {
-        if (n.rect.w > maxWFinal) maxWFinal = n.rect.w;
+    // Fallback: uniform spacing on the outer ring; overlaps are the
+    // collide force's problem.
+    return {
+        radius: R,
+        slots: items.map((n, j) => ({
+            node: n,
+            ring: 0,
+            frac: (j + 1) / (items.length + 1),
+        })),
+        overhang,
+    };
+}
+
+// A plan's placed rects, mirrored into the OTHER half's frame — so the
+// bottom-half (exports) plan can treat the top half (imports) as
+// obstacles where the two halves meet at the circle's sides.
+function planRectsMirrored(plan: ArcRingPlan, ringSpacing: number): PlanRect[] {
+    const out: PlanRect[] = [];
+    for (const s of plan.slots) {
+        const r = plan.radius - s.ring * ringSpacing;
+        if (r <= 0) continue;
+        const rect = rectAtSlot(s.node, s.frac, r, plan.radius, plan.overhang);
+        out.push({...rect, cy: -rect.cy});
     }
-    const slotWFinal = maxWFinal + slotPad;
-    return {radius: Math.max(R, (N * slotWFinal) / Math.PI), rings: [items.slice()]};
+    return out;
 }
 
 // Pulls every non-arc (middle) node directly to (0, 0) at strong
@@ -408,12 +522,14 @@ function importExportArcForce(
     ringSpacing: number,
     outerPad: number,
 ) {
-    let importsPlan: ArcRingPlan = {radius: 0, rings: []};
-    let exportsPlan: ArcRingPlan = {radius: 0, rings: []};
+    let importsPlan: ArcRingPlan = {radius: 0, slots: [], overhang: 0};
+    let exportsPlan: ArcRingPlan = {radius: 0, slots: [], overhang: 0};
+    let importNodes: SimAstNode[] = [];
+    let exportNodes: SimAstNode[] = [];
     let middleNodes: SimAstNode[] = [];
 
     function force(alpha: number): void {
-        if (importsPlan.rings.length === 0 && exportsPlan.rings.length === 0) return;
+        if (importsPlan.slots.length === 0 && exportsPlan.slots.length === 0) return;
 
         // Live middle radius — re-planning per tick adapts the arcs
         // outward if the middle has spread beyond the seed estimate.
@@ -429,30 +545,45 @@ function importExportArcForce(
             if (d > middleR) middleR = d;
         }
 
+        // Re-plan both halves when the live middle has outgrown the
+        // radius the plans were packed for (the planned slots were
+        // squeezed around a SMALLER middle — keeping them while the
+        // drawn arc grows leaves the outer arc half empty), using the
+        // middle's LIVE rects as obstacles so wide items never get
+        // planned through actual content. Both halves go together
+        // because exports treat the planned imports as obstacles. The
+        // 1.02 hysteresis avoids re-packing every tick while the
+        // middle jitters around its settled size.
+        const grown = (plan: ArcRingPlan): boolean =>
+            plan.slots.length > 0 && middleR + outerPad > plan.radius * 1.02;
+        if (grown(importsPlan) || grown(exportsPlan)) {
+            const middleRects = nodeRects(middleNodes);
+            importsPlan = planArcRings(
+                importNodes, slotPad, ringSpacing, middleR, outerPad, middleRects,
+            );
+            exportsPlan = planArcRings(
+                exportNodes, slotPad, ringSpacing, middleR, outerPad,
+                mirrorRects(middleRects).concat(planRectsMirrored(importsPlan, ringSpacing)),
+            );
+        }
+
         const applyHalf = (plan: ArcRingPlan, top: boolean): void => {
-            if (plan.rings.length === 0) return;
-            const K = plan.rings.length;
+            if (plan.slots.length === 0) return;
             // R is the larger of (the plan's radius) and (whatever the
             // live middle requires). The plan already considered
             // middleR_estimate; this just protects against the middle
             // settling larger than the estimate.
             const R = Math.max(plan.radius, middleR + outerPad);
 
-            for (let k = 0; k < K; k++) {
-                const r = R - k * ringSpacing;
-                if (r <= 0) break;
-                const ring = plan.rings[k];
-                const N_k = ring.length;
-                for (let j = 0; j < N_k; j++) {
-                    const t = top
-                        ? Math.PI + ((j + 1) / (N_k + 1)) * Math.PI
-                        : (Math.PI * (N_k - j)) / (N_k + 1);
-                    const tx = r * Math.cos(t);
-                    const ty = r * Math.sin(t);
-                    const n = ring[j];
-                    n.vx = (n.vx ?? 0) + (tx - n.x) * alpha * strength;
-                    n.vy = (n.vy ?? 0) + (ty - n.y) * alpha * strength;
-                }
+            for (const slot of plan.slots) {
+                const r = R - slot.ring * ringSpacing;
+                if (r <= 0) continue;
+                const c = slotCenter(slot.node, slot.frac, r, R, plan.overhang);
+                const tx = c.x;
+                const ty = top ? c.y : -c.y;
+                const n = slot.node;
+                n.vx = (n.vx ?? 0) + (tx - n.x) * alpha * strength;
+                n.vy = (n.vy ?? 0) + (ty - n.y) * alpha * strength;
             }
         };
 
@@ -461,8 +592,8 @@ function importExportArcForce(
     }
 
     force.initialize = (n: SimAstNode[]): void => {
-        const importNodes: SimAstNode[] = [];
-        const exportNodes: SimAstNode[] = [];
+        importNodes = [];
+        exportNodes = [];
         middleNodes = [];
         for (const x of n) {
             if (x.tree.syntaxKind === "ImportDeclaration") {
@@ -482,12 +613,20 @@ function importExportArcForce(
         // Estimate middleR from rect SIZES (positions haven't settled
         // at force-init time): treat middle nodes as a single
         // equivalent disc that contains all their area. This gives a
-        // reasonable target the plan can compress around.
+        // reasonable target the plan can compress around. Obstacle
+        // rects use the seed positions — rough, but the live re-plan
+        // in force() corrects against real positions as they settle.
         let middleArea = 0;
         for (const mn of middleNodes) middleArea += mn.rect.w * mn.rect.h;
         const middleREstimate = middleArea > 0 ? Math.sqrt(middleArea / Math.PI) : 0;
-        importsPlan = planArcRings(importNodes, slotPad, ringSpacing, middleREstimate, outerPad);
-        exportsPlan = planArcRings(exportNodes, slotPad, ringSpacing, middleREstimate, outerPad);
+        const middleRects = nodeRects(middleNodes);
+        importsPlan = planArcRings(
+            importNodes, slotPad, ringSpacing, middleREstimate, outerPad, middleRects,
+        );
+        exportsPlan = planArcRings(
+            exportNodes, slotPad, ringSpacing, middleREstimate, outerPad,
+            mirrorRects(middleRects).concat(planRectsMirrored(importsPlan, ringSpacing)),
+        );
     };
     return force;
 }
@@ -624,58 +763,68 @@ function buildContainerForceLayout(
     for (const tn of middleMembers) seedMiddleArea += tn.rect.w * tn.rect.h;
     const seedMiddleR = seedMiddleArea > 0 ? Math.sqrt(seedMiddleArea / Math.PI) : 0;
 
+    // Middle seeds first — a small ring near origin so charge spreads
+    // them without an initial pile-up — because the arc plans need
+    // them as obstacle rects.
+    const middleSeedById = new Map<string, {x: number; y: number}>();
+    const middleSeedRects: PlanRect[] = [];
+    middleMembers.forEach((tn, i) => {
+        const angle = i * 2.4;
+        const x = Math.cos(angle) * (spread * 0.4);
+        const y = Math.sin(angle) * (spread * 0.4);
+        middleSeedById.set(tn.id, {x, y});
+        middleSeedRects.push({cx: x, cy: y, hw: tn.rect.w / 2, hh: tn.rect.h / 2});
+    });
+
     // Seed plan uses the same packing algorithm the force runs at
     // initialize. Treat each TreemapNode as if it were a SimAstNode
     // for the purpose of reading rect.w — the packer only needs
-    // .rect.w from each item.
+    // .rect from each item.
+    const toSim = (tn: TreemapNode): SimAstNode => ({
+        id: tn.id,
+        rect: tn.rect,
+        x: 0,
+        y: 0,
+        tree: tn,
+    });
     const seedImports = planArcRings(
-        importMembers.map((tn) => ({id: tn.id, rect: tn.rect, x: 0, y: 0, tree: tn})),
+        importMembers.map(toSim),
         IMPORT_EXPORT_ARC_SLOT_PAD,
         IMPORT_EXPORT_ARC_RING_SPACING,
         seedMiddleR,
         IMPORT_EXPORT_ARC_OUTER_PAD,
+        middleSeedRects,
     );
     const seedExports = planArcRings(
-        exportMembers.map((tn) => ({id: tn.id, rect: tn.rect, x: 0, y: 0, tree: tn})),
+        exportMembers.map(toSim),
         IMPORT_EXPORT_ARC_SLOT_PAD,
         IMPORT_EXPORT_ARC_RING_SPACING,
         seedMiddleR,
         IMPORT_EXPORT_ARC_OUTER_PAD,
+        mirrorRects(middleSeedRects).concat(
+            planRectsMirrored(seedImports, IMPORT_EXPORT_ARC_RING_SPACING),
+        ),
     );
 
-    // Build id → (x, y) seed map by walking each plan's rings.
+    // Build id → (x, y) seed map from each plan's slots.
     const seedPosById = new Map<string, {x: number; y: number}>();
     const seedHalf = (plan: ArcRingPlan, top: boolean): void => {
-        const R = plan.radius;
-        for (let k = 0; k < plan.rings.length; k++) {
-            const r = R - k * IMPORT_EXPORT_ARC_RING_SPACING;
-            const ring = plan.rings[k];
-            const N_k = ring.length;
-            for (let j = 0; j < N_k; j++) {
-                const t = top
-                    ? Math.PI + ((j + 1) / (N_k + 1)) * Math.PI
-                    : (Math.PI * (N_k - j)) / (N_k + 1);
-                seedPosById.set(ring[j].id, {x: r * Math.cos(t), y: r * Math.sin(t)});
-            }
+        for (const slot of plan.slots) {
+            const r = plan.radius - slot.ring * IMPORT_EXPORT_ARC_RING_SPACING;
+            if (r <= 0) continue;
+            const c = slotCenter(slot.node, slot.frac, r, plan.radius, plan.overhang);
+            seedPosById.set(slot.node.id, {x: c.x, y: top ? c.y : -c.y});
         }
     };
     seedHalf(seedImports, true);
     seedHalf(seedExports, false);
 
-    let mi = 0;
     const nodes: SimAstNode[] = members.map((tn) => {
-        const seeded = seedPosById.get(tn.id);
-        if (seeded) {
-            return {id: tn.id, x: seeded.x, y: seeded.y, rect: tn.rect, tree: tn};
-        }
-        // Middle nodes — small ring near origin so charge spreads
-        // them without an initial pile-up.
-        const angle = mi * 2.4;
-        mi++;
+        const seeded = seedPosById.get(tn.id) ?? middleSeedById.get(tn.id);
         return {
             id: tn.id,
-            x: Math.cos(angle) * (spread * 0.4),
-            y: Math.sin(angle) * (spread * 0.4),
+            x: seeded?.x ?? 0,
+            y: seeded?.y ?? 0,
             rect: tn.rect,
             tree: tn,
         };
@@ -743,6 +892,81 @@ function buildContainerForceLayout(
     for (let i = 0; i < SETTLE_TICKS; i++) simulation.tick();
     simulation.stop();
 
+    // Final snap: re-plan both arcs against the SETTLED middle and
+    // set arc nodes directly onto their slots. During the settle,
+    // plans are built from in-flight middle positions and only
+    // refresh when the middle's radius GROWS — a plan locked against
+    // a transient sprawl never heals, leaving items parked on inner
+    // rings while the outer arc has free room. The post-settle plan
+    // sees the real obstacle geometry, and its slots are
+    // collision-free by construction, so direct assignment is safe.
+    const importIdSet = new Set(importMembers.map((tn) => tn.id));
+    const exportIdSet = new Set(exportMembers.map((tn) => tn.id));
+    const importSim = nodes.filter((n) => importIdSet.has(n.id));
+    const exportSim = nodes.filter((n) => exportIdSet.has(n.id));
+    const middleSim = nodes.filter(
+        (n) => !importIdSet.has(n.id) && !exportIdSet.has(n.id),
+    );
+    let settledMiddleR = 0;
+    for (const m of middleSim) {
+        const d = Math.hypot(
+            Math.abs(m.x) + m.rect.w / 2,
+            Math.abs(m.y) + m.rect.h / 2,
+        );
+        if (d > settledMiddleR) settledMiddleR = d;
+    }
+    const settledMiddleRects = nodeRects(middleSim);
+    // Both halves must lie on ONE circle — the drawn boundary is a
+    // single circle through the arc slots. Planning each half at its
+    // own feasible radius (imports usually need a bigger R than the
+    // lone default export) shifted the bbox-derived boundary off the
+    // cluster's origin, which read as all content sagging downward
+    // inside the circle. So: plan imports, start exports at the
+    // imports' radius, and if exports still needed more room re-plan
+    // both at the larger radius.
+    let snapImports = planArcRings(
+        importSim,
+        IMPORT_EXPORT_ARC_SLOT_PAD,
+        IMPORT_EXPORT_ARC_RING_SPACING,
+        settledMiddleR,
+        IMPORT_EXPORT_ARC_OUTER_PAD,
+        settledMiddleRects,
+    );
+    const snapExportsAt = (floorR: number): ArcRingPlan =>
+        planArcRings(
+            exportSim,
+            IMPORT_EXPORT_ARC_SLOT_PAD,
+            IMPORT_EXPORT_ARC_RING_SPACING,
+            Math.max(settledMiddleR, floorR - IMPORT_EXPORT_ARC_OUTER_PAD),
+            IMPORT_EXPORT_ARC_OUTER_PAD,
+            mirrorRects(settledMiddleRects).concat(
+                planRectsMirrored(snapImports, IMPORT_EXPORT_ARC_RING_SPACING),
+            ),
+        );
+    let snapExports = snapExportsAt(snapImports.radius);
+    if (snapExports.radius > snapImports.radius && importSim.length > 0) {
+        snapImports = planArcRings(
+            importSim,
+            IMPORT_EXPORT_ARC_SLOT_PAD,
+            IMPORT_EXPORT_ARC_RING_SPACING,
+            snapExports.radius - IMPORT_EXPORT_ARC_OUTER_PAD,
+            IMPORT_EXPORT_ARC_OUTER_PAD,
+            settledMiddleRects,
+        );
+        snapExports = snapExportsAt(snapImports.radius);
+    }
+    const snapHalf = (plan: ArcRingPlan, top: boolean): void => {
+        for (const slot of plan.slots) {
+            const r = plan.radius - slot.ring * IMPORT_EXPORT_ARC_RING_SPACING;
+            if (r <= 0) continue;
+            const c = slotCenter(slot.node, slot.frac, r, plan.radius, plan.overhang);
+            slot.node.x = c.x;
+            slot.node.y = top ? c.y : -c.y;
+        }
+    };
+    snapHalf(snapImports, true);
+    snapHalf(snapExports, false);
+
     // Cluster bounding box from settled positions + rect extents.
     // Middle nodes contribute their full footprint (corners are
     // inside the file). Arc nodes (imports / exports) contribute
@@ -780,25 +1004,19 @@ function buildContainerForceLayout(
     }
     const bboxW = maxX - minX;
     const bboxH = maxY - minY;
-    const cx = minX + bboxW / 2;
-    const cy = minY + bboxH / 2;
 
-    let radius = 0;
-    for (const n of nodes) {
-        if (arcIdSet.has(n.id)) {
-            // Arc node: distance to its CENTRE defines the boundary
-            // it sits on. Corners are allowed past this.
-            const d = Math.hypot(n.x - cx, n.y - cy);
-            if (d > radius) radius = d;
-        } else {
-            const hw = n.rect.w / 2;
-            const hh = n.rect.h / 2;
-            const dxAbs = Math.abs(n.x - cx) + hw;
-            const dyAbs = Math.abs(n.y - cy) + hh;
-            const d = Math.hypot(dxAbs, dyAbs);
-            if (d > radius) radius = d;
-        }
-    }
+    // The cluster's true centre is the ORIGIN: middleCenterForce
+    // pulls the middle there and both arc halves are planned around
+    // it on a shared radius. Deriving the circle centre from the
+    // bbox let any asymmetry — one-sided arcs, content hanging low —
+    // shift the drawn boundary off the cluster, reading as a uniform
+    // y-offset of everything inside it. The radius is the shared arc
+    // circle, or for arc-less containers (classes) whatever covers
+    // the middle's corners.
+    const cx = 0;
+    const cy = 0;
+    let radius = Math.max(snapImports.radius, snapExports.radius);
+    if (settledMiddleR > radius) radius = settledMiddleR;
 
     return {
         containerId,

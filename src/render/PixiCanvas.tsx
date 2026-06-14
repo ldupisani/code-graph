@@ -1,7 +1,7 @@
 import {useEffect, useRef} from "react";
 import {Application, Container, Graphics} from "pixi.js";
 import {getFileAst} from "../api/client";
-import {applyExpansion, assignRigidPositions, buildFileLayout, EXPANDED_MAX, EXPANDED_MIN, isCircular, refreshSizeForces} from "../graph/layout";
+import {applyExpansion, assignRigidPositions, buildFileLayout, EXPANDED_MAX, EXPANDED_MIN, isCircular, refreshSizeForces, seedFromSaved, type SavedNodePos} from "../graph/layout";
 import {AST_LABEL_FONT, astLabelOnScreenFactor, astLabelScale, fileLabel, labelScreenBox, measureMono} from "../graph/labels";
 import {isSupportFile, useGraphStore} from "../graph/store";
 import {useConfigStore} from "../graph/config/store";
@@ -26,6 +26,25 @@ import {createJsxStoryOverlayLayer, type JsxStoryOverlayItem} from "./jsxStoryOv
 // project starts at the default centered view.
 let savedCamera: {rootPath: string; x: number; y: number; scale: number} | null = null;
 
+// Settled file positions persisted across PixiCanvas rebuilds, keyed by
+// rootPath. An incremental graph update (a filesystem delta merged by the
+// store) produces a new `project` object, which re-runs the canvas effect and
+// rebuilds the layout — without this, every node would re-settle from the seed
+// ring and the whole arrangement would jump. seedFromSaved restores these so
+// the view stays put across an edit; only added/removed files move. Captured on
+// teardown, consumed on the next build for the SAME rootPath.
+let savedPositions: {rootPath: string; byId: Map<string, SavedNodePos>} | null = null;
+
+// Set by App when a filesystem delta auto-selects changed/added files, asking
+// the renderer to frame the whole selection once it has rebuilt. Consumed (and
+// cleared) on the next build — that's the first moment node positions for the
+// new payload exist, and it sidesteps the brief window where cameraApiRef is
+// null during the async Pixi rebuild.
+let pendingSelectionFrame = false;
+export function requestSelectionFrame(): void {
+    pendingSelectionFrame = true;
+}
+
 // Imperative canvas controls exposed to the React HUD (zoom + pin buttons), so
 // device-independent actions exist alongside the wheel / keyboard.
 // A camera transform plus an optional content anchor. The force layout settles
@@ -47,6 +66,9 @@ export interface CameraState {
 export interface CameraApi {
     zoomBy: (factor: number) => void; // factor < 1 zooms out, > 1 zooms in
     fitView: () => void; // re-frame the overview layout
+    // Pan + zoom so every listed file (AST-node ids resolve to their file) fits
+    // the viewport. Used to auto-frame the selection after a filesystem delta.
+    frameFiles: (ids: readonly string[], opts?: {animate?: boolean}) => void;
     pinAll: () => void; // pin every file box at its current position
     pinVisible: () => void; // pin only the files currently on screen
     unpinAll: () => void; // release every user pin
@@ -418,6 +440,19 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             let cfg = configRef.current;
 
             const layout = buildFileLayout(project);
+            // Restore settled positions from the previous build of the SAME
+            // project (an incremental delta rebuilds the effect). Existing files
+            // snap back where they were; only new files need to find a spot.
+            const restoringPositions =
+                savedPositions != null && savedPositions.rootPath === project.rootPath;
+            if (restoringPositions) {
+                seedFromSaved(layout, savedPositions!.byId, project);
+            }
+            // One-shot flag: restore expansion sizes for files this (re)build
+            // inherited as already-expanded (see restoreInheritedExpansion). Done
+            // on the first ticker frame, not here, so every closure const it
+            // transitively needs is initialised (avoids TDZ on late consts).
+            let inheritedExpansionRestored = false;
             // Drives the configured tiers: keeps layout.rigidRaw in sync with
             // the static (overview) tier's pattern, and derives the rigid-blend
             // weight from the tier zoom ranges (replaces the old rigidness()).
@@ -481,7 +516,18 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // rigid folder layout on the connectivity centroid, so the
             // two layouts overlap and the render-time interpolation
             // between them is a short travel rather than a fly-across.
-            layout.simulation.tick(50);
+            //
+            // When RESTORING positions (incremental update) the existing files
+            // are already settled, so skip the cold 50-tick warm-up and run a
+            // short, cool reheat instead: just enough for any newly-added files
+            // to slot in beside their neighbours and for collide to open space,
+            // without yanking the established layout around.
+            if (restoringPositions) {
+                layout.simulation.alpha(0.25);
+                layout.simulation.tick(6);
+            } else {
+                layout.simulation.tick(50);
+            }
             snapshotConn();
             // Apply the configured overview pattern to rigidRaw BEFORE the
             // initial anchor + fit, so a persisted non-default pattern (e.g. a
@@ -561,6 +607,111 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // cameraScale picks the new world.scale.x up at the `let
                 // cameraScale = world.scale.x` initialiser further down in
                 // this same IIFE — runs strictly after this function does.
+            }
+
+            // Start framing every file in `ids`: centre their bounding box and
+            // zoom so it ALL fits (zooming out as far as needed). Drives the
+            // "auto-frame selection after a filesystem delta" feature and is
+            // exposed on CameraApi. AST-node ids resolve to their owning file.
+            //
+            // This installs a TRACKING target rather than a one-shot jump: the
+            // per-frame updateSelectionFrame eases toward the live fit each tick,
+            // so as the selected files auto-expand (growing into big circles) and
+            // the sim settles, the camera keeps zooming out to hold them all in
+            // view, centred. It releases once the fit converges (everything has
+            // settled), the user takes the camera, or a safety deadline passes.
+            // cameraFramingSelection guards syncExpansion's auto-expand from
+            // stealing the camera while this is active.
+            // NOTE: only safe to CALL after the camera-animation state below is
+            // initialised — callers live later in the build sequence.
+            function frameFiles(ids: readonly string[], _opts?: {animate?: boolean}): void {
+                const seen = new Set<string>();
+                const files: string[] = [];
+                for (const id of ids) {
+                    const fileId = id.includes("#") ? fileIdOfAstId(id) : id;
+                    if (seen.has(fileId)) continue;
+                    seen.add(fileId);
+                    if (layout.byId.has(fileId)) files.push(fileId);
+                }
+                if (files.length === 0) return;
+                // Cancel competing camera motion so the fit owns the view.
+                followId = null;
+                followAt = null;
+                zoomFit = null;
+                cameraTween = null;
+                cameraAnchorHold = null;
+                frameSelectionTargets = files;
+                frameSelectionSettleFrames = 0;
+                // Generous backstop: long enough for an AST fetch + expand + sim
+                // settle to play out, after which we stop tracking regardless.
+                frameSelectionDeadline = performance.now() + 6000;
+                cameraFramingSelection = true;
+            }
+
+            // Per-frame service for an active frameFiles() target. Eases the
+            // camera toward the CURRENT fit of the selected files — read from
+            // their live rects (n.x/n.y + width/height, the actual drawn sizes,
+            // so expansion is accounted for). Runs after stepLayout so it sees
+            // this frame's final positions/sizes.
+            function updateSelectionFrame(): void {
+                if (frameSelectionTargets === null) return;
+                const W = app.screen.width;
+                const H = app.screen.height;
+                if (W <= 0 || H <= 0) return;
+                let minX = Infinity;
+                let minY = Infinity;
+                let maxX = -Infinity;
+                let maxY = -Infinity;
+                let count = 0;
+                for (const id of frameSelectionTargets) {
+                    const n = layout.byId.get(id);
+                    if (!n) continue;
+                    count++;
+                    const hw = n.width / 2;
+                    const hh = n.height / 2;
+                    if (n.x - hw < minX) minX = n.x - hw;
+                    if (n.y - hh < minY) minY = n.y - hh;
+                    if (n.x + hw > maxX) maxX = n.x + hw;
+                    if (n.y + hh > maxY) maxY = n.y + hh;
+                }
+                if (count === 0) {
+                    frameSelectionTargets = null;
+                    cameraFramingSelection = false;
+                    return;
+                }
+                const cx = (minX + maxX) / 2;
+                const cy = (minY + maxY) / 2;
+                const MARGIN = 0.85;
+                const fitW = (W * MARGIN) / Math.max(1, maxX - minX);
+                const fitH = (H * MARGIN) / Math.max(1, maxY - minY);
+                // Fit the WHOLE bbox: take the smaller axis ratio so nothing is
+                // cropped. Floor low (allow zooming far out for a big spread),
+                // cap modestly so a single tiny file doesn't slam to max zoom.
+                const targetScale = Math.max(0.02, Math.min(2, Math.min(fitW, fitH)));
+                const targetX = W / 2 - cx * targetScale;
+                const targetY = H / 2 - cy * targetScale;
+                const k = 0.2; // ease factor per frame
+                const ns = world.scale.x + (targetScale - world.scale.x) * k;
+                world.scale.set(ns);
+                cameraScale = ns;
+                world.x += (targetX - world.x) * k;
+                world.y += (targetY - world.y) * k;
+                // Converged only when the target itself is stable (expansion + sim
+                // have settled) AND we've eased onto it. Hold for a few frames so
+                // a momentary stillness mid-expansion doesn't end it early.
+                const settled =
+                    Math.abs(targetX - world.x) < 0.5 &&
+                    Math.abs(targetY - world.y) < 0.5 &&
+                    Math.abs(targetScale - world.scale.x) < 0.0005;
+                frameSelectionSettleFrames = settled ? frameSelectionSettleFrames + 1 : 0;
+                if (frameSelectionSettleFrames >= 6 || performance.now() > frameSelectionDeadline) {
+                    world.scale.set(targetScale);
+                    cameraScale = targetScale;
+                    world.x = targetX;
+                    world.y = targetY;
+                    frameSelectionTargets = null;
+                    cameraFramingSelection = false;
+                }
             }
 
             // True if any file's on-screen rect overlaps the viewport at the
@@ -800,6 +951,18 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             let followId: string | null = null;
             let followStartAt = 0;
             let followAt: {x: number; y: number} | null = null;
+
+            // True while a frameFiles() fit owns the camera. Suppresses
+            // syncExpansion's per-frame "auto-expand grabs the camera" follow, so
+            // a multi-file fit isn't yanked to a single newly-expanded file.
+            // Cleared when the fit settles or the user takes the camera.
+            let cameraFramingSelection = false;
+            // Active frameFiles() tracking state: the file ids being framed, a
+            // settle-frame counter, and a safety deadline. null = not framing.
+            // Serviced each frame by updateSelectionFrame.
+            let frameSelectionTargets: string[] | null = null;
+            let frameSelectionSettleFrames = 0;
+            let frameSelectionDeadline = 0;
 
             // Zoom-to-fit animation. Set by `fitFileInViewport` when a freshly
             // expanded file is larger than the viewport; cleared once the
@@ -1622,6 +1785,31 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
 
             function applyExpansionToSim() {
                 applyExpansion(layout, useGraphStore.getState().expandedFiles, expandedSizeFor);
+            }
+
+            // Restore expansion for files this (re)build inherited as already
+            // expanded — e.g. an incremental delta keeps the edited file open.
+            // buildFileLayout starts every node collapsed, and syncExpansion's
+            // per-frame early-return (want === current) means nothing would
+            // re-apply the expanded size, so the file would render stuck at
+            // collapsed size until toggled (the "edit collapses my open file" bug).
+            // Applies the size from the store's (fresh, delta-supplied) AST and
+            // snaps width/height straight to it so the file updates IN PLACE with
+            // no collapse / re-open flicker. Runs once, on the first ticker frame.
+            function restoreInheritedExpansion(): void {
+                if (inheritedExpansionRestored) return;
+                inheritedExpansionRestored = true;
+                if (useGraphStore.getState().expandedFiles.size === 0) return;
+                applyExpansionToSim();
+                let snapped = false;
+                for (const n of layout.nodes) {
+                    if (n.targetExpanded) {
+                        n.width = n.targetW;
+                        n.height = n.targetH;
+                        snapped = true;
+                    }
+                }
+                if (snapped) refreshSizeForces(layout);
             }
 
             // Per-Block overlay-rect animation. When the user toggles a
@@ -4467,8 +4655,16 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // draw so it can read visibleById.
                 updateCameraTween();
                 updateZoomFit();
+                // Before the first syncExpansion: re-apply inherited expansion
+                // sizes so a file kept expanded across a rebuild (incremental
+                // delta) doesn't render collapsed.
+                restoreInheritedExpansion();
                 syncExpansion();
                 stepLayout();
+                // After positions/sizes are final this frame: ease the camera to
+                // keep the framed selection centred and fully in view as it
+                // expands and settles.
+                updateSelectionFrame();
                 updateCameraHold(); // after positions update → anchor held without 1-frame lag
                 draw();
                 updateFollow();
@@ -4621,6 +4817,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         fitProjectToViewport();
                         cameraScale = world.scale.x;
                     },
+                    frameFiles: (ids, opts) => frameFiles(ids, opts),
                     pinAll: pinAllFiles,
                     pinVisible: pinVisibleFiles,
                     unpinAll: unpinAllFiles,
@@ -4711,6 +4908,18 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         }
                     },
                 };
+            }
+
+            // A filesystem delta auto-selected changed/added files and asked us
+            // to frame the selection. Now is the first safe point: the rebuild's
+            // positions are restored, the camera-animation state is initialised,
+            // and the ticker is running, so the fit eases from the just-restored
+            // view to the selected files. file-level ids only (the union of all
+            // selected files), so the user sees what just changed in context.
+            if (pendingSelectionFrame) {
+                pendingSelectionFrame = false;
+                const selected = [...useGraphStore.getState().selectionSet];
+                if (selected.length > 0) frameFiles(selected, {animate: true});
             }
 
             // __DEBUG_DRILLDOWN__ (temporary) — drive the real overlay-aware
@@ -4862,6 +5071,9 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     zoomFit = null;
                     cameraTween = null;
                     cameraAnchorHold = null;
+                    // User took the camera; stop tracking the framed selection.
+                    frameSelectionTargets = null;
+                    cameraFramingSelection = false;
                 },
                 // Pivot policy for wheel-zoom, by what the cursor is on:
                 //   * COLLAPSED file → anchor on the icon's centre so the
@@ -5308,9 +5520,16 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // frame: targetExpanded=true forces nt=0, and
                 // step 3's offX recompute zeros the carried offset
                 // since n.x ends up at connX after the first tick.
-                followId = fileId;
-                followStartAt = 0;
-                followAt = null;
+                //
+                // …unless a frameFiles() fit currently owns the camera (e.g.
+                // auto-framing the selection after a filesystem delta): grabbing
+                // the camera here would yank a multi-file fit onto this single
+                // file. The fit's completion releases the guard.
+                if (!cameraFramingSelection) {
+                    followId = fileId;
+                    followStartAt = 0;
+                    followAt = null;
+                }
             }
 
             // Reconcile expandedFiles with (selectionSet × zoom). Called each
@@ -5378,6 +5597,18 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     x: world.x,
                     y: world.y,
                     scale: world.scale.x,
+                };
+                // Snapshot settled connectivity positions (+ pin state) so an
+                // incremental rebuild for the same project restores the view
+                // instead of re-settling from scratch. See seedFromSaved.
+                savedPositions = {
+                    rootPath: project.rootPath,
+                    byId: new Map(
+                        layout.nodes.map((n) => [
+                            n.id,
+                            {x: n.connX, y: n.connY, userPinned: n.userPinned === true},
+                        ]),
+                    ),
                 };
                 layout.simulation.stop();
                 resizeObserver.disconnect();

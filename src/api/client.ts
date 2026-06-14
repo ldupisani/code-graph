@@ -1,6 +1,7 @@
 import type {
   ApiError,
   FileAstResponse,
+  GraphDelta,
   ProjectRequest,
   ProjectResponse,
 } from './types';
@@ -36,24 +37,21 @@ export function getFileAst(projectId: string, fileId: string): Promise<FileAstRe
   return request<FileAstResponse>(url, { method: 'GET' });
 }
 
-export interface WatchEvent {
-  kind: 'changed' | 'added' | 'removed';
-  fileId: string;
-}
-
-// Streams filesystem events for a project via Server-Sent Events. The browser
+// Streams incremental graph deltas for a project via Server-Sent Events: each
+// filesystem change the server detects is re-walked (changed file only) and
+// emitted as a GraphDelta the caller merges into the live graph. The browser
 // reconnects automatically; we just close on cleanup.
-export function subscribeToWatch(
+export function subscribeToDeltas(
   projectId: string,
-  onEvent: (event: WatchEvent) => void,
+  onDelta: (delta: GraphDelta) => void,
   onError?: (e: Event) => void,
 ): () => void {
   const url = `/api/project/${encodeURIComponent(projectId)}/watch`;
   const es = new EventSource(url);
   es.onmessage = (e) => {
     try {
-      const data = JSON.parse(e.data) as WatchEvent;
-      onEvent(data);
+      const data = JSON.parse(e.data) as GraphDelta;
+      onDelta(data);
     } catch {
       // ignore malformed payloads
     }

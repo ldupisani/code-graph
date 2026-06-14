@@ -82,6 +82,42 @@ export interface ApiError {
   error: string;
 }
 
+// Incremental update streamed over the watch SSE channel when a single file
+// changes on disk, replacing the old "re-open the whole project" round-trip.
+// The client merges it into the live graph WITHOUT rebuilding the renderer, so
+// camera, layout positions, selection, and config all survive an edit.
+//
+// Edge replacement is keyed by SOURCE file. Because AST ids are
+// `${fileId}#${seq}` with `seq` reset per file, an edge can only touch the
+// changed file if it ORIGINATES from that file or from a file that imports it
+// (you must import a symbol to call/extend it across files). So the server
+// recomputes edges for exactly `affectedFromFiles = {fileId} ∪ importers(fileId)`
+// and the client drops every existing edge whose source file is in that set
+// before splicing in `imports` / `semanticEdges`. Edges among untouched files
+// are never sent and never disturbed.
+export interface GraphDelta {
+  kind: 'changed' | 'added' | 'removed';
+  // The file the filesystem event fired for (relative-path id).
+  fileId: string;
+  // The file's fresh node (size/lines may have changed). Present for
+  // 'changed' and 'added'; absent for 'removed'.
+  file?: FileNode;
+  // The changed file's freshly-walked AST, shipped inline so the client can
+  // replace its cached AST synchronously and update an EXPANDED file in place
+  // — without dropping it to collapsed size while a separate fetch round-trips.
+  // Present for 'changed' and 'added'; absent for 'removed'.
+  ast?: FileAstResponse;
+  // Source files whose outgoing edges were recomputed and are fully
+  // represented by `imports` + `semanticEdges` below. The client removes all
+  // prior edges originating from any of these files, then adds the new ones.
+  // For 'removed' this also drives dropping edges that pointed INTO the file.
+  affectedFromFiles: string[];
+  // Recomputed import edges originating from `affectedFromFiles`.
+  imports: ImportEdge[];
+  // Recomputed semantic edges originating from `affectedFromFiles`.
+  semanticEdges: SemanticEdge[];
+}
+
 // AST node returned by GET /api/project/:projectId/ast?fileId=...
 // Flat list keyed by stable id (fileId#start-end). The root is the SourceFile
 // itself; its `parentId` is `null`.

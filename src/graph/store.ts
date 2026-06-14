@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { FileAstResponse, ProjectResponse } from '../api/types';
+import type { FileAstResponse, GraphDelta, ProjectResponse } from '../api/types';
 
 // Which edge kinds the renderer should draw. The user toggles these
 // via the EdgeFilterPills HUD; the renderer consults this set each
@@ -84,11 +84,22 @@ export interface GraphStore {
   // travel with layout templates. The renderer reads them from there.
   setProject: (p: ProjectResponse | null) => void;
   refreshProject: (p: ProjectResponse) => void;
+  // Merge an incremental filesystem delta (see GraphDelta) WITHOUT replacing
+  // the whole project: patches only the changed file's node, the edges that
+  // originate from the affected file set, and drops only the stale per-file
+  // AST/selection state. projectId/rootPath are unchanged so the renderer
+  // recognises it as the same project and reconciles in place.
+  applyDelta: (delta: GraphDelta) => void;
   setSelection: (id: string | null) => void;
   // Multi-select: toggle a single id in selectionSet. If id is
   // already selected → remove it (primary clears when it was the
   // removed one). Otherwise → add it and make it the new primary.
   toggleSelection: (id: string) => void;
+  // Additively select ids (no toggling-off): each id is added to the
+  // selection set and the last becomes primary. Used when filesystem deltas
+  // auto-select changed/added files — re-selecting an already-selected file
+  // must keep it selected, which toggleSelection wouldn't.
+  addSelection: (ids: readonly string[]) => void;
   // Plain-click on an AST node — like setSelection, but PRESERVES
   // any currently-selected FILES so a multi-file shift-select
   // survives drilling into one of those files. Replaces the AST
@@ -164,6 +175,91 @@ export const useGraphStore = create<GraphStore>((set) => ({
       expandedAstNodes: new Set(),
       previewedAstNodes: new Set(),
     })),
+  applyDelta: (delta) =>
+    set((s) => {
+      if (!s.project) return s;
+      const affected = new Set(delta.affectedFromFiles);
+      const removedId = delta.kind === 'removed' ? delta.fileId : null;
+
+      // --- Files ---------------------------------------------------------
+      let files = s.project.files;
+      if (removedId) {
+        files = files.filter((f) => f.id !== removedId);
+      } else if (delta.file) {
+        const idx = files.findIndex((f) => f.id === delta.fileId);
+        if (idx >= 0) {
+          files = files.slice();
+          files[idx] = delta.file;
+        } else {
+          files = [...files, delta.file];
+        }
+      }
+
+      // --- Edges ---------------------------------------------------------
+      // Drop every edge that ORIGINATES from an affected file (the server
+      // recomputed those and sent replacements) plus, on removal, any edge
+      // still pointing INTO the gone file. Then splice the new ones in.
+      const edges = s.project.edges
+        .filter((e) => !affected.has(e.fromId) && e.toId !== removedId)
+        .concat(delta.imports);
+      const semanticEdges = s.project.semanticEdges
+        .filter(
+          (e) =>
+            !affected.has(astFileId(e.fromId)) &&
+            (removedId == null || astFileId(e.toId) !== removedId),
+        )
+        .concat(delta.semanticEdges);
+
+      // New object identity (same projectId/rootPath) so React subscribers
+      // refresh; the renderer reconciles in place rather than rebuilding.
+      const project = { ...s.project, files, edges, semanticEdges };
+
+      // --- Per-file state invalidation -----------------------------------
+      // Replace the changed file's cached AST with the fresh one shipped in the
+      // delta (or drop it on removal). Replacing — rather than deleting and
+      // re-fetching — lets an EXPANDED file update its contents in place,
+      // staying expanded at its new size instead of collapsing while a fetch
+      // round-trips.
+      const asts = new Map(s.asts);
+      if (delta.ast) asts.set(delta.fileId, delta.ast);
+      else asts.delete(delta.fileId);
+
+      // Only ids belonging to a REMOVED file are truly stale. We deliberately
+      // KEEP the changed file's AST-node ids (block expansions, previews,
+      // selections): node ids are `fileId#seq` (walk order), so for edits that
+      // don't change the node COUNT they still point at the same nodes and the
+      // user's expanded blocks stay open. An id that no longer matches simply
+      // expands nothing — no crash, self-heals on the next edit/click. Pruning
+      // them all (the old behaviour) made every block collapse on every save.
+      const isStale = (id: string): boolean =>
+        removedId != null && (id === removedId || astFileId(id) === removedId);
+      const pruneSet = (set: ReadonlySet<string>): Set<string> => {
+        const next = new Set<string>();
+        for (const id of set) if (!isStale(id)) next.add(id);
+        return next;
+      };
+
+      const selectionSet = pruneSet(s.selectionSet);
+      const selection = s.selection && !isStale(s.selection) ? s.selection : null;
+      const tracedPath = s.tracedPath?.some(isStale) ? null : s.tracedPath;
+
+      // Keep the changed file EXPANDED (just drop a removed file). Because the
+      // fresh AST is already in `asts` above, the renderer rebuilds its subtree
+      // from new content on the next draw without ever collapsing it. (The
+      // file's stale block-expansion / AST-node selection is pruned below — only
+      // its inner drill-down resets, the file itself stays open.)
+      return {
+        project,
+        asts,
+        selection,
+        selectionSet,
+        expandedFiles: filterToKnownFiles(s.expandedFiles, project),
+        expandedAstNodes: pruneSet(s.expandedAstNodes),
+        previewedAstNodes: pruneSet(s.previewedAstNodes),
+        tracedPath,
+        focusId: s.focusId && isStale(s.focusId) ? null : s.focusId,
+      };
+    }),
   // Plain click: selection becomes JUST this id (or empty when null).
   setSelection: (selection) =>
     set({
@@ -185,6 +281,13 @@ export const useGraphStore = create<GraphStore>((set) => ({
       }
       next.add(id);
       return { selectionSet: next, selection: id };
+    }),
+  addSelection: (ids) =>
+    set((s) => {
+      if (ids.length === 0) return s;
+      const next = new Set(s.selectionSet);
+      for (const id of ids) next.add(id);
+      return { selectionSet: next, selection: ids[ids.length - 1] };
     }),
   selectAstNode: (id) =>
     set((s) => {
@@ -266,6 +369,14 @@ export function isSupportFile(relativePath: string): boolean {
 if (import.meta.env.DEV && typeof window !== 'undefined') {
   (window as unknown as { useGraphStore: typeof useGraphStore }).useGraphStore =
     useGraphStore;
+}
+
+// AST ids are `${fileId}#${seq}`; file ids are '#'-free relative paths, so the
+// last '#' splits an endpoint back to its owning file. Mirrors the same helper
+// on the server (server/project.ts) and in layout.ts.
+function astFileId(astId: string): string {
+  const i = astId.lastIndexOf('#');
+  return i <= 0 ? astId : astId.slice(0, i);
 }
 
 function filterToKnownFiles(

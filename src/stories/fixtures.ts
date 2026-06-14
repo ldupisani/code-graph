@@ -16,6 +16,7 @@ export function mockCameraApi(): CameraApi {
     return {
         zoomBy: fn().mockName("zoomBy"),
         fitView: fn().mockName("fitView"),
+        frameFiles: fn().mockName("frameFiles"),
         pinAll: fn().mockName("pinAll"),
         pinVisible: fn().mockName("pinVisible"),
         unpinAll: fn().mockName("unpinAll"),

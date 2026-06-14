@@ -24,10 +24,18 @@ export function buildSemanticEdges(
   idByNode: Map<Node, string>,
 ): SemanticEdge[] {
   const edges: SemanticEdge[] = [];
-  let seq = 0;
+  // Content-addressed ids (not a running counter): an edge is uniquely keyed
+  // by its endpoints + kind, since fromId is a per-call/-declaration AST node
+  // id. This keeps ids STABLE across incremental re-walks — when applyFileEvent
+  // recomputes a subset of edges, the new ids never collide with the retained
+  // ones, and an unchanged edge keeps the same id across refreshes.
+  const seen = new Set<string>();
   const emit: EmitFn = (kind, fromId, toId, viaImportNodeId) => {
     if (fromId === toId) return; // skip self-loops
-    edges.push({ id: `e${seq++}`, kind, fromId, toId, viaImportNodeId });
+    const id = `${fromId}~${kind}~${toId}`;
+    if (seen.has(id)) return; // collapse exact duplicates
+    seen.add(id);
+    edges.push({ id, kind, fromId, toId, viaImportNodeId });
   };
 
   for (const sf of sourceFiles) {

@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Group, Panel, Separator, usePanelRef } from 'react-resizable-panels';
-import { openProject, subscribeToWatch, type WatchEvent } from './api/client';
+import { openProject, subscribeToDeltas } from './api/client';
 import { useGraphStore } from './graph/store';
-import { PixiCanvas, type CameraApi } from './render/PixiCanvas';
+import { PixiCanvas, requestSelectionFrame, type CameraApi } from './render/PixiCanvas';
 import { ZoomControls } from './ui/ZoomControls';
 import { PinControls } from './ui/PinControls';
 import { SnapshotBar } from './ui/SnapshotBar';
@@ -14,12 +14,21 @@ import { SearchPalette } from './ui/SearchPalette';
 import { EditorPane } from './ui/EditorPane';
 import { FolderPicker } from './ui/FolderPicker';
 import { SettingsPanel } from './ui/settings/SettingsPanel';
-import type { AstNode, FileNode, ProjectResponse } from './api/types';
+import type { AstNode, FileNode, GraphDelta, ProjectResponse } from './api/types';
+
+// Membership equality for two string sets — used to detect whether a delta
+// actually changed the selected-file set (and thus warrants a camera re-frame).
+function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const id of a) if (!b.has(id)) return false;
+  return true;
+}
 
 export function App() {
   const project = useGraphStore((s) => s.project);
   const setProject = useGraphStore((s) => s.setProject);
-  const refreshProject = useGraphStore((s) => s.refreshProject);
+  const applyDelta = useGraphStore((s) => s.applyDelta);
+  const addSelection = useGraphStore((s) => s.addSelection);
 
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -161,38 +170,60 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  // Subscribe to filesystem events for the current project; on any event,
-  // re-run openProject (debounced) and update via refreshProject. Camera +
-  // expansion state are preserved across the swap (see store + PixiCanvas).
+  // Subscribe to incremental graph deltas for the current project. Each
+  // filesystem change streams a GraphDelta (changed file + recomputed edges
+  // only) that we merge in place — no full re-walk, no renderer rebuild, so
+  // camera, layout positions, selection, and config all survive the edit.
   useEffect(() => {
     if (!project) return;
-    let pending: ReturnType<typeof setTimeout> | null = null;
-    const refresh = async (rootPath: string) => {
-      setRefreshing(true);
-      try {
-        const data = await openProject({ path: rootPath });
-        refreshProject(data);
-        console.log(
-          `[code-graph] refreshed: ${data.files.length} files, ${data.edges.length} imports, ${data.semanticEdges.length} semantic`,
-        );
-      } catch (e) {
-        console.error('[code-graph] refresh failed', e);
-      } finally {
-        setRefreshing(false);
+    // Coalesce bursts of deltas (a formatter or `git checkout` can touch many
+    // files at once) into a single flush so the renderer rebuilds once, not
+    // once per file. Each merge preserves view/positions, but back-to-back
+    // rebuilds would still thrash. A short trailing timer keeps single-save
+    // latency low while batching multi-file storms.
+    const buffer: GraphDelta[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    let clearFlash: ReturnType<typeof setTimeout> | null = null;
+    const flush = () => {
+      flushTimer = null;
+      // Snapshot the selected-file set BEFORE merging so we can tell whether the
+      // SET actually changes (a file enters/leaves the selection) vs just an
+      // edit to an already-selected file.
+      const before = new Set(useGraphStore.getState().selectionSet);
+      const touched: string[] = [];
+      for (const d of buffer) {
+        applyDelta(d);
+        if (d.kind !== 'removed') touched.push(d.fileId);
       }
+      buffer.length = 0;
+      // Auto-select files that are newly added/changed (not already selected).
+      const current = useGraphStore.getState().selectionSet;
+      const newlySelected = touched.filter((id) => !current.has(id));
+      if (newlySelected.length > 0) addSelection(newlySelected);
+      // Re-frame the camera ONLY when the set of selected files changed — a file
+      // entered (added/changed-and-not-yet-selected) or left (a selected file was
+      // removed and pruned). Editing an already-selected file leaves the set
+      // unchanged, so the camera stays exactly where the user left it.
+      const after = useGraphStore.getState().selectionSet;
+      if (!sameStringSet(before, after)) requestSelectionFrame();
+      setRefreshing(true);
+      if (clearFlash) clearTimeout(clearFlash);
+      clearFlash = setTimeout(() => setRefreshing(false), 400);
     };
-    const unsub = subscribeToWatch(project.projectId, (event: WatchEvent) => {
-      console.log('[code-graph] fs event', event);
-      if (pending) clearTimeout(pending);
-      pending = setTimeout(() => {
-        void refresh(project.rootPath);
-      }, 300);
+    const unsub = subscribeToDeltas(project.projectId, (delta) => {
+      console.log(
+        `[code-graph] delta ${delta.kind} ${delta.fileId}: ${delta.imports.length} imports, ${delta.semanticEdges.length} semantic`,
+      );
+      buffer.push(delta);
+      if (flushTimer) clearTimeout(flushTimer);
+      flushTimer = setTimeout(flush, 120);
     });
     return () => {
       unsub();
-      if (pending) clearTimeout(pending);
+      if (flushTimer) clearTimeout(flushTimer);
+      if (clearFlash) clearTimeout(clearFlash);
     };
-  }, [project?.projectId, project?.rootPath, refreshProject]);
+  }, [project?.projectId, applyDelta, addSelection]);
 
   return (
     <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column' }}>

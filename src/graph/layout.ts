@@ -1053,3 +1053,90 @@ export function refreshSizeForces(layout: FileLayoutResult): void {
             .strength(0.3),
     );
 }
+
+// A node's settled connectivity position, snapshotted before a rebuild so an
+// incremental graph update (a filesystem delta) can restore the view instead
+// of re-settling from scratch. See seedFromSaved.
+export interface SavedNodePos {
+    x: number;
+    y: number;
+    userPinned: boolean;
+}
+
+// Seed a freshly built layout from a previous run's settled positions so an
+// incremental update keeps the user's view stable. Files that existed before
+// snap back to exactly where they were (and re-pin if they were pinned);
+// brand-new files are placed by placeNewFile near their graph neighbours so
+// they animate in beside related code rather than flying in from the origin.
+// The caller follows this with a COOL reheat (low alpha, few ticks) so settled
+// nodes stay put and only the new arrivals migrate into place.
+export function seedFromSaved(
+    layout: FileLayoutResult,
+    saved: ReadonlyMap<string, SavedNodePos>,
+    project: ProjectResponse,
+): void {
+    const neighbours = buildNeighbourIndex(project);
+    for (const n of layout.nodes) {
+        const p = saved.get(n.id);
+        if (p) {
+            n.x = n.connX = p.x;
+            n.y = n.connY = p.y;
+            n.userPinned = p.userPinned;
+            // Re-pin so a user-held file keeps its exact spot through the update.
+            if (p.userPinned) {
+                n.fx = p.x;
+                n.fy = p.y;
+            }
+        } else {
+            placeNewFile(n, neighbours.get(n.id) ?? [], saved);
+        }
+    }
+}
+
+// File-level adjacency (imports + collapsed semantic edges, undirected) used to
+// place new files near related ones.
+function buildNeighbourIndex(project: ProjectResponse): Map<string, string[]> {
+    const nbr = new Map<string, string[]>();
+    const link = (a: string, b: string): void => {
+        if (a === b) return;
+        (nbr.get(a) ?? nbr.set(a, []).get(a)!).push(b);
+        (nbr.get(b) ?? nbr.set(b, []).get(b)!).push(a);
+    };
+    for (const e of project.edges) link(e.fromId, e.toId);
+    for (const e of project.semanticEdges) link(fileIdOf(e.fromId), fileIdOf(e.toId));
+    return nbr;
+}
+
+// Decide where a brand-new file (no saved position) starts. This is a layout
+// quality choice with real trade-offs, so it's factored out:
+//   * Neighbour-centroid (below): the file appears next to the code it's wired
+//     to, reading as "this belongs here" — but a file with many spread-out
+//     neighbours lands in a crowded middle the reheat must untangle.
+//   * Alternatives worth trying: seed at the nearest single neighbour, at the
+//     file's folder-grid (rigid) slot, or just keep the ring seed and let the
+//     forces decide.
+// Mutates the node's x/y/connX/connY in place. Falls back to the ring seed
+// (already set by buildFileLayout) when no neighbour has a known position.
+function placeNewFile(
+    node: SimFileNode,
+    neighbourIds: readonly string[],
+    saved: ReadonlyMap<string, SavedNodePos>,
+): void {
+    let sx = 0;
+    let sy = 0;
+    let k = 0;
+    for (const id of neighbourIds) {
+        const p = saved.get(id);
+        if (p) {
+            sx += p.x;
+            sy += p.y;
+            k++;
+        }
+    }
+    if (k === 0) return; // no placed neighbour — keep buildFileLayout's ring seed
+    // Deterministic per-file offset so several new files sharing the same
+    // neighbours don't stack on one pixel (no Math.random — keeps tests stable).
+    const jitter = ((node.id.length * 37) % 80) - 40;
+    node.x = node.connX = sx / k + jitter;
+    node.y = node.connY = sy / k + jitter;
+}

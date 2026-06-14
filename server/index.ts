@@ -7,6 +7,7 @@ import type {
 } from '../src/api/types';
 import { extractAst } from './ast-extractor';
 import {
+  applyFileEvent,
   findSourceFile,
   getCachedAst,
   getLoadedProject,
@@ -122,7 +123,24 @@ app.get<{ Params: { projectId: string } }>(
     raw.write(`: connected to ${projectId}\n\n`);
 
     const unsubscribe = loaded.watcher.subscribe((event) => {
-      raw.write(`data: ${JSON.stringify(event)}\n\n`);
+      // Translate the raw filesystem event into an incremental GraphDelta:
+      // re-walk only the changed file, recompute only the edges that can touch
+      // it, and stream that diff. The client merges it without rebuilding the
+      // renderer, so the view/config survive the edit.
+      try {
+        const delta = applyFileEvent(loaded, event);
+        if (delta) {
+          raw.write(`data: ${JSON.stringify(delta)}\n\n`);
+          app.log.info(
+            `delta ${delta.kind} ${delta.fileId}: ${delta.affectedFromFiles.length} src files, ${delta.imports.length} imports, ${delta.semanticEdges.length} semantic`,
+          );
+        }
+      } catch (e) {
+        app.log.warn(
+          { err: e instanceof Error ? e.message : String(e) },
+          `applyFileEvent failed for ${event.fileId}`,
+        );
+      }
     });
 
     const heartbeat = setInterval(() => {

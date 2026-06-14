@@ -35,6 +35,14 @@ let savedCamera: {rootPath: string; x: number; y: number; scale: number} | null 
 // teardown, consumed on the next build for the SAME rootPath.
 let savedPositions: {rootPath: string; byId: Map<string, SavedNodePos>} | null = null;
 
+// Per-expanded-block drag offsets (blockId → world dx/dy from its origin cell),
+// persisted across PixiCanvas rebuilds so a graph update (an incremental delta)
+// doesn't reset blocks the user dragged out of place. Keyed by rootPath like
+// savedCamera/savedPositions. Block ids are `fileId#seq`; offsets for unchanged
+// files restore exactly, the edited file's may drift if its node count shifted
+// (same trade-off as preserving block expansion).
+let savedOverlayOffsets: {rootPath: string; byId: Map<string, {x: number; y: number}>} | null = null;
+
 // Set by App when a filesystem delta auto-selects changed/added files, asking
 // the renderer to frame the whole selection once it has rebuilt. Consumed (and
 // cleared) on the next build — that's the first moment node positions for the
@@ -937,6 +945,12 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // accumulates from there. Cleared when a block collapses.
             const overlayDragOffsets = new Map<string, {x: number; y: number}>();
             let overlayDragBase = {x: 0, y: 0};
+            // Restore block drag offsets carried over from the previous build of
+            // the same project (incremental delta), so a dragged-out block stays
+            // where the user put it across an edit.
+            if (restoringPositions && savedOverlayOffsets && savedOverlayOffsets.rootPath === project.rootPath) {
+                for (const [id, off] of savedOverlayOffsets.byId) overlayDragOffsets.set(id, {...off});
+            }
 
             // When a node is selected the camera eases toward a fixed world
             // point so it lands centered on what the user just clicked, even
@@ -5609,6 +5623,11 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                             {x: n.connX, y: n.connY, userPinned: n.userPinned === true},
                         ]),
                     ),
+                };
+                // Snapshot block drag offsets so the next rebuild can restore them.
+                savedOverlayOffsets = {
+                    rootPath: project.rootPath,
+                    byId: new Map([...overlayDragOffsets].map(([id, o]) => [id, {...o}])),
                 };
                 layout.simulation.stop();
                 resizeObserver.disconnect();

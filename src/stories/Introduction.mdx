@@ -1,0 +1,77 @@
+import {Meta} from "@storybook/addon-docs/blocks";
+
+<Meta title="Introduction" />
+
+# code-graph component sandbox
+
+Stories for the HUD overlays and settings panels — everything that renders
+as React on top of the Pixi canvas. The canvas itself (`PixiCanvas`), the
+Monaco editor pane, and the search palette are intentionally **not** storied:
+they're integration surfaces, covered by the `scripts/visual-test*.mjs`
+Playwright flows instead.
+
+Nothing here talks to the Fastify backend — the `/api` proxy is stripped in
+`.storybook/main.ts`, so a story that tries to fetch will fail loudly.
+
+## Seeding store state
+
+App state lives in three Zustand singletons (`useGraphStore`,
+`useConfigStore`, `useSnapshotStore`), not React context. Stories seed them
+declaratively via `parameters.stores`; the `withStores` decorator
+(`.storybook/decorators.tsx`) resets all three to a deterministic baseline
+before every story, clears their localStorage blobs, then applies your seeds:
+
+```tsx
+export const FocusMode: Story = {
+    parameters: {
+        stores: {
+            graph: {project: miniProject, focusId: "src/App.tsx", focusHops: 2},
+            config: {behavioral: {isolateImports: true}},   // deep-merged via setConfig
+            snapshots: {byProject: {[DEMO_ROOT]: demoSnapshots(3)}},
+        },
+    },
+};
+```
+
+Two gotchas:
+
+- **Story parameters deep-merge over meta parameters.** To *clear* a seed the
+  meta set (e.g. "no project"), override it explicitly (`graph: {project: null}`),
+  don't pass an empty object.
+- **Use explicit ids in fixtures** (see `src/stories/fixtures.ts`). The
+  snapshot store's `add()` uses a module-level counter, so ids minted through
+  it depend on how many stories ran first — poison for screenshot baselines.
+
+Shared fixtures: `mockCameraRef()` (a `CameraApi` of Action-panel spies, for
+components that take the camera ref), `miniProject`, `dogAst`,
+`demoSnapshots(n)`.
+
+The `withCanvasFrame` decorator wraps every story in a dark
+`position: relative` frame standing in for the canvas panel — that's what the
+absolutely-positioned HUD components anchor to. Size it per story with
+`parameters.frame: {width, height}`.
+
+## Visual regression
+
+```sh
+npm run test:vr          # build storybook-static, screenshot every story, diff
+npm run test:vr:update   # regenerate baselines after an intended change
+```
+
+One Playwright test per story (`tests/storybook-vr.spec.ts` walks the built
+`index.json`). Baselines live in `tests/__screenshots__/` and are committed;
+they're rendered with macOS system fonts, so regenerate them in the Playwright
+container when CI lands.
+
+## Adding a story
+
+1. Co-locate `Component.stories.tsx` next to the component (CSF3,
+   `satisfies Meta<typeof Component>`).
+2. Pure components: pass props, use `fn()` from `storybook/test` for
+   callbacks.
+3. Store-coupled components: seed via `parameters.stores` as above.
+4. Run `npm run test:vr:update` and commit the new baselines with the story.
+
+The app's own graph hides `*.stories.tsx` by default — they're classified as
+support files (`isSupportFile`, `src/graph/store.ts`), toggled by the
+"tests" pill.

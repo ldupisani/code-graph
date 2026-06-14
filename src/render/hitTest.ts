@@ -14,7 +14,12 @@ export interface HitRect {
     // text shown at the centre of each cluster). Carries the cluster
     // directory in `id`; `fileId` is unused for this kind. Used by
     // the drag-fork to grab every file under a folder at once.
-    kind: "file" | "ast" | "ast-toggle" | "folder";
+    //
+    // 'ast-preview' marks the eye handle drawn at the top-right of
+    // expanded JSX overlays whose component has stories — clicking it
+    // toggles the live Storybook view (see jsxStoryOverlay.ts). A
+    // click router like 'ast-toggle': never a semantic anchor.
+    kind: "file" | "ast" | "ast-toggle" | "ast-preview" | "folder";
     x: number;
     y: number;
     w: number;

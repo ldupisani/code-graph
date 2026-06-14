@@ -23,14 +23,17 @@ function buildView(st: GraphStore): SnapshotView {
     };
 }
 
-// Save the current view as a NEW snapshot and make it the active one. No-op
+// Save the current view as a NEW snapshot and CLEAR the active marker —
+// the highlight means "the view you're on", which is only meaningful after
+// explicitly jumping to (or overwriting) a saved view; auto-marking a fresh
+// save would go stale the moment the user keeps moving the camera. No-op
 // (returns null) when there's no project or the camera handle isn't ready yet.
 export function captureSnapshot(api: CameraApi | null): string | null {
     const st = useGraphStore.getState();
     if (!st.project || !api) return null;
     const ss = useSnapshotStore.getState();
     const id = ss.add(st.project.rootPath, {view: buildView(st), camera: api.getCamera(), pins: api.getPins()});
-    ss.setActive(st.project.rootPath, id);
+    ss.setActive(st.project.rootPath, null);
     return id;
 }
 

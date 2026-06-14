@@ -10,7 +10,7 @@ import {activeTiers, createTierEngine} from "./tierLayout";
 import {getPattern} from "../graph/patterns/registry";
 import {layoutAst, type TreemapLayout, type TreemapNode} from "../graph/treemap";
 import {buildAstForceLayout, type AstForceLayout, type ContainerForceLayout} from "../graph/astForce";
-import type {FileAstResponse, ProjectResponse} from "../api/types";
+import type {AstNode, FileAstResponse, ProjectResponse} from "../api/types";
 import type {SimFileNode} from "../graph/types";
 import {blendColor, DEFAULT_FILL_ALPHA, depthTint, EXPORT_FILL_ALPHA, EXPORT_FILL_BLEND, EXPORT_FILL_COLOR, hslToHex, liveTheme} from "./theme";
 import {composeModifierPrefix, isBracketKind, isBraceLabelKind, isExpandableKind, isFunctionSignatureKind, isHighLevel, isJsxSignatureKind, isSignificant, KIND_FILL_TINT, KIND_OUTLINE, labelFor, NAME_LIKE_KINDS, splitCallMarker, splitDeclarationKeyword, splitDefaultExportPrefix, splitTypeAnnotation, SYNTAX, syntaxColor, syntaxTokens} from "./astStyle";
@@ -18,6 +18,8 @@ import {findVisibleAnchor, smallestContaining, type HitRect} from "./hitTest";
 import {drawEdges, drawSemanticEdges, emitDashed} from "./edges";
 import {wireCamera} from "./cameraInput";
 import {LabelPool} from "./labelPool";
+import {createStoryOverlayLayer, isStoryFile, storiesForPath, storybookIndexDown, STORY_OVERLAY_MIN_SIDE_PX, type StoryEntry, type StoryOverlayItem} from "./storybookOverlay";
+import {createJsxStoryOverlayLayer, type JsxStoryOverlayItem} from "./jsxStoryOverlay";
 
 // Camera state persisted across PixiCanvas rebuilds (e.g. when a filesystem
 // refresh swaps the project payload). Keyed by rootPath so opening a *different*
@@ -135,6 +137,269 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             const resizeObserver = new ResizeObserver(() => app.resize());
             resizeObserver.observe(container);
 
+            // DOM layer floating live Storybook iframes over expanded
+            // *.stories.* files. Fed per-frame from the ticker (see
+            // updateStoryOverlays); shares the canvas container so its
+            // coordinates are world.x + worldPos·scale directly.
+            // Story frame sizes reported by embedded previews (world px).
+            // Persisted per file for the app's lifetime so a re-expand
+            // starts at the right size instead of the default.
+            const storyMeasuredSizes = new Map<string, {w: number; h: number}>();
+            const storyOverlayLayer = createStoryOverlayLayer(container, {
+                // ✕ on the embed header: drop every selection id that
+                // belongs to this file — expansion follows the selection
+                // (syncExpansion), so the file collapses next frame.
+                onClose: (fileId) => {
+                    const st = useGraphStore.getState();
+                    for (const id of [...st.selectionSet]) {
+                        if (id === fileId || id.startsWith(`${fileId}#`)) {
+                            useGraphStore.getState().toggleSelection(id);
+                        }
+                    }
+                },
+                // The embedded story reported its rendered frame size —
+                // retarget the file's expanded rect to fit the content
+                // (also fires when the user switches story via chips).
+                onMeasure: (fileId, size) => {
+                    const prev = storyMeasuredSizes.get(fileId);
+                    if (prev && Math.abs(prev.w - size.w) < 2 && Math.abs(prev.h - size.h) < 2) return;
+                    storyMeasuredSizes.set(fileId, size);
+                    applyExpansionToSim();
+                },
+            });
+
+            // DOM layer floating live Storybook iframes over expanded
+            // JSX overlays whose eye handle is toggled on (the handle
+            // only exists when the enclosing component HAS stories; the
+            // wireframe mock of the markup lives in the hover tooltip).
+            // Same container/coordinate contract as the story layer;
+            // fed from the ticker right after it (updateJsxStoryOverlays).
+            const jsxStoryLayer = createJsxStoryOverlayLayer(container, {
+                onClose: (nodeId) => useGraphStore.getState().togglePreview(nodeId),
+                // Hoisted — defined with the story-mapping helpers below.
+                getStories: (nodeId) => storiesForJsxNode(nodeId),
+            });
+
+            // Whether an expanded story file shows the live Storybook
+            // EMBED. False — the Storybook dev server is unreachable, or
+            // its index has no stories for this file — falls the file
+            // back to the normal AST visualization, so an expanded story
+            // file is never just an empty rectangle. While the FIRST
+            // index fetch is still in flight we stay optimistic (pending
+            // embed) to avoid an AST flash before the embed appears; the
+            // moment a fetch fails, the fallback kicks in, and the
+            // throttled retry inside storiesForPath restores the embed
+            // when the server comes back.
+            function storyEmbedActive(relativePath: string): boolean {
+                const stories = storiesForPath(relativePath);
+                if (stories === null) return !storybookIndexDown();
+                return stories.length > 0;
+            }
+
+            // Component file -> story files importing it, for the
+            // preview overlay's storybook mode. Import edges are static
+            // per project payload, so build once.
+            const storyFilesByComponentFile = new Map<string, string[]>();
+            for (const e of project.edges) {
+                if (!isStoryFile(e.fromId)) continue;
+                let list = storyFilesByComponentFile.get(e.toId);
+                if (!list) {
+                    list = [];
+                    storyFilesByComponentFile.set(e.toId, list);
+                }
+                list.push(e.fromId);
+            }
+
+            // ---- Component-aware story resolution for the preview overlay ----
+            // A file like settings/fields.tsx exports SEVERAL components and
+            // its stories file has one story per component — a preview on
+            // ColorField's JSX must offer ColorField's stories only, not the
+            // whole file's. The mapping comes from the story FILE's own AST:
+            // a render-style story export mentions the component it renders
+            // (`render: () => <ColorField …/>`), so we match story exports to
+            // the JSX node's enclosing component by name. Args-only CSF
+            // stories (meta.component, no per-story JSX) mention nothing —
+            // for those the file's full story list stays, which is right
+            // (such a file documents a single component).
+
+            // Node labels carry presentation prefixes — "const Foo" on a
+            // VariableStatement, "<Foo />" on JSX — strip down to the bare
+            // identifier before comparing.
+            const cleanTag = (s: string | null | undefined): string => (s ?? "").replace(/^(?:const|let|var)\s+/, "").replace(/[<>/\s…]/g, "");
+            // Storybook derives a story's display name from its export
+            // ("NumberWithSlider" → "Number With Slider"); squashing both
+            // sides recovers the match.
+            const squashName = (s: string): string => s.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+
+            const astLookupCache = new WeakMap<FileAstResponse, Map<string, AstNode[]>>();
+            function astChildren(ast: FileAstResponse): Map<string, AstNode[]> {
+                let children = astLookupCache.get(ast);
+                if (!children) {
+                    children = new Map();
+                    for (const n of ast.nodes) {
+                        if (n.parentId === null) continue;
+                        let l = children.get(n.parentId);
+                        if (!l) children.set(n.parentId, (l = []));
+                        l.push(n);
+                    }
+                    astLookupCache.set(ast, children);
+                }
+                return children;
+            }
+
+            // Nearest enclosing top-level component for an AST node: walk the
+            // parent chain to the first NAMED, capitalized declaration.
+            function enclosingComponentName(fileId: string, nodeId: string): string | null {
+                const ast = useGraphStore.getState().asts.get(fileId);
+                if (!ast) return null;
+                const byId = new Map(ast.nodes.map((n) => [n.id, n]));
+                const DECL = new Set(["FunctionDeclaration", "VariableStatement", "VariableDeclaration", "ClassDeclaration"]);
+                let cur = byId.get(nodeId) ?? null;
+                while (cur) {
+                    const name = cleanTag(cur.name);
+                    if (/^[A-Z]/.test(name) && DECL.has(cur.syntaxKind)) return name;
+                    cur = cur.parentId ? (byId.get(cur.parentId) ?? null) : null;
+                }
+                return null;
+            }
+
+            // One DFS per subtree: every capitalized identifier/JSX tag it
+            // mentions, plus whether it renders any capitalized JSX at all
+            // (= it's a component-specific story, not args-only CSF).
+            function scanSubtree(ast: FileAstResponse, root: AstNode): {mentions: Set<string>; rendersJsx: boolean} {
+                const children = astChildren(ast);
+                const mentions = new Set<string>();
+                let rendersJsx = false;
+                const stack = [root];
+                while (stack.length) {
+                    const n = stack.pop()!;
+                    const name = cleanTag(n.name);
+                    if (n !== root && /^[A-Z]/.test(name)) {
+                        mentions.add(name);
+                        if (n.syntaxKind === "JsxElement" || n.syntaxKind === "JsxSelfClosingElement") rendersJsx = true;
+                    }
+                    const kids = children.get(n.id);
+                    if (kids) for (const k of kids) stack.push(k);
+                }
+                return {mentions, rendersJsx};
+            }
+
+            // Does a story export REACH the target component? Stories often
+            // render a local demo wrapper (`render: () => <NumberDemo/>`,
+            // where NumberDemo renders <NumberField/> further down the same
+            // file), so the mention check follows local declarations
+            // transitively rather than requiring a direct reference.
+            function filterStoriesByComponent(storyAst: FileAstResponse, entries: StoryEntry[], component: string): StoryEntry[] {
+                const DECL = new Set(["FunctionDeclaration", "VariableStatement", "VariableDeclaration", "ClassDeclaration"]);
+                const declByName = new Map<string, AstNode>();
+                const exportsByName = new Map<string, AstNode>();
+                for (const n of storyAst.nodes) {
+                    if (!n.name) continue;
+                    const name = cleanTag(n.name);
+                    if (DECL.has(n.syntaxKind) && /^[A-Z]/.test(name) && !declByName.has(name)) declByName.set(name, n);
+                    if (n.exported) exportsByName.set(squashName(name), n);
+                }
+                const scanCache = new Map<string, {mentions: Set<string>; rendersJsx: boolean}>();
+                const scan = (node: AstNode) => {
+                    let s = scanCache.get(node.id);
+                    if (!s) scanCache.set(node.id, (s = scanSubtree(storyAst, node)));
+                    return s;
+                };
+                const reaches = (start: AstNode): boolean => {
+                    const queue = [start];
+                    const visited = new Set<string>([cleanTag(start.name)]);
+                    while (queue.length) {
+                        const m = scan(queue.shift()!).mentions;
+                        if (m.has(component)) return true;
+                        for (const name of m) {
+                            if (visited.has(name)) continue;
+                            visited.add(name);
+                            const decl = declByName.get(name);
+                            if (decl) queue.push(decl);
+                        }
+                    }
+                    return false;
+                };
+                const matched: StoryEntry[] = [];
+                let anyComponentSpecific = false;
+                for (const e of entries) {
+                    const exp = exportsByName.get(squashName(e.name));
+                    if (!exp) continue;
+                    if (scan(exp).rendersJsx) anyComponentSpecific = true;
+                    if (reaches(exp)) matched.push(e);
+                }
+                if (matched.length > 0) return matched;
+                // Stories here render components, none of them ours → none
+                // belong to this node. No component-specific story at all
+                // (args-only CSF) → can't disambiguate, keep the file's list.
+                return anyComponentSpecific ? [] : entries;
+            }
+
+            // Story-file AST fetches, fire-and-forget (mirrors the fetch half
+            // of expandFileForSelection without expanding anything).
+            const storyAstInFlight = new Set<string>();
+            const storyAstFailed = new Set<string>();
+            function ensureStoryAst(fileId: string): void {
+                if (storyAstInFlight.has(fileId) || storyAstFailed.has(fileId)) return;
+                storyAstInFlight.add(fileId);
+                getFileAst(project.projectId, fileId)
+                    .then((ast) => useGraphStore.getState().setFileAst(fileId, ast))
+                    .catch(() => {
+                        // Unfilterable — the resolver falls back to the
+                        // file's full story list.
+                        storyAstFailed.add(fileId);
+                    })
+                    .finally(() => storyAstInFlight.delete(fileId));
+            }
+
+            // Per-node resolved story list. null = still resolving (the
+            // overlay layer retries per frame); cached once computed with the
+            // index present so the AST scans don't rerun at 60fps.
+            const storyEntriesMemo = new Map<string, StoryEntry[]>();
+            function storiesForJsxNode(nodeId: string): StoryEntry[] | null {
+                const cached = storyEntriesMemo.get(nodeId);
+                if (cached) return cached;
+                const hash = nodeId.lastIndexOf("#");
+                if (hash <= 0) return [];
+                const fileId = nodeId.slice(0, hash);
+                const paths = storyFilesByComponentFile.get(fileId) ?? [];
+                if (paths.length === 0) return [];
+                let indexLoading = false;
+                const collected: {path: string; entries: StoryEntry[]}[] = [];
+                for (const p of paths) {
+                    const s = storiesForPath(p);
+                    if (s === null) indexLoading = true;
+                    else if (s.length > 0) collected.push({path: p, entries: s});
+                }
+                // Index unavailable: [] while down (retry continues via the
+                // throttled fetch — uncached so the chip appears when the
+                // server returns), null while the first fetch is in flight.
+                if (indexLoading) return storybookIndexDown() ? [] : null;
+                const component = enclosingComponentName(fileId, nodeId);
+                const out: StoryEntry[] = [];
+                let astPending = false;
+                for (const {path, entries} of collected) {
+                    if (!component) {
+                        out.push(...entries);
+                        continue;
+                    }
+                    const ast = useGraphStore.getState().asts.get(path);
+                    if (!ast) {
+                        if (storyAstFailed.has(path)) {
+                            out.push(...entries);
+                            continue;
+                        }
+                        ensureStoryAst(path);
+                        astPending = true;
+                        continue;
+                    }
+                    out.push(...filterStoriesByComponent(ast, entries, component));
+                }
+                if (astPending) return null;
+                storyEntriesMemo.set(nodeId, out);
+                return out;
+            }
+
             // cameraScale mirrors world.scale.x; stepLayout reads it each
             // frame to decide the rigid-layout blend (see rigidness()).
             const world = new Container();
@@ -169,6 +434,15 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // entry that the user's manual Block expansions feed into).
                     getAstForce: (id: string) => activeForce(id),
                     getAstTree: (id: string) => activeTree(id),
+                    // Focus/isolate debugging: the BFS neighbourhood the
+                    // dim/hide passes are using this frame.
+                    getLiveFiles: () => {
+                        const lf = computeLiveFiles();
+                        return lf ? [...lf] : null;
+                    },
+                    // This frame's hit rects (world coords) — lets a headless
+                    // test aim a click at e.g. the eye handle precisely.
+                    getHitRects: () => [...hitRects, ...overlayHitRects].map((r) => ({...r})),
                     ensureExpandedLayout,
                     applyExpansionToSim: () => applyExpansionToSim(),
                     getCameraScale: () => world.scale.x,
@@ -446,6 +720,11 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // boundary actually drawn. Pure breathing room — the file's name is
             // drawn outside (above) the boundary, not inside it.
             const FILE_RIM = 10;
+            // Expanded rect for *.stories.* files before the embedded story
+            // has reported its real frame size (it posts one as soon as it
+            // renders — see storyMeasuredSizes). Matches the preview's
+            // default canvas frame, so the common case barely resizes.
+            const STORY_EXPAND_DEFAULT = {w: 900, h: 480};
             // The arrow-function `⇒` glyph is visually smaller than the ƒ / ▷
             // markers at the standard 11px, so it's drawn a touch larger to match.
             const ARROW_GLYPH_SIZE = 14;
@@ -487,9 +766,9 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // the visibleById entry for the Block id, otherwise camera
                 // follow / edge anchoring would resolve to the small 12px
                 // handle rect instead of the full overlay or cell.
-                // 'folder' is the same story: a drag handle, not a
-                // semantic anchor for edges or follow.
-                if (r.kind !== "ast-toggle" && r.kind !== "folder") {
+                // 'folder' and 'ast-preview' are the same story: drag/click
+                // handles, not semantic anchors for edges or follow.
+                if (r.kind !== "ast-toggle" && r.kind !== "ast-preview" && r.kind !== "folder") {
                     visibleById.set(r.id, r);
                 }
             };
@@ -1277,6 +1556,18 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // changes (file-watcher driven re-walk) — Block expansions don't
             // affect the main layout anymore; they spawn separate overlays.
             function ensureExpandedLayout(fileId: string): PerFileLayout | null {
+                // Story files showing the live embed have no AST view —
+                // their expanded interior is the Storybook iframe. Returning
+                // null (even when the AST is in the store, e.g. fetched for
+                // the editor pane) makes edge anchoring and hit-testing treat
+                // them as content-less: an import line anchors at the file's
+                // border instead of the phantom position its import statement
+                // would occupy in an invisible AST layout. Tested on the id
+                // directly (file ids ARE relative paths) — the sim lookup
+                // would shadow-trip on this function's local `layout` binding
+                // below. When the embed ISN'T active (Storybook down / no
+                // stories) the file falls through to the normal AST layout.
+                if (isStoryFile(fileId) && storyEmbedActive(fileId)) return null;
                 const state = useGraphStore.getState();
                 const ast = state.asts.get(fileId);
                 if (!ast) return null;
@@ -1288,6 +1579,17 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             }
 
             function expandedSizeFor(fileId: string): {w: number; h: number} | null {
+                // Story files expand to a rect sized for the Storybook
+                // embed — their interior is the live story iframe, not
+                // the AST, so there's no content layout to measure and
+                // no need to wait for the AST fetch before expanding.
+                // Once the embedded preview reports its real frame size
+                // (storyMeasuredSizes) the rect snaps to the content.
+                const storySim = layout.byId.get(fileId);
+                if (storySim && isStoryFile(storySim.relativePath) && storyEmbedActive(storySim.relativePath)) {
+                    const measured = storyMeasuredSizes.get(fileId);
+                    return measured ? {...measured} : {...STORY_EXPAND_DEFAULT};
+                }
                 const result = ensureExpandedLayout(fileId);
                 if (!result) return null;
                 // Floor the expanded diameter at "collapsed footprint
@@ -1517,6 +1819,11 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         // group into. Otherwise edges between same-cluster but
                         // different-leaf-directory files would still draw.
                         fileToActiveCluster,
+                        // With nothing selected, tint each edge with the
+                        // imported file's hull colour so lines read as
+                        // "feeding into that cluster". Any selection
+                        // switches back to grey + directional colours.
+                        selectionSet.size === 0 ? colourForDirectory : null,
                         cfg.lod,
                         cfg.theme.edgeStyle,
                     );
@@ -1842,26 +2149,66 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     const body = isSelected ? liveTheme.colors.fileSelected : dirColour;
                     const line = isSelected ? liveTheme.colors.fileBorderSelected : cluster ? colourForDirectory(cluster) : liveTheme.colors.fileBorder;
                     const strokeW = Math.min(1, 1 / cameraScale);
-                    worldGfx
-                        .poly([ix, iy, ix + iw - fold, iy, ix + iw, iy + fold, ix + iw, iy + ih, ix, iy + ih])
-                        .fill({color: body, alpha: iconAlpha})
-                        .stroke({color: line, width: strokeW, alpha: iconAlpha});
-                    // The folded corner, slightly distinct so it reads as a page.
-                    worldGfx.poly([ix + iw - fold, iy, ix + iw, iy + fold, ix + iw - fold, iy + fold]).fill({color: line, alpha: 0.6 * iconAlpha});
+                    if (isStoryFile(sim.relativePath)) {
+                        // Story files: an EYE instead of the page — they're
+                        // "views" of a component, and expanding one shows
+                        // the live Storybook render. Almond outline (two
+                        // quadratic arcs) + iris + pupil, fit to the same
+                        // iw×ih footprint the page icon uses.
+                        const eyeHalfW = iw * 0.55;
+                        const eyeHalfH = ih * 0.3;
+                        worldGfx
+                            .moveTo(sim.x - eyeHalfW, sim.y)
+                            .quadraticCurveTo(sim.x, sim.y - eyeHalfH * 2, sim.x + eyeHalfW, sim.y)
+                            .quadraticCurveTo(sim.x, sim.y + eyeHalfH * 2, sim.x - eyeHalfW, sim.y)
+                            .fill({color: body, alpha: iconAlpha})
+                            .stroke({color: line, width: strokeW, alpha: iconAlpha});
+                        worldGfx.circle(sim.x, sim.y, eyeHalfH * 0.8).fill({color: line, alpha: iconAlpha});
+                        worldGfx.circle(sim.x, sim.y, eyeHalfH * 0.36).fill({color: 0x101014, alpha: iconAlpha});
+                    } else {
+                        worldGfx
+                            .poly([ix, iy, ix + iw - fold, iy, ix + iw, iy + fold, ix + iw, iy + ih, ix, iy + ih])
+                            .fill({color: body, alpha: iconAlpha})
+                            .stroke({color: line, width: strokeW, alpha: iconAlpha});
+                        // The folded corner, slightly distinct so it reads as a page.
+                        worldGfx.poly([ix + iw - fold, iy, ix + iw, iy + fold, ix + iw - fold, iy + fold]).fill({color: line, alpha: 0.6 * iconAlpha});
+                    }
                 }
+
+                // Story files expand to a RECTANGLE owned by the DOM
+                // Storybook embed — the panel's own border is the file
+                // boundary, so the canvas draws no circle and no fill
+                // for them, just a selection ring when selected. The
+                // animated rect interpolates icon footprint → expanded
+                // w×h with the same t the circle crossfade uses. With
+                // the embed inactive (Storybook down / no stories) the
+                // file renders like any other: circle + AST contents.
+                const story = isStoryFile(sim.relativePath) && storyEmbedActive(sim.relativePath);
+                const animW = iw + (sim.width - iw) * t;
+                const animH = ih + (sim.height - ih) * t;
 
                 // 2. CIRCLE — drawn whenever t > 0, fading in and growing
                 //    from icon-radius to fullR. At t === 1 this is the
                 //    only thing rendered (icon path above skipped).
                 if (t > 0) {
                     const circleAlpha = t * dimAlpha;
-                    worldGfx.circle(sim.x, sim.y, animatedR).fill({color: liveTheme.colors.fileExpanded, alpha: 0.7 * circleAlpha});
-                    if (isSelected) {
-                        worldGfx.circle(sim.x, sim.y, animatedR).stroke({
-                            color: liveTheme.colors.fileSelected,
-                            width: FILE_RIM / 2,
-                            alpha: circleAlpha,
-                        });
+                    if (story) {
+                        if (isSelected) {
+                            worldGfx.roundRect(sim.x - animW / 2, sim.y - animH / 2, animW, animH, 10).stroke({
+                                color: liveTheme.colors.fileSelected,
+                                width: FILE_RIM / 2,
+                                alpha: circleAlpha,
+                            });
+                        }
+                    } else {
+                        worldGfx.circle(sim.x, sim.y, animatedR).fill({color: liveTheme.colors.fileExpanded, alpha: 0.7 * circleAlpha});
+                        if (isSelected) {
+                            worldGfx.circle(sim.x, sim.y, animatedR).stroke({
+                                color: liveTheme.colors.fileSelected,
+                                width: FILE_RIM / 2,
+                                alpha: circleAlpha,
+                            });
+                        }
                     }
                 }
 
@@ -1876,6 +2223,17 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 //    user still sees a big circle.
                 if (t < 0.5) {
                     pushRect({id: sim.id, fileId: sim.id, kind: "file", x: ix, y: iy, w: iw, h: ih, area: iw * ih});
+                } else if (story) {
+                    pushRect({
+                        id: sim.id,
+                        fileId: sim.id,
+                        kind: "file",
+                        x: sim.x - animW / 2,
+                        y: sim.y - animH / 2,
+                        w: animW,
+                        h: animH,
+                        area: animW * animH,
+                    });
                 } else {
                     const r2 = animatedR;
                     pushRect({
@@ -1894,8 +2252,10 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 //    visible shape. Top of the animated circle is at
                 //    sim.y - animatedR; at t=0 that equals iy, at t=1 it
                 //    equals y, so the label slides smoothly upward as
-                //    the file grows.
-                putName(sim.y - animatedR);
+                //    the file grows. Story files clear the embed's
+                //    floating header bar (screen-fixed ~28px above the
+                //    rect) so the two don't overlap.
+                putName(story ? sim.y - animH / 2 - (t * 34) / cameraScale : sim.y - animatedR);
 
                 // 5. AST contents — only when fully expanded (t === 1
                 //    after the snap-to-target threshold). Drawing them
@@ -1905,7 +2265,13 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 //    The brief pop-in at the end of the transition is
                 //    acceptable because by that point the file's circle
                 //    is already at its final size.
-                if (sim.expanded && t >= 1) {
+                //    Story files with a live embed draw NO AST contents
+                //    — their expanded interior belongs entirely to the
+                //    Storybook embed (storybookOverlay.ts), which also
+                //    means no AST hit rects compete with the pass-through
+                //    clicks there. (`story` already folds in the
+                //    embed-active check, so the AST fallback renders.)
+                if (sim.expanded && t >= 1 && !story) {
                     let tree = activeTree(sim.id);
                     if (!tree) {
                         buildSubtreeLayout(sim.id);
@@ -2177,10 +2543,17 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     area: w * h,
                 });
 
+                // While the Storybook view covers this overlay, skip its
+                // interior children entirely (background + handles stay):
+                // the iframe hides them anyway, and not pushing their
+                // HitRects keeps pass-through clicks from landing on
+                // invisible cells underneath the panel.
+                const previewCovers = useGraphStore.getState().previewedAstNodes.has(blockId);
+
                 // Only render the overlay's children once the lerp has
                 // finished — during the grow they'd be drawn at full layout
                 // positions inside a smaller rect and would visually spill.
-                if (!anim) {
+                if (!anim && !previewCovers) {
                     const kids = overlayTree.childrenByParent.get(blockId);
                     if (kids) {
                         for (const k of kids) {
@@ -2308,6 +2681,51 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         h: handleSize,
                         area: handleSize * handleSize,
                     });
+
+                    // Preview (eye) handle: toggles the live Storybook view
+                    // that covers this overlay (see jsxStoryOverlay.ts).
+                    // Drawn ONLY when the enclosing component actually has
+                    // stories — there's nothing to preview otherwise (the
+                    // wireframe mock lives in the hover tooltip). Sits at
+                    // the overlay's top-RIGHT corner, mirroring the
+                    // collapse handle's top-left, same hover treatment.
+                    // storiesForJsxNode is memoized after first resolution,
+                    // so the per-frame call is a map lookup.
+                    if (
+                        (blockNode.syntaxKind === "JsxElement" || blockNode.syntaxKind === "JsxFragment") &&
+                        (storiesForJsxNode(blockId)?.length ?? 0) > 0
+                    ) {
+                        const px = x + w - handleInset - handleSize;
+                        const previewOn = useGraphStore.getState().previewedAstNodes.has(blockId);
+                        const isEyeHovered = hoveredHit?.kind === "ast-preview" && hoveredHit.id === blockId;
+                        const elw = (isEyeHovered ? 1.6 : 1) / cameraScale;
+                        worldGfx
+                            .rect(px, hy, handleSize, handleSize)
+                            .fill({color: stroke, alpha: previewOn ? 0.55 : isEyeHovered ? 0.5 : 0.25})
+                            .stroke({color: stroke, width: elw, alpha: 1});
+                        // Eye glyph: almond outline + pupil (same idiom as the
+                        // collapsed story-file icon in drawFile).
+                        const ecx = px + handleSize / 2;
+                        const ecy = hy + handleSize / 2;
+                        const eyeHalfW = handleSize * 0.32;
+                        const eyeHalfH = handleSize * 0.17;
+                        worldGfx
+                            .moveTo(ecx - eyeHalfW, ecy)
+                            .quadraticCurveTo(ecx, ecy - eyeHalfH * 2, ecx + eyeHalfW, ecy)
+                            .quadraticCurveTo(ecx, ecy + eyeHalfH * 2, ecx - eyeHalfW, ecy)
+                            .stroke({color: stroke, width: elw, alpha: 1});
+                        worldGfx.circle(ecx, ecy, eyeHalfH * 0.7).fill({color: stroke, alpha: 1});
+                        pushRect({
+                            id: blockId,
+                            fileId,
+                            kind: "ast-preview",
+                            x: px,
+                            y: hy,
+                            w: handleSize,
+                            h: handleSize,
+                            area: handleSize * handleSize,
+                        });
+                    }
                 }
             }
 
@@ -3948,6 +4366,89 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 }
             }
 
+            // Collect this frame's expanded story files and hand their
+            // screen rects (inscribed square of each file's circle) to
+            // the DOM overlay layer. Runs after draw() so it reads the
+            // same frameHiddenFileIds the file pass used — a story file
+            // hidden by the tests filter or isolate mode gets no embed.
+            function updateStoryOverlays(): void {
+                const items: StoryOverlayItem[] = [];
+                const expanded = useGraphStore.getState().expandedFiles;
+                if (expanded.size > 0) {
+                    const s = world.scale.x;
+                    for (const fileId of expanded) {
+                        const sim = layout.byId.get(fileId);
+                        if (!sim || sim.expanded !== true) continue;
+                        if (!isStoryFile(sim.relativePath)) continue;
+                        // Storybook unreachable / no stories: the file is in
+                        // AST-fallback mode this frame — no embed panel. This
+                        // call also drives the index retry that brings the
+                        // embed back when the server returns.
+                        if (!storyEmbedActive(sim.relativePath)) continue;
+                        if (frameHiddenFileIds && frameHiddenFileIds.has(fileId)) continue;
+                        // The embed fills the file's whole expanded rect —
+                        // the panel's own border IS the file boundary.
+                        const wScreen = sim.width * s;
+                        const hScreen = sim.height * s;
+                        if (Math.min(wScreen, hScreen) < STORY_OVERLAY_MIN_SIDE_PX) continue;
+                        items.push({
+                            fileId,
+                            relativePath: sim.relativePath,
+                            x: world.x + (sim.x - sim.width / 2) * s,
+                            y: world.y + (sim.y - sim.height / 2) * s,
+                            w: wScreen,
+                            h: hScreen,
+                            // Layout size pinned to the expansion TARGET so
+                            // mid-animation frames scale instead of reflow.
+                            worldW: sim.targetW > 0 ? sim.targetW : sim.width,
+                            worldH: sim.targetH > 0 ? sim.targetH : sim.height,
+                        });
+                    }
+                }
+                storyOverlayLayer.update(items);
+            }
+
+            // Storybook views on JSX nodes: one item per toggled-on (eye
+            // handle) AND currently-expanded JSX overlay whose component
+            // has stories. The overlay body's HitRect (kind 'ast',
+            // pushed by drawOverlay with the grow-lerped w/h) is this
+            // frame's geometry — reading it instead of tracking anything
+            // new means the panel rides the expand animation, drag
+            // offsets, and LOD culling for free: when the overlay isn't
+            // drawn, the rect is absent and the panel vanishes with it.
+            function updateJsxStoryOverlays(): void {
+                const st = useGraphStore.getState();
+                const items: JsxStoryOverlayItem[] = [];
+                if (st.previewedAstNodes.size > 0) {
+                    const s = world.scale.x;
+                    for (const nodeId of st.previewedAstNodes) {
+                        if (!st.expandedAstNodes.has(nodeId)) continue;
+                        // No stories (eye shouldn't even be drawn — e.g. a
+                        // stale toggle from before a re-walk) → no panel.
+                        if ((storiesForJsxNode(nodeId)?.length ?? 0) === 0) continue;
+                        const r = visibleById.get(nodeId);
+                        if (!r || r.kind !== "ast") continue;
+                        const wScreen = r.w * s;
+                        const hScreen = r.h * s;
+                        if (Math.min(wScreen, hScreen) < STORY_OVERLAY_MIN_SIDE_PX) continue;
+                        // Layout size pinned to the overlay's SETTLED rect
+                        // so mid-grow frames scale instead of reflowing.
+                        const target = getOverlayLayout(nodeId)?.byId.get(nodeId)?.rect;
+                        items.push({
+                            nodeId,
+                            fileId: r.fileId,
+                            x: world.x + r.x * s,
+                            y: world.y + r.y * s,
+                            w: wScreen,
+                            h: hScreen,
+                            worldW: target?.w ?? r.w,
+                            worldH: target?.h ?? r.h,
+                        });
+                    }
+                }
+                jsxStoryLayer.update(items);
+            }
+
             const tickerCb = () => {
                 // Refresh the per-frame config snapshot first so every helper
                 // below reads this frame's (possibly just-edited) config.
@@ -3975,6 +4476,25 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // the view if a layout edit (or a stale restored camera) left
                 // every file off-screen.
                 recoverIfBlank();
+                // DOM story overlays go LAST — after updateFollow /
+                // recoverIfBlank, which mutate the camera AFTER draw().
+                // Pixi renders the stage at the END of the tick with the
+                // final transform, so positioning the DOM any earlier
+                // leaves it one camera-step behind the canvas for the
+                // whole duration of a follow pan (visible as the embed
+                // trailing its panel until the pan settles).
+                //
+                // Contained: an exception escaping the ticker kills the
+                // render loop (frozen/blank canvas), and these two touch
+                // the DOM + a network-fed index — the least battle-tested
+                // soil in the frame. A bad frame here costs one overlay
+                // update, not the app.
+                try {
+                    updateStoryOverlays();
+                    updateJsxStoryOverlays();
+                } catch (err) {
+                    if (import.meta.env.DEV) console.warn("[code-graph] overlay update failed", err);
+                }
             };
             app.ticker.add(tickerCb);
 
@@ -4322,7 +4842,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // but the body is mostly covered by children, so we don't
                     // promise toggleability there with the cursor.
                     let isToggleable = false;
-                    if (target?.kind === "ast-toggle") {
+                    if (target?.kind === "ast-toggle" || target?.kind === "ast-preview") {
                         isToggleable = true;
                     } else if (target?.kind === "ast") {
                         const tree = activeTree(target.fileId);
@@ -4535,6 +5055,14 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     st.setTracedPath(null);
                     followId = null;
                     followAt = null;
+                    return;
+                }
+
+                // Preview (eye) handle: flip the Storybook view for this JSX
+                // overlay. No selection / camera / expansion change — like
+                // 'ast-toggle', it's a pure router.
+                if (target.kind === "ast-preview") {
+                    useGraphStore.getState().togglePreview(target.id);
                     return;
                 }
 
@@ -4860,6 +5388,8 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 labelPool.destroy();
                 directoryLabelPool.destroy();
                 for (const pane of overlayPanes) pane.labels.destroy();
+                storyOverlayLayer.destroy();
+                jsxStoryLayer.destroy();
                 app.ticker.remove(tickerCb);
                 // {removeView:true} rather than `true` so the GLOBAL TexturePool
                 // singleton survives: `true` runs GlobalResourceRegistry.release()

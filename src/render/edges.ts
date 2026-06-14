@@ -7,6 +7,7 @@ import type {TreemapLayout} from "../graph/treemap";
 import {liveTheme} from "./theme";
 import {SYNTAX} from "./astStyle";
 import {findVisibleAnchor, type HitRect} from "./hitTest";
+import {isStoryFile} from "./storybookOverlay";
 
 // Edge-length LOD: maps the on-screen length of an edge segment to an
 // alpha multiplier. Short edges (local intra-cluster plumbing) get
@@ -138,6 +139,13 @@ export function drawEdges(
     // endpoints share a directory, skip the edge so the diagram
     // shows only cross-cluster connections at low zoom.
     fileToDir: ReadonlyMap<string, string>,
+    // When set (the caller passes it only while NOTHING is selected),
+    // edges take the hull colour of the IMPORTED file's folder
+    // grouping — "this line feeds into THAT cluster" — instead of the
+    // uniform grey. With a selection active this is null and the
+    // directional yellow/blue/green colouring below stays the only
+    // signal, with non-selection edges quiet grey behind it.
+    clusterColorOf: ((dir: string) => number) | null,
     // LOD thresholds (intra-dir gate + edge-length alpha ramp).
     lod: LodConfig,
     // How to route each connection line (straight / curved / square).
@@ -169,7 +177,13 @@ export function drawEdges(
             const dirTo = fileToDir.get(edge.toId);
             if (dirFrom != null && dirFrom === dirTo) continue;
         }
-        if (visibleSemanticPairs.has(`${edge.fromId} ${edge.toId}`)) continue;
+        // An EXPANDED story file's link to its component(s) is the
+        // story embed's headline relationship — "this panel renders
+        // THAT file" — so it bypasses everything that would normally
+        // quiet a short local import: the semantic-pair suppression,
+        // the focus-mode dim, and the edge-length muting below.
+        const storyLink = (s.expanded === true && isStoryFile(s.relativePath)) || (t.expanded === true && isStoryFile(t.relativePath));
+        if (!storyLink && visibleSemanticPairs.has(`${edge.fromId} ${edge.toId}`)) continue;
 
         // Source point: import-block center if available, else file center.
         let sx = s.x;
@@ -205,14 +219,16 @@ export function drawEdges(
 
         let edgeAlpha = 0.7;
         const onPath = pathEdgeKeys.has(`${edge.fromId}|${edge.toId}`);
-        if (liveFiles && !onPath && (!liveFiles.has(edge.fromId) || !liveFiles.has(edge.toId))) {
+        if (liveFiles && !onPath && !storyLink && (!liveFiles.has(edge.fromId) || !liveFiles.has(edge.toId))) {
             edgeAlpha *= 0.18;
         }
         // Edge-length LOD: short edges (within-cluster local imports)
         // get progressively muted; long edges (cross-cluster
         // architectural links) stay bright. Path-traced edges always
-        // stay bright — they ARE the user's question.
-        if (!onPath) {
+        // stay bright — they ARE the user's question. Likewise an
+        // expanded story's component links: short and same-directory
+        // by nature, but exactly what the user is looking at.
+        if (!onPath && !storyLink) {
             edgeAlpha *= edgeLengthAlphaMultiplier(sx, sy, tx, ty, cameraScale, lod);
         }
         // Directional colour. If the IMPORTING file (edge.fromId) is
@@ -223,7 +239,15 @@ export function drawEdges(
         // Edges that don't touch any selection keep the default grey.
         const fromSel = selectionSet.has(edge.fromId);
         const toSel = selectionSet.has(edge.toId);
-        const edgeColor = fromSel && toSel ? liveTheme.colors.edgeBidirectional : fromSel ? liveTheme.colors.edgeImporting : toSel ? liveTheme.colors.edgeImported : liveTheme.colors.edge;
+        // No-selection base colour: the imported file's cluster hue
+        // (see clusterColorOf above), falling back to the theme grey
+        // for files outside any grouping.
+        let restColor = liveTheme.colors.edge;
+        if (clusterColorOf) {
+            const targetDir = fileToDir.get(edge.toId);
+            if (targetDir != null) restColor = clusterColorOf(targetDir);
+        }
+        const edgeColor = fromSel && toSel ? liveTheme.colors.edgeBidirectional : fromSel ? liveTheme.colors.edgeImporting : toSel ? liveTheme.colors.edgeImported : restColor;
         traceEdge(gfx, sx, sy, tx, ty, edgeStyle);
         gfx.stroke({
             color: edgeColor,

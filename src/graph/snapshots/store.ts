@@ -62,9 +62,12 @@ export interface Snapshot {
 export interface SnapshotStore {
     // rootPath -> ordered snapshots. The bar renders byProject[currentRootPath].
     byProject: Record<string, Snapshot[]>;
-    // rootPath -> id of the view most recently saved or jumped to. The bar
-    // highlights it ("the view you're on") and the overwrite hotkey targets it.
-    // Persisted so the highlight survives a reload.
+    // rootPath -> id of the view most recently jumped to or overwritten. The
+    // bar highlights it ("the view you're on") and the overwrite hotkey
+    // targets it. Saving a NEW snapshot clears it (see captureSnapshot) —
+    // a fresh save isn't a view you navigated to, and the marker would go
+    // stale as soon as the camera moves on. Persisted so the highlight
+    // survives a reload.
     activeByProject: Record<string, string | null>;
     // Save a NEW snapshot for a project (no name unless given). Returns the id.
     add: (rootPath: string, snap: {view: SnapshotView; camera: Snapshot["camera"]; pins?: Snapshot["pins"]; name?: string}) => string;
@@ -79,10 +82,12 @@ export interface SnapshotStore {
     reorder: (rootPath: string, id: string, dir: -1 | 1) => void;
 }
 
-let seq = 0;
+// Ids must be unique across SESSIONS, not just within one: snapshots persist
+// to localStorage but a module counter resets on reload, so a counter-only id
+// eventually collides with a persisted snapshot — and two chips sharing an id
+// BOTH render as "active". Time + random needs no cross-session coordination.
 function uid(prefix: string): string {
-    seq += 1;
-    return `${prefix}-${seq}-${(seq * 2654435761) % 1000000}`;
+    return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export const useSnapshotStore = create<SnapshotStore>()(
@@ -166,6 +171,22 @@ export const useSnapshotStore = create<SnapshotStore>()(
                 const p = (persisted ?? {}) as Partial<SnapshotStore>;
                 const byProject = p.byProject && typeof p.byProject === "object" ? p.byProject : {};
                 const activeByProject = p.activeByProject && typeof p.activeByProject === "object" ? p.activeByProject : {};
+                // Heal duplicate ids minted by the old counter-based uid()
+                // (the counter reset on reload, so a later session could
+                // re-mint an existing id): the FIRST occurrence keeps the
+                // id — and any active marker pointing at it — later
+                // duplicates get fresh ids.
+                for (const [root, list] of Object.entries(byProject)) {
+                    if (!Array.isArray(list)) continue;
+                    const seen = new Set<string>();
+                    byProject[root] = list.map((snap) => {
+                        if (!seen.has(snap.id)) {
+                            seen.add(snap.id);
+                            return snap;
+                        }
+                        return {...snap, id: uid("snap")};
+                    });
+                }
                 return {...current, byProject, activeByProject};
             },
         },

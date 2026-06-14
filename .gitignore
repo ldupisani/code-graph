@@ -4,3 +4,7 @@ dist
 *.log
 .vite
 .tsbuildinfo
+
+*storybook.log
+storybook-static
+test-results

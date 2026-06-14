@@ -1,4 +1,27 @@
+import { Component, useEffect, type ReactNode } from 'react';
 import { useGraphStore } from '../graph/store';
+import { useSourceStore } from '../graph/sourceStore';
+import { buildJsxPreviewModel, JsxWireframePreview } from '../render/jsxPreview';
+
+// JSX kinds get a structural wireframe preview instead of (above) the
+// plain source-line peek — see src/render/jsxPreview.tsx.
+const JSX_KINDS = new Set(['JsxElement', 'JsxSelfClosingElement', 'JsxFragment']);
+
+// The tooltip hangs off App's React tree, so an exception while
+// rendering a wireframe for arbitrary analyzed JSX would unmount the
+// ENTIRE app (observed: a real <input> instantiated with children —
+// blank page). Contain it: a failed preview falls back to whatever
+// plain-text rendering the caller provides. Keyed by hoveredId at the
+// call site so the next hover gets a fresh try.
+class PreviewBoundary extends Component<{ fallback: ReactNode; children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
 
 // Subscribes to the store's hoveredId + hoveredScreenRect (set by
 // PixiCanvas's onHover callback). Shows a tooltip anchored just below
@@ -8,6 +31,7 @@ import { useGraphStore } from '../graph/store';
 //     collapsed `{…}` cell. Takes priority when present.
 //   * a `signature` (set by signatureOf — function-likes get
 //     `(p: T): R`, typed declarations get `: T`).
+// JSX nodes additionally render a wireframe mock of their markup.
 //
 // The screen rect is captured once at hover-start; the tooltip
 // doesn't track per-frame canvas motion. That's intentional — a
@@ -20,20 +44,35 @@ export function HoverTooltip() {
   const hoveredId = useGraphStore((s) => s.hoveredId);
   const hoveredScreenRect = useGraphStore((s) => s.hoveredScreenRect);
   const asts = useGraphStore((s) => s.asts);
+  const projectId = useGraphStore((s) => s.project?.projectId);
 
-  if (!hoveredId || !hoveredScreenRect) return null;
-
-  // Resolve the AST node from the file's flat node list. The
+  // Resolve the AST node from the file's flat node list BEFORE any
+  // early return — the hooks below must run unconditionally. The
   // hoveredId is either a fileId (no '#') or an AST node id
   // (`${fileId}#${seq}`); files don't carry a signature so we only
   // look up AST nodes.
-  const i = hoveredId.lastIndexOf('#');
-  if (i < 0) return null;
-  const fileId = hoveredId.slice(0, i);
-  const ast = asts.get(fileId);
-  if (!ast) return null;
-  const node = ast.nodes.find((n) => n.id === hoveredId);
-  if (!node || (!node.signature && !node.preview)) return null;
+  const i = hoveredId ? hoveredId.lastIndexOf('#') : -1;
+  const fileId = hoveredId && i >= 0 ? hoveredId.slice(0, i) : null;
+  const ast = fileId ? asts.get(fileId) : undefined;
+  const node = ast ? ast.nodes.find((n) => n.id === hoveredId) : undefined;
+  const isJsx = node != null && JSX_KINDS.has(node.syntaxKind);
+
+  // Raw source unlocks attribute values / expression text in the
+  // wireframe; the preview renders immediately without it and
+  // re-renders (via the store subscription) when the fetch lands.
+  const source = useSourceStore((s) => (fileId ? s.sources.get(fileId) : undefined));
+  const ensure = useSourceStore((s) => s.ensure);
+  useEffect(() => {
+    if (isJsx && projectId && fileId) ensure(projectId, fileId);
+  }, [isJsx, projectId, fileId, ensure]);
+
+  if (!hoveredId || !hoveredScreenRect || !ast || !node) return null;
+  if (!isJsx && !node.signature && !node.preview) return null;
+
+  const jsxModel = isJsx
+    ? buildJsxPreviewModel(ast.nodes, node.id, source, { maxDepth: 4, maxNodes: 60 })
+    : null;
+  if (isJsx && !jsxModel && !node.signature && !node.preview) return null;
 
   // Anchor: just below the rect, left edge aligned. Capped to the
   // viewport so the tooltip doesn't fall off the right edge of the
@@ -80,7 +119,16 @@ export function HoverTooltip() {
         userSelect: 'none',
       }}
     >
-      {node.preview ? (
+      {jsxModel ? (
+        // JSX subtree: the structural wireframe mock IS the preview —
+        // it already shows the whole layout, so no source-line caption.
+        <PreviewBoundary
+          key={hoveredId}
+          fallback={<span style={{ color: '#d4d4d4' }}>{node.preview ?? node.name ?? node.syntaxKind}</span>}
+        >
+          <JsxWireframePreview model={jsxModel} maxWidth={360} maxHeight={260} />
+        </PreviewBoundary>
+      ) : node.preview ? (
         // Expandable block: show its first source line verbatim (server's
         // previewOf already appended "…" when the block spans more lines)
         // so the user can peek inside a collapsed `{…}` cell without drilling.

@@ -30,6 +30,12 @@ export interface GraphStore {
   // and re-collapses. See PixiCanvas.tsx — the layout's
   // `collapseChildren` predicate consults this set.
   expandedAstNodes: ReadonlySet<string>;
+  // AST node IDs (JsxElement / JsxFragment overlays) whose live
+  // Storybook view is toggled on — the eye handle (drawn only when the
+  // enclosing component has stories) flips membership, and the
+  // renderer's jsxStoryOverlay layer covers the node's rect with the
+  // story iframe while the id is here AND the node is expanded.
+  previewedAstNodes: ReadonlySet<string>;
   asts: ReadonlyMap<string, FileAstResponse>;
   edgeFilter: EdgeFilter;
   // Id of the rect under the cursor. React HUD components (e.g.
@@ -94,6 +100,7 @@ export interface GraphStore {
   expandFile: (fileId: string) => void;
   collapseFile: (fileId: string) => void;
   toggleAstNode: (id: string) => void;
+  togglePreview: (id: string) => void;
   setEdgeFilter: (next: Partial<EdgeFilter>) => void;
   setHover: (
     id: string | null,
@@ -113,6 +120,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
   selectionSet: new Set<string>(),
   expandedFiles: new Set<string>(),
   expandedAstNodes: new Set<string>(),
+  previewedAstNodes: new Set<string>(),
   asts: new Map<string, FileAstResponse>(),
   edgeFilter: { ...ALL_EDGES_ON },
   hoveredId: null,
@@ -129,6 +137,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
       selectionSet: new Set(),
       expandedFiles: new Set(),
       expandedAstNodes: new Set(),
+      previewedAstNodes: new Set(),
       asts: new Map(),
       edgeFilter: { ...ALL_EDGES_ON },
       focusId: null,
@@ -153,6 +162,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
       asts: new Map(),
       expandedFiles: filterToKnownFiles(s.expandedFiles, project),
       expandedAstNodes: new Set(),
+      previewedAstNodes: new Set(),
     })),
   // Plain click: selection becomes JUST this id (or empty when null).
   setSelection: (selection) =>
@@ -212,6 +222,13 @@ export const useGraphStore = create<GraphStore>((set) => ({
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return { expandedAstNodes: next };
+    }),
+  togglePreview: (id) =>
+    set((s) => {
+      const next = new Set(s.previewedAstNodes);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return { previewedAstNodes: next };
     }),
   setEdgeFilter: (next) =>
     set((s) => ({ edgeFilter: { ...s.edgeFilter, ...next } })),

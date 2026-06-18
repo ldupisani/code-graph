@@ -21,9 +21,21 @@
 // and is always clickable; "interact" arms the iframe for real mouse
 // work inside the story.
 
-import {storyIframeUrl, type StoryEntry} from "./storybookOverlay";
+import {
+    createControlGroup,
+    createIconHandle,
+    ICON_CODE,
+    ICON_COLLAPSE,
+    ICON_INTERACT,
+    storyIframeUrl,
+    wireDragCollapse,
+    type StoryEntry,
+} from "./storybookOverlay";
 
 const HEADER_H = 24;
+// Top inset (screen px) the story content is pushed down by, leaving a
+// clear strip for the interact/close handles (see storybookOverlay).
+const CONTROL_STRIP_H = 28;
 
 // Story chosen per AST node, surviving collapse/re-expand and layer
 // rebuilds (same idiom as selectedStoryByFile in the story layer).
@@ -52,8 +64,17 @@ export interface JsxStoryOverlayOpts {
     // stories (the caller normally gates items on this, so the layer
     // just keeps its placeholder header).
     getStories: (nodeId: string) => StoryEntry[] | null;
-    // Header ✕ — wired to togglePreview(nodeId) by the caller.
+    // "</>" handle — switch the story back to the code view (the caller
+    // wires this to togglePreview(nodeId)).
     onClose?: (nodeId: string) => void;
+    // Top-left drag|collapse handle, mirroring the code block's: a plain
+    // click collapses the block (onCollapse); a drag repositions it by
+    // feeding SCREEN-px deltas into the same overlay-drag-offset
+    // mechanism the canvas handle uses (so the connector line is free).
+    onCollapse?: (nodeId: string) => void;
+    onDragStart?: (nodeId: string) => boolean;
+    onDragMove?: (nodeId: string, dx: number, dy: number) => void;
+    onDragEnd?: (nodeId: string) => void;
 }
 
 export interface JsxStoryOverlayLayer {
@@ -220,14 +241,35 @@ export function createJsxStoryOverlayLayer(container: HTMLElement, opts: JsxStor
             syncChips();
         }
 
-        const spacer = document.createElement("span");
-        spacer.style.flex = "1";
-        o.header.appendChild(spacer);
+        // Controls as icon handles floating inside the panel's top
+        // corners, instead of text controls in the header above the block:
+        //   top-LEFT  — drag|collapse handle (drag to move, click to
+        //               collapse), mirroring the code block's handle;
+        //   top-RIGHT — "</>" switch-to-code, then interact.
+        const left = createControlGroup("left");
+        const collapse = createIconHandle(ICON_COLLAPSE, "Drag to move · click to collapse");
+        wireDragCollapse(collapse, {
+            onCollapse: () => opts.onCollapse?.(nodeId),
+            onDragStart: () => opts.onDragStart?.(nodeId) ?? false,
+            onDragMove: (dx, dy) => opts.onDragMove?.(nodeId, dx, dy),
+            onDragEnd: () => opts.onDragEnd?.(nodeId),
+        });
+        left.appendChild(collapse);
+        o.frameBox.appendChild(left);
 
-        const interact = chip("interact", "Let the mouse work INSIDE the story (graph pan/zoom won't pass through it while on)");
+        const right = createControlGroup("right");
+        if (opts.onClose) {
+            const code = createIconHandle(ICON_CODE, "Switch to code view");
+            code.onclick = () => opts.onClose?.(nodeId);
+            right.appendChild(code);
+        }
+        const interact = createIconHandle(
+            ICON_INTERACT,
+            "Let the mouse work INSIDE the story (graph pan/zoom won't pass through it while on)",
+        );
         const syncInteract = (): void => {
-            interact.style.background = o.interactive ? "rgba(78, 201, 176, 0.25)" : "rgba(44, 44, 52, 0.9)";
-            interact.style.color = o.interactive ? "#4ec9b0" : "#a8a8b2";
+            interact.style.background = o.interactive ? "rgba(78, 201, 176, 0.22)" : "rgba(20, 20, 26, 0.72)";
+            interact.style.color = o.interactive ? "#4ec9b0" : "#c2c2cc";
         };
         interact.onclick = () => {
             o.interactive = !o.interactive;
@@ -235,22 +277,12 @@ export function createJsxStoryOverlayLayer(container: HTMLElement, opts: JsxStor
             syncInteract();
         };
         syncInteract();
-        o.header.appendChild(interact);
+        right.appendChild(interact);
+        o.frameBox.appendChild(right);
 
-        if (opts.onClose) {
-            const close = chip("✕", "Close this preview");
-            Object.assign(close.style, {
-                borderRadius: "999px",
-                width: "16px",
-                height: "16px",
-                padding: "0",
-                lineHeight: "16px",
-                background: "rgba(70, 40, 44, 0.95)",
-                color: "#f0c8c8",
-            } satisfies Partial<CSSStyleDeclaration>);
-            close.onclick = () => opts.onClose?.(nodeId);
-            o.header.appendChild(close);
-        }
+        // The header now holds only the story chips (when >1 story); with
+        // a single story it's empty, so drop the bar above the panel.
+        o.header.style.display = o.header.childElementCount > 0 ? "flex" : "none";
         // Invalidate cached geometry so this frame's update pass writes
         // the scale transform onto the just-created iframe.
         o.lastX = NaN;
@@ -303,11 +335,14 @@ export function createJsxStoryOverlayLayer(container: HTMLElement, opts: JsxStor
                 o.el.style.width = `${w}px`;
                 o.el.style.height = `${h}px`;
                 if (o.iframe) {
+                    // Reserve a strip at the top for the control handles
+                    // so the story sits below them, not under them.
+                    const availH = Math.max(1, h - CONTROL_STRIP_H);
                     const sx = w / Math.max(1, o.worldW);
-                    const sy = h / Math.max(1, o.worldH);
+                    const sy = availH / Math.max(1, o.worldH);
                     const s = Math.min(sx, sy);
                     const offX = (w - o.worldW * s) / 2;
-                    const offY = (h - o.worldH * s) / 2;
+                    const offY = CONTROL_STRIP_H + (availH - o.worldH * s) / 2;
                     o.iframe.style.transform = `translate(${offX}px, ${offY}px) scale(${s})`;
                     const ratio = Math.min(sx, sy) / Math.max(sx, sy);
                     o.iframe.style.opacity = String(Math.min(1, ratio * ratio * 1.2));

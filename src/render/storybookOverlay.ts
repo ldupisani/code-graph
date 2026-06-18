@@ -40,6 +40,11 @@ export interface StoryEntry {
 const SB_ORIGIN = "http://localhost:6006";
 const INDEX_RETRY_MS = 10_000;
 const HEADER_H = 24;
+// Top inset (screen px) the story content is pushed down by, leaving a
+// clear strip for the interact/close handles so they don't sit over the
+// story. The strip stays part of the pointer-transparent frameBox, so
+// grabbing it still drags the block through to the canvas.
+const CONTROL_STRIP_H = 28;
 // Don't bother below this on-screen size — the story would be a stamp.
 export const STORY_OVERLAY_MIN_SIDE_PX = 90;
 
@@ -80,6 +85,108 @@ export function storiesForPath(relativePath: string): StoryEntry[] | null {
 
 export function storyIframeUrl(storyId: string): string {
     return `${SB_ORIGIN}/iframe.html?viewMode=story&id=${encodeURIComponent(storyId)}`;
+}
+
+// Inline glyphs for the in-panel control handles. stroke=currentColor
+// so the wrapping button's `color` drives them — same thin-outline feel
+// as the Pixi eye handle, kept crisp at any size since they're SVG.
+export const ICON_INTERACT =
+    '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 3 7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/><path d="m13 13 6 6"/></svg>';
+// A minus, matching the app's collapse handle (the ast-toggle handle on
+// expanded blocks is a square with a horizontal minus line).
+export const ICON_COLLAPSE =
+    '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 12h12"/></svg>';
+// "</>" — switch the live story back to the code view.
+export const ICON_CODE =
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 16 4-4-4-4"/><path d="m6 8-4 4 4 4"/><path d="m14.5 4-5 16"/></svg>';
+
+// A small square icon handle that floats INSIDE the story panel's
+// top-right corner — the DOM counterpart of the eye handle drawn on a
+// JSX block (PixiCanvas), replacing the old text controls that sat in
+// the header above the panel.
+export function createIconHandle(svg: string, title: string): HTMLButtonElement {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.title = title;
+    b.innerHTML = svg;
+    Object.assign(b.style, {
+        appearance: "none",
+        border: "0",
+        borderRadius: "6px",
+        width: "20px",
+        height: "20px",
+        padding: "0",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        cursor: "pointer",
+        background: "rgba(20, 20, 26, 0.72)",
+        color: "#c2c2cc",
+        flexShrink: "0",
+    } satisfies Partial<CSSStyleDeclaration>);
+    return b;
+}
+
+// Wires a handle so a DRAG repositions the panel and a plain CLICK
+// collapses it — exactly the dual role of the code block's collapse
+// handle. Deltas are reported in SCREEN px from the gesture start; the
+// caller converts to world space and feeds the same drag-offset
+// mechanism the canvas handle uses (so the connector line back to the
+// origin comes for free). onDragStart returning false vetoes the drag
+// (e.g. the block isn't expanded), leaving the gesture a click.
+export interface DragCollapseHandlers {
+    onDragStart?: () => boolean;
+    onDragMove?: (dx: number, dy: number) => void;
+    onDragEnd?: () => void;
+    onCollapse?: () => void;
+}
+export function wireDragCollapse(handle: HTMLElement, h: DragCollapseHandlers): void {
+    let startX = 0;
+    let startY = 0;
+    let dragging = false;
+    handle.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        startX = e.clientX;
+        startY = e.clientY;
+        dragging = false;
+        handle.setPointerCapture(e.pointerId);
+    });
+    handle.addEventListener("pointermove", (e) => {
+        if (!handle.hasPointerCapture(e.pointerId)) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        if (!dragging && Math.hypot(dx, dy) > 3) dragging = h.onDragStart?.() ?? true;
+        if (dragging) h.onDragMove?.(dx, dy);
+    });
+    const end = (e: PointerEvent): void => {
+        if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
+        if (dragging) h.onDragEnd?.();
+        else h.onCollapse?.();
+        dragging = false;
+    };
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+}
+
+// Holds the icon handles, pinned to a top corner inside the frameBox
+// (which clips and is pointer-transparent; the group opts its pointer
+// events back in). Collapse sits top-LEFT (the app's convention for the
+// collapse handle); interact sits top-RIGHT (where the eye/preview
+// handle lives). The space between stays pointer-transparent so dragging
+// the panel still moves the file through to the canvas.
+export function createControlGroup(side: "left" | "right" = "right"): HTMLDivElement {
+    const g = document.createElement("div");
+    Object.assign(g.style, {
+        position: "absolute",
+        top: "4px",
+        [side]: "4px",
+        display: "flex",
+        gap: "4px",
+        pointerEvents: "auto",
+        zIndex: "2",
+    } satisfies Partial<CSSStyleDeclaration>);
+    return g;
 }
 
 function ensureIndex(): void {
@@ -317,57 +424,35 @@ export function createStoryOverlayLayer(container: HTMLElement, opts: StoryOverl
             o.header.appendChild(chip);
         }
 
-        const spacer = document.createElement("span");
-        spacer.style.flex = "1";
-        o.header.appendChild(spacer);
+        // Controls as icon handles floating inside the panel's top
+        // corners (instead of text controls in the header above the
+        // block): collapse [-] top-LEFT, interact top-RIGHT. The header
+        // now carries only the story chips.
+        if (opts.onClose) {
+            const left = createControlGroup("left");
+            const collapse = createIconHandle(ICON_COLLAPSE, "Collapse this file (or drag the panel to move it)");
+            collapse.onclick = () => opts.onClose?.(fileId);
+            left.appendChild(collapse);
+            o.frameBox.appendChild(left);
+        }
 
-        const interact = document.createElement("button");
-        interact.type = "button";
-        interact.textContent = "interact";
-        interact.title = "Let the mouse work INSIDE the story (graph pan/zoom won't pass through it while on)";
-        Object.assign(interact.style, {
-            appearance: "none",
-            border: "0",
-            borderRadius: "999px",
-            padding: "1px 8px",
-            fontFamily: "inherit",
-            fontSize: "10px",
-            cursor: "pointer",
-            background: "rgba(44, 44, 52, 0.9)",
-            color: "#a8a8b2",
-            flexShrink: "0",
-        } satisfies Partial<CSSStyleDeclaration>);
+        const right = createControlGroup("right");
+        const interact = createIconHandle(
+            ICON_INTERACT,
+            "Let the mouse work INSIDE the story (graph pan/zoom won't pass through it while on)",
+        );
+        const syncInteract = (): void => {
+            interact.style.background = o.interactive ? "rgba(78, 201, 176, 0.22)" : "rgba(20, 20, 26, 0.72)";
+            interact.style.color = o.interactive ? "#4ec9b0" : "#c2c2cc";
+        };
         interact.onclick = () => {
             o.interactive = !o.interactive;
             if (o.iframe) o.iframe.style.pointerEvents = o.interactive ? "auto" : "none";
-            interact.style.background = o.interactive ? "rgba(78, 201, 176, 0.25)" : "rgba(44, 44, 52, 0.9)";
-            interact.style.color = o.interactive ? "#4ec9b0" : "#a8a8b2";
+            syncInteract();
         };
-        o.header.appendChild(interact);
-
-        if (opts.onClose) {
-            const close = document.createElement("button");
-            close.type = "button";
-            close.textContent = "✕";
-            close.title = "Collapse this file (deselects it)";
-            Object.assign(close.style, {
-                appearance: "none",
-                border: "0",
-                borderRadius: "999px",
-                width: "16px",
-                height: "16px",
-                padding: "0",
-                lineHeight: "16px",
-                fontFamily: "inherit",
-                fontSize: "10px",
-                cursor: "pointer",
-                background: "rgba(70, 40, 44, 0.95)",
-                color: "#f0c8c8",
-                flexShrink: "0",
-            } satisfies Partial<CSSStyleDeclaration>);
-            close.onclick = () => opts.onClose?.(fileId);
-            o.header.appendChild(close);
-        }
+        syncInteract();
+        right.appendChild(interact);
+        o.frameBox.appendChild(right);
         syncChips();
         // Invalidate cached geometry so this frame's update pass writes
         // the scale transform onto the just-created iframe even if the
@@ -423,14 +508,15 @@ export function createStoryOverlayLayer(container: HTMLElement, opts: StoryOverl
                     // doesn't match the story's — width and height ease
                     // at the same rate from different starting points.
                     // Scale uniformly to fit, CENTER the scaled story in
-                    // the panel, and fade it up as the aspects converge,
-                    // so the transition reads as a settle rather than
-                    // content stuck misaligned in a corner.
+                    // the panel (below the control strip), and fade it up
+                    // as the aspects converge, so the transition reads as
+                    // a settle rather than content stuck in a corner.
+                    const availH = Math.max(1, h - CONTROL_STRIP_H);
                     const sx = w / Math.max(1, o.worldW);
-                    const sy = h / Math.max(1, o.worldH);
+                    const sy = availH / Math.max(1, o.worldH);
                     const s = Math.min(sx, sy);
                     const offX = (w - o.worldW * s) / 2;
-                    const offY = (h - o.worldH * s) / 2;
+                    const offY = CONTROL_STRIP_H + (availH - o.worldH * s) / 2;
                     o.iframe.style.transform = `translate(${offX}px, ${offY}px) scale(${s})`;
                     const ratio = Math.min(sx, sy) / Math.max(sx, sy);
                     o.iframe.style.opacity = String(Math.min(1, ratio * ratio * 1.2));

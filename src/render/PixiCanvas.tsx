@@ -205,7 +205,24 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // Same container/coordinate contract as the story layer;
             // fed from the ticker right after it (updateJsxStoryOverlays).
             const jsxStoryLayer = createJsxStoryOverlayLayer(container, {
+                // "</>" handle: drop the live story, revealing the code
+                // overlay underneath (the block stays expanded).
                 onClose: (nodeId) => useGraphStore.getState().togglePreview(nodeId),
+                // Top-left handle, dual role like the canvas collapse
+                // handle. Click collapses the block; drag feeds the SAME
+                // overlayDragOffsets the canvas handle drives — converting
+                // the DOM's screen-px delta to world space — so the panel
+                // repositions and the origin connector draws for free.
+                onCollapse: (nodeId) => useGraphStore.getState().toggleAstNode(nodeId),
+                onDragStart: (nodeId) => {
+                    if (!useGraphStore.getState().expandedAstNodes.has(nodeId)) return false;
+                    overlayDragBase = overlayDragOffsets.get(nodeId) ?? {x: 0, y: 0};
+                    return true;
+                },
+                onDragMove: (nodeId, dx, dy) => {
+                    const s = world.scale.x;
+                    overlayDragOffsets.set(nodeId, {x: overlayDragBase.x + dx / s, y: overlayDragBase.y + dy / s});
+                },
                 // Hoisted — defined with the story-mapping helpers below.
                 getStories: (nodeId) => storiesForJsxNode(nodeId),
             });
@@ -3518,8 +3535,12 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // Normally gated on fitting its box on screen; but high-level
                     // constructs (classes/interfaces/exports) keep their label even
                     // when zoomed out past the point it fits, so the structure stays
-                    // readable while lower-level semantics drop out.
-                    (isHighLevel(node) || (wOnScreen >= labelBox.w * labelOnScreenFactor && hOnScreen >= labelBox.h * labelOnScreenFactor))
+                    // readable while lower-level semantics drop out. A template
+                    // expression's `${}` header is the title for the spans still
+                    // visible inside it, so it persists the same way.
+                    (isHighLevel(node) ||
+                        node.syntaxKind === "TemplateExpression" ||
+                        (wOnScreen >= labelBox.w * labelOnScreenFactor && hOnScreen >= labelBox.h * labelOnScreenFactor))
                 ) {
                     const parent = node.parentId ? tree.byId.get(node.parentId) : null;
                     const parentLabel = parent ? labelFor(parent) : null;
@@ -3750,21 +3771,13 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     } else if (followAt === null) {
                         const r = visibleById.get(followId) ?? findVisibleAnchor(followId, visibleById, activeTree);
                         if (!r) return; // not resolvable yet — try again next frame
-                        // Code blocks anchor at their TOP-LEFT, not their centre:
-                        // an expanded Block overlay reads top-down / left-to-right
-                        // (it's a code statement, not a circular node), and the
-                        // overlay can be substantially larger than the viewport.
-                        // Centering its bounds would push the start of the code
-                        // off-screen up-left; anchoring at the top-left puts the
-                        // start of the statement at screen centre so the user can
-                        // read down from there.
-                        const isBlock =
-                            followId.includes("#") &&
-                            useGraphStore
-                                .getState()
-                                .asts.get(fileIdOfAstId(followId))
-                                ?.nodes.find((n) => n.id === followId)?.syntaxKind === "Block";
-                        followAt = isBlock ? {x: r.x, y: r.y} : {x: r.x + r.w / 2, y: r.y + r.h / 2};
+                        // Expanded overlays anchor at their TOP-CENTRE: an
+                        // expanded block reads top-down and can be taller than
+                        // the viewport, so centering its bounds would push the
+                        // start of the content off-screen upward. Putting the
+                        // top edge — horizontally centred — at screen centre
+                        // lets the user read downward from the start.
+                        followAt = {x: r.x + r.w / 2, y: r.y};
                     }
                 }
                 const targetX = app.screen.width / 2 - followAt.x * cameraScale;

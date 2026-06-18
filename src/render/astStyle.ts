@@ -179,6 +179,10 @@ export const NAME_LIKE_KINDS = new Set([
     // name-like so it shows up alongside its parameters even at
     // lower zooms.
     "ArrowFunction",
+    // `${}` is the title for the spans laid out inside a template
+    // literal; like the arrow, it has no name, so keep it name-like so
+    // the header survives the simplified tier alongside its contents.
+    "TemplateExpression",
 ]);
 
 // Kinds shown as a colored outline instead of a text label. They carry no

@@ -830,7 +830,12 @@ function collectAccessChain(
     } else if (
       k === ts.SyntaxKind.Identifier ||
       k === ts.SyntaxKind.ThisKeyword ||
-      k === ts.SyntaxKind.SuperKeyword
+      k === ts.SyntaxKind.SuperKeyword ||
+      // `import.meta` / `new.target` — a single MetaProperty node whose text
+      // already reads as the dotted base, so it's an atomic chain leaf. Without
+      // this, `import.meta.env.DEV` bails out of synthesis and renders as
+      // nested "access" boxes instead of one dotted-path rect.
+      k === ts.SyntaxKind.MetaProperty
     ) {
       reverse.push({ text: cursor.getText(), bracket: false });
       captured.push(cursor);

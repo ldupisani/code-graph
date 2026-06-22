@@ -72,7 +72,11 @@ export interface SemanticEdge {
 export interface ProjectResponse {
   projectId: string;
   rootPath: string;
-  tsConfigPath: string;
+  // Which analyzer produced this graph. Drives the editor's syntax mode and
+  // any language-specific UI affordances.
+  language: 'typescript' | 'python';
+  // The tsconfig used — TypeScript projects only; absent for Python.
+  tsConfigPath?: string;
   files: FileNode[];
   edges: ImportEdge[]; // file-level imports
   semanticEdges: SemanticEdge[]; // AST-level: calls, extends, implements

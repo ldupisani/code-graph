@@ -9,6 +9,17 @@ interface EditorPaneProps {
   project: ProjectResponse;
 }
 
+// Monaco syntax mode from the file extension. Monaco ships Python and
+// TS/JS grammars; anything else falls back to plain text.
+function languageForFile(fileId: string | null): string {
+  if (!fileId) return 'plaintext';
+  if (/\.(py|pyi)$/.test(fileId)) return 'python';
+  if (/\.(ts|mts|cts)$/.test(fileId)) return 'typescript';
+  if (/\.(tsx)$/.test(fileId)) return 'typescript';
+  if (/\.(jsx?|mjs|cjs)$/.test(fileId)) return 'javascript';
+  return 'plaintext';
+}
+
 interface ResolvedSelection {
   fileId: string;
   node: AstNode | null; // null when selection is the file itself
@@ -172,7 +183,7 @@ export function EditorPane({ project }: EditorPaneProps) {
       <div style={{ position: 'absolute', top: 30, bottom: 0, left: 0, right: 0 }}>
         <Editor
           theme="vs-dark"
-          language="typescript"
+          language={languageForFile(activeFileId)}
           value={source}
           onMount={onMount}
           options={{

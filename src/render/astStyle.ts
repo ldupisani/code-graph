@@ -82,6 +82,28 @@ export const SYNTAX_KIND_LABELS: Record<string, string> = {
     // the label (see bakeNamedType), and a destructured one renders as
     // `{…} : Type` via syntaxTokens — so a label-less Parameter needs no
     // stand-in text (it would just read as a noisy "param" wrapper).
+
+    // --- Python (stdlib `ast` node names) ---
+    // Jumps / simple statements with no operands → a plain keyword label.
+    Pass: "pass",
+    Break: "break",
+    Continue: "continue",
+    Global: "global",
+    Nonlocal: "nonlocal",
+    Delete: "del",
+    Lambda: "λ",
+    // Expressions (mirror the TS Call/access/index labels; usually the
+    // synthesized name wins, these are fallbacks).
+    Call: "call",
+    Attribute: "access",
+    Subscript: "index",
+    // Container literals — `{…}` collapsed object/dict, `[]`/`()` for
+    // list/tuple. Like their TS counterparts the label drops when expanded
+    // inline (see BRACE_LABEL_KINDS / BRACKET_KINDS).
+    Dict: "{…}",
+    Set: "{…}",
+    List: "[]",
+    Tuple: "()",
 };
 
 // Names ALWAYS take precedence. Unnamed nodes get a label only if their kind
@@ -183,6 +205,28 @@ export const NAME_LIKE_KINDS = new Set([
     // literal; like the arrow, it has no name, so keep it name-like so
     // the header survives the simplified tier alongside its contents.
     "TemplateExpression",
+    // --- Python control flow / keyword statements (their inline keyword
+    // glyph is the only signal of what the rect IS, so keep it at low zoom). ---
+    "If",
+    "For",
+    "AsyncFor",
+    "While",
+    "With",
+    "AsyncWith",
+    "Try",
+    "ExceptHandler",
+    "Return",
+    "Raise",
+    "Assert",
+    "Pass",
+    "Break",
+    "Continue",
+    "Lambda",
+    "Import",
+    "ImportFrom",
+    "Global",
+    "Nonlocal",
+    "Delete",
 ]);
 
 // Kinds shown as a colored outline instead of a text label. They carry no
@@ -246,6 +290,21 @@ export const KIND_OUTLINE: Record<string, number> = {
     DoStatement: COLORS.astOutlineControl,
     SwitchStatement: COLORS.astOutlineControl,
     TryStatement: COLORS.astOutlineControl,
+    // --- Python ---
+    ClassDef: COLORS.astOutlineAbstract,
+    If: COLORS.astOutlineControl,
+    For: COLORS.astOutlineControl,
+    AsyncFor: COLORS.astOutlineControl,
+    While: COLORS.astOutlineControl,
+    With: COLORS.astOutlineControl,
+    AsyncWith: COLORS.astOutlineControl,
+    Try: COLORS.astOutlineControl,
+    ExceptHandler: COLORS.astOutlineControl,
+    Match: COLORS.astOutlineControl,
+    Dict: COLORS.astOutlineObject,
+    Set: COLORS.astOutlineObject,
+    List: COLORS.astOutlineObject,
+    Tuple: COLORS.astOutlineObject,
 };
 
 // Kinds whose box is stroked as a literal pair of square brackets — solid
@@ -254,7 +313,7 @@ export const KIND_OUTLINE: Record<string, number> = {
 // destructuring (`const [a, b] = …`) AND array literals (`[x, y]`), where the
 // brackets ARE the syntax and a "[]" text label over the band just duplicates
 // them. The stroke colour comes from KIND_OUTLINE above.
-export const BRACKET_KINDS = new Set(["ArrayBindingPattern", "ArrayLiteralExpression"]);
+export const BRACKET_KINDS = new Set(["ArrayBindingPattern", "ArrayLiteralExpression", "List"]);
 export function isBracketKind(kind: string): boolean {
     return BRACKET_KINDS.has(kind);
 }
@@ -274,6 +333,10 @@ export const BRACE_LABEL_KINDS = new Set([
     "TypeLiteral",
     "ArrayLiteralExpression",
     "Block",
+    // Python brace literals — `{…}` drops when expanded inline.
+    "Dict",
+    "Set",
+    "List",
 ]);
 export function isBraceLabelKind(kind: string): boolean {
     return BRACE_LABEL_KINDS.has(kind);
@@ -291,6 +354,9 @@ export const KIND_FILL_TINT: Record<string, {color: number; blend: number}> = {
     // "this brings stuff in" at a glance, replacing the previous
     // explicit "import" header label.
     ImportDeclaration: {color: 0x4a6ac5, blend: 0.35},
+    // Python imports get the same blue wash.
+    Import: {color: 0x4a6ac5, blend: 0.35},
+    ImportFrom: {color: 0x4a6ac5, blend: 0.35},
 };
 
 // A node is "significant" — worth its own box, never collapsed as a
@@ -380,6 +446,13 @@ export const EXPANDABLE_KINDS = new Set([
     // children, and closing tag as their own rects.
     "JsxElement",
     "JsxFragment",
+    // --- Python ---
+    // A class drills into its members (like ClassDeclaration); a dict literal
+    // drills into its entries (like ObjectLiteralExpression). Function bodies
+    // are wrapped in a synthetic `Block` server-side, so they collapse via the
+    // `Block` entry above rather than needing FunctionDef here.
+    "ClassDef",
+    "Dict",
 ]);
 export function isExpandableKind(kind: string): boolean {
     return EXPANDABLE_KINDS.has(kind);
@@ -512,6 +585,24 @@ export const SYNTAX_TEMPLATES: Record<string, SyntaxTemplate> = {
     TemplateSpan: () => [{kw: "$", color: P}, {child: 0}],
     // `[expr] as [Type]` — both operands present (expression 0, type 1).
     AsExpression: () => [{child: 0}, {kw: "as", color: K}, {child: 1}],
+
+    // --- Python control flow / keyword-expressions ---
+    // Bodies are bare statement lists (no Block wrapper for control flow), so
+    // each template references only its header operand(s); the body statements
+    // auto-append below the keyword header. `elif` arrives as a nested `If` in
+    // the parent's orelse, which simply renders as another `if [test]` row.
+    If: () => [{kw: "if", color: C}, {child: 0}],
+    While: () => [{kw: "while", color: C}, {child: 0}],
+    For: () => [{kw: "for", color: C}, {child: 0}, {kw: "in", color: C}, {child: 1}],
+    AsyncFor: () => [{kw: "async for", color: C}, {child: 0}, {kw: "in", color: C}, {child: 1}],
+    With: () => [{kw: "with", color: C}, {child: 0}],
+    AsyncWith: () => [{kw: "async with", color: C}, {child: 0}],
+    Return: () => [{kw: "↩", color: C, size: 22}],
+    Raise: () => [{kw: "raise", color: C}],
+    Assert: () => [{kw: "assert", color: C}, {child: 0}],
+    Await: () => [{kw: "await", color: C}],
+    Yield: () => [{kw: "yield", color: C}],
+    YieldFrom: () => [{kw: "yield from", color: C}],
     // NOTE: function definitions are NOT templated here — they use the
     // two-column functionLayout in treemap.ts (params bracketed on the left,
     // return type + body on the right). See isFunctionSignatureKind below,
@@ -525,7 +616,14 @@ export function hasSyntaxTemplate(kind: string): boolean {
 // Named function-likes rendered with the signature template + a name band. The
 // renderer prepends a keyword-blue `ƒ` marker to the band for these so a
 // function definition is unmistakable. Widen alongside the templates above.
-export const FUNCTION_SIGNATURE_KINDS = new Set(["FunctionDeclaration", "MethodDeclaration", "ArrowFunction"]);
+export const FUNCTION_SIGNATURE_KINDS = new Set([
+    "FunctionDeclaration",
+    "MethodDeclaration",
+    "ArrowFunction",
+    // Python — `def` / `async def` (params bracketed left, body right).
+    "FunctionDef",
+    "AsyncFunctionDef",
+]);
 export function isFunctionSignatureKind(kind: string): boolean {
     return FUNCTION_SIGNATURE_KINDS.has(kind);
 }
@@ -694,6 +792,41 @@ export const SYNTAX_CATEGORY: Record<string, keyof typeof SYNTAX> = {
     TemplateTail: "string",
     NumericLiteral: "number",
     BigIntLiteral: "number",
+
+    // --- Python (stdlib `ast` node names) ---
+    ClassDef: "type",
+    FunctionDef: "func",
+    AsyncFunctionDef: "func",
+    Lambda: "keyword",
+    Call: "func",
+    Attribute: "variable",
+    Subscript: "variable",
+    Name: "variable",
+    alias: "variable",
+    Decorator: "keyword",
+    Import: "keyword",
+    ImportFrom: "keyword",
+    Global: "keyword",
+    Nonlocal: "keyword",
+    Delete: "keyword",
+    If: "control",
+    For: "control",
+    AsyncFor: "control",
+    While: "control",
+    With: "control",
+    AsyncWith: "control",
+    Try: "control",
+    ExceptHandler: "control",
+    Return: "control",
+    Raise: "control",
+    Assert: "control",
+    Pass: "control",
+    Break: "control",
+    Continue: "control",
+    Await: "control",
+    Yield: "control",
+    YieldFrom: "control",
+    Match: "control",
 };
 
 export function syntaxColor(node: {syntaxKind: string; isType?: boolean}): number {
@@ -711,7 +844,7 @@ export function syntaxColor(node: {syntaxKind: string; isType?: boolean}): numbe
 // these keep their text (everything else — calls, ifs, property keys,
 // operands — drops out). Classes/interfaces/enums/type-aliases by kind,
 // plus exported declarations regardless of kind.
-export const HIGH_LEVEL_KINDS = new Set(["ClassDeclaration", "ClassExpression", "InterfaceDeclaration", "EnumDeclaration", "TypeAliasDeclaration"]);
+export const HIGH_LEVEL_KINDS = new Set(["ClassDeclaration", "ClassExpression", "InterfaceDeclaration", "EnumDeclaration", "TypeAliasDeclaration", "ClassDef"]);
 export function isHighLevel(node: {syntaxKind: string; exported?: boolean}): boolean {
     return node.exported === true || HIGH_LEVEL_KINDS.has(node.syntaxKind);
 }

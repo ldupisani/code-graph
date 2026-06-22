@@ -25,7 +25,7 @@ export function FolderPicker({ onSubmit, loading, error, initialPath }: FolderPi
         type="text"
         value={path}
         onChange={(e) => setPath(e.target.value)}
-        placeholder="/absolute/path/to/typescript/project"
+        placeholder="/absolute/path/to/a TypeScript or Python project"
         style={{ flex: 1, minWidth: '24rem' }}
         autoFocus
       />

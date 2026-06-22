@@ -5,10 +5,8 @@ import type {
   ProjectRequest,
   ProjectResponse,
 } from '../src/api/types';
-import { extractAst } from './ast-extractor';
 import {
   applyFileEvent,
-  findSourceFile,
   getCachedAst,
   getLoadedProject,
   openProject,
@@ -64,15 +62,14 @@ app.get<{
   const cached = getCachedAst(loaded, fileId);
   if (cached) return cached;
 
-  // Fallback if a file was added after open (M6 territory).
-  const sf = findSourceFile(loaded, fileId);
-  if (!sf) {
+  // Fallback if a file was added after open.
+  const ast = await loaded.analyzer.extract(fileId);
+  if (!ast) {
     reply.code(404);
     return { error: `Unknown fileId: ${fileId}` };
   }
-  const result = extractAst(sf, fileId);
-  app.log.info(`AST for ${fileId}: ${result.response.nodes.length} nodes (uncached)`);
-  return result.response;
+  app.log.info(`AST for ${fileId}: ${ast.nodes.length} nodes (uncached)`);
+  return ast;
 });
 
 app.get<{
@@ -90,13 +87,13 @@ app.get<{
     reply.code(404);
     return { error: `Unknown projectId: ${projectId}. Re-open the project.` };
   }
-  const sf = findSourceFile(loaded, fileId);
-  if (!sf) {
+  const source = await loaded.analyzer.readSource(fileId);
+  if (source == null) {
     reply.code(404);
     return { error: `Unknown fileId: ${fileId}` };
   }
   reply.type('text/plain; charset=utf-8');
-  return sf.getFullText();
+  return source;
 });
 
 // SSE endpoint that streams filesystem events for a project. Connection is
@@ -127,20 +124,22 @@ app.get<{ Params: { projectId: string } }>(
       // re-walk only the changed file, recompute only the edges that can touch
       // it, and stream that diff. The client merges it without rebuilding the
       // renderer, so the view/config survive the edit.
-      try {
-        const delta = applyFileEvent(loaded, event);
-        if (delta) {
-          raw.write(`data: ${JSON.stringify(delta)}\n\n`);
-          app.log.info(
-            `delta ${delta.kind} ${delta.fileId}: ${delta.affectedFromFiles.length} src files, ${delta.imports.length} imports, ${delta.semanticEdges.length} semantic`,
+      void (async () => {
+        try {
+          const delta = await applyFileEvent(loaded, event);
+          if (delta) {
+            raw.write(`data: ${JSON.stringify(delta)}\n\n`);
+            app.log.info(
+              `delta ${delta.kind} ${delta.fileId}: ${delta.affectedFromFiles.length} src files, ${delta.imports.length} imports, ${delta.semanticEdges.length} semantic`,
+            );
+          }
+        } catch (e) {
+          app.log.warn(
+            { err: e instanceof Error ? e.message : String(e) },
+            `applyFileEvent failed for ${event.fileId}`,
           );
         }
-      } catch (e) {
-        app.log.warn(
-          { err: e instanceof Error ? e.message : String(e) },
-          `applyFileEvent failed for ${event.fileId}`,
-        );
-      }
+      })();
     });
 
     const heartbeat = setInterval(() => {

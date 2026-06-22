@@ -37,6 +37,7 @@ export function mockCameraRef(): {current: CameraApi | null} {
 export const miniProject: ProjectResponse = {
     projectId: "demo",
     rootPath: DEMO_ROOT,
+    language: "typescript",
     tsConfigPath: `${DEMO_ROOT}/tsconfig.json`,
     files: [
         {

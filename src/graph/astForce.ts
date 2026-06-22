@@ -85,7 +85,7 @@ export interface AstForceLayout {
 // Member-container kinds whose direct children get their OWN force
 // layout (rather than the default treemap stacking). Each gets drawn
 // as a circle, like the file circle but smaller.
-const MEMBER_CONTAINER_KINDS = new Set(["ClassDeclaration", "InterfaceDeclaration"]);
+const MEMBER_CONTAINER_KINDS = new Set(["ClassDeclaration", "InterfaceDeclaration", "ClassDef"]);
 
 function isMemberContainer(tn: TreemapNode): boolean {
     return MEMBER_CONTAINER_KINDS.has(tn.syntaxKind);

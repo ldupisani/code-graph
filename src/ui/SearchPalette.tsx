@@ -351,6 +351,10 @@ const INDEXED_KINDS = new Set([
   'GetAccessor',
   'SetAccessor',
   'Constructor',
+  // --- Python ---
+  'ClassDef',
+  'FunctionDef',
+  'AsyncFunctionDef',
 ]);
 
 function shortName(f: FileNode): string {

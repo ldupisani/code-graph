@@ -227,6 +227,10 @@ export const NAME_LIKE_KINDS = new Set([
     "Global",
     "Nonlocal",
     "Delete",
+    // A tuple's `()` label (e.g. a `known, path = …` unpacking target) has no
+    // name, like the arrow glyph — keep it name-like so it survives the
+    // simplified tier instead of vanishing early when zoomed out.
+    "Tuple",
 ]);
 
 // Kinds shown as a colored outline instead of a text label. They carry no

@@ -64,6 +64,20 @@ export interface CameraDeps {
     onOverlayDragStart?: (id: string) => boolean;
     onOverlayDragMove?: (id: string, dx: number, dy: number) => void;
     onOverlayDragEnd?: (id: string) => void;
+    // Selection-group drag. When SHIFT+drag STARTS on a file HitRect, the host
+    // returns the sims of every currently-selected file (plus the grabbed one);
+    // wireCamera then moves them all by the same delta and pins each on release
+    // — reusing the folder-drag fan-out. Returning null/empty falls through to
+    // the marquee. This is what makes a shift+drag on a file move the whole
+    // selected group rather than draw a box.
+    onSelectionDragStart?: (fileId: string) => SimFileNode[] | null;
+    // Marquee (shift+drag on empty space / non-file) protocol. The gesture
+    // becomes a rubber-band selection. `onMarqueeMove` fires every pointermove
+    // with the current box in SCREEN coords (the host draws it); `onMarqueeEnd`
+    // fires on release with the final box (the host selects the files inside it,
+    // additively). No click fires on release.
+    onMarqueeMove?: (rect: {x: number; y: number; w: number; h: number}) => void;
+    onMarqueeEnd?: (rect: {x: number; y: number; w: number; h: number}) => void;
 }
 
 export function wireCamera(deps: CameraDeps): () => void {
@@ -102,10 +116,25 @@ export function wireCamera(deps: CameraDeps): () => void {
     // Overlay-drag state. Non-null = we're moving an expanded block's overlay
     // (its id). The camera-pan branch and the click/collapse branch are skipped.
     let draggingOverlay: string | null = null;
+    // Marquee state. True once a shift+drag crosses the deadzone; the pan /
+    // file-drag / click branches are all skipped. `shiftDown` snapshots the
+    // modifier at pointer-down so the gesture's intent is fixed at its start.
+    let draggingMarquee = false;
+    let shiftDown = false;
+    let marqueeRect = {x: 0, y: 0, w: 0, h: 0};
 
     const screenToWorld = (sx: number, sy: number) => ({
         x: (sx - world.x) / world.scale.x,
         y: (sy - world.y) / world.scale.y,
+    });
+
+    // Normalised box (positive w/h) from the pointer-down origin to the
+    // current screen position.
+    const marqueeFrom = (gx: number, gy: number) => ({
+        x: Math.min(pointerStart.x, gx),
+        y: Math.min(pointerStart.y, gy),
+        w: Math.abs(gx - pointerStart.x),
+        h: Math.abs(gy - pointerStart.y),
     });
 
     const onDown = (e: FederatedPointerEvent) => {
@@ -119,6 +148,8 @@ export function wireCamera(deps: CameraDeps): () => void {
         draggingFile = null;
         draggingFolder = null;
         draggingOverlay = null;
+        draggingMarquee = false;
+        shiftDown = e.shiftKey === true;
         container.style.cursor = "grabbing";
     };
 
@@ -129,6 +160,36 @@ export function wireCamera(deps: CameraDeps): () => void {
             const dy = e.global.y - pointerStart.y;
             movedDistance = Math.max(movedDistance, Math.hypot(dx, dy));
 
+            // Shift+drag is decided before everything else so it wins over the
+            // normal file/folder/overlay/pan paths. Starting on a FILE moves the
+            // whole selected group (and pins it); starting anywhere else draws a
+            // marquee. Engages once past the deadzone.
+            if (
+                movedDistance > DRAG_DEADZONE &&
+                !draggingMarquee &&
+                draggingFile === null &&
+                draggingFolder === null &&
+                draggingOverlay === null &&
+                shiftDown
+            ) {
+                if (pendingTarget?.kind === "file" && deps.onSelectionDragStart) {
+                    const sims = deps.onSelectionDragStart(pendingTarget.fileId);
+                    if (sims && sims.length > 0) {
+                        // Snapshot starts so the move math stays delta-based —
+                        // exactly the folder-drag group path.
+                        draggingFolder = sims.map((sim) => ({sim, startX: sim.x, startY: sim.y}));
+                        onUserCameraMove();
+                        pendingTarget = null;
+                    }
+                }
+                if (!draggingFolder && deps.onMarqueeEnd) {
+                    draggingMarquee = true;
+                    pendingTarget = null; // no click/collapse on release
+                    onUserCameraMove();
+                    container.style.cursor = "crosshair";
+                }
+            }
+
             // Past the deadzone for the first time: decide what kind
             // of drag this is. If the pointer-down landed on a FILE
             // or FOLDER HitRect and the host accepts the drag-start
@@ -137,6 +198,7 @@ export function wireCamera(deps: CameraDeps): () => void {
             // path).
             if (
                 movedDistance > DRAG_DEADZONE &&
+                !draggingMarquee &&
                 draggingFile === null &&
                 draggingFolder === null &&
                 draggingOverlay === null &&
@@ -186,7 +248,10 @@ export function wireCamera(deps: CameraDeps): () => void {
                 }
             }
 
-            if (draggingOverlay) {
+            if (draggingMarquee) {
+                marqueeRect = marqueeFrom(e.global.x, e.global.y);
+                deps.onMarqueeMove?.(marqueeRect);
+            } else if (draggingOverlay) {
                 // Move the overlay by the cumulative world-space delta from the
                 // grab point; the host adds it to the overlay's origin.
                 const w = screenToWorld(e.global.x, e.global.y);
@@ -229,7 +294,12 @@ export function wireCamera(deps: CameraDeps): () => void {
     };
 
     const onUp = () => {
-        if (draggingOverlay) {
+        if (draggingMarquee) {
+            // Commit the rubber-band selection (host adds the files inside the
+            // box). No click fires — this was a selection gesture, not a click.
+            deps.onMarqueeEnd?.(marqueeRect);
+            draggingMarquee = false;
+        } else if (draggingOverlay) {
             // Overlay-drag end: the overlay keeps its new offset; no click, so
             // the close handle isn't triggered (a plain click still collapses).
             deps.onOverlayDragEnd?.(draggingOverlay);

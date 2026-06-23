@@ -451,6 +451,13 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // frame to decide the rigid-layout blend (see rigidness()).
             const world = new Container();
             app.stage.addChild(world);
+            // Screen-space overlay for the shift+drag marquee box. NOT a child
+            // of `world`, so it's drawn in raw screen coords (no pan/zoom
+            // transform) and sits above everything. eventMode 'none' so it
+            // never intercepts the stage's pointer events.
+            const marqueeGfx = new Graphics();
+            marqueeGfx.eventMode = "none";
+            app.stage.addChild(marqueeGfx);
             let cameraScale = world.scale.x;
             // The zoom the auto-fit chose at project open. The rigid ↔
             // connectivity transition band is positioned relative to this
@@ -5089,6 +5096,36 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     }
                     container.style.cursor = isToggleable ? "pointer" : "grab";
                 },
+                // Shift+drag marquee: draw the box live (screen space), then on
+                // release ADD every file whose rect intersects it to the
+                // selection — same additive semantics as shift-clicking each.
+                onMarqueeMove: (rect) => {
+                    marqueeGfx.clear();
+                    if (rect.w < 1 && rect.h < 1) return;
+                    marqueeGfx
+                        .rect(rect.x, rect.y, rect.w, rect.h)
+                        .fill({color: liveTheme.colors.fileSelected, alpha: 0.12})
+                        .stroke({color: liveTheme.colors.fileSelected, width: 1, alpha: 0.9});
+                },
+                onMarqueeEnd: (rect) => {
+                    marqueeGfx.clear();
+                    // Marquee box (screen) → world AABB via the inverse camera
+                    // transform on opposite corners.
+                    const s = world.scale.x;
+                    const minX = (rect.x - world.x) / s;
+                    const minY = (rect.y - world.y) / s;
+                    const maxX = (rect.x + rect.w - world.x) / s;
+                    const maxY = (rect.y + rect.h - world.y) / s;
+                    const ids: string[] = [];
+                    for (const r of visibleById.values()) {
+                        if (r.kind !== "file") continue;
+                        // AABB overlap (file rect vs marquee, world space).
+                        if (r.x + r.w >= minX && r.x <= maxX && r.y + r.h >= minY && r.y <= maxY) {
+                            ids.push(r.id);
+                        }
+                    }
+                    if (ids.length > 0) useGraphStore.getState().addSelection(ids);
+                },
                 onUserCameraMove: () => {
                     followId = null;
                     followAt = null;
@@ -5214,6 +5251,26 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         if (clusterDirOf(n.relativePath, depth) === folderId) {
                             sims.push(n);
                         }
+                    }
+                    if (sims.length === 0) return null;
+                    userDragActive = true;
+                    return sims;
+                },
+                // Shift+drag starting on a file: move the whole SELECTED group.
+                // The set is every selected file (selectionSet entries without a
+                // `#` are file ids) plus the grabbed file, so grabbing any file
+                // drags it together with the current selection. Reuses the
+                // folder-drag fan-out, so each lands userPinned on release.
+                onSelectionDragStart: (fileId) => {
+                    const ids = new Set<string>();
+                    for (const id of useGraphStore.getState().selectionSet) {
+                        if (!id.includes("#")) ids.add(id);
+                    }
+                    ids.add(fileId);
+                    const sims: SimFileNode[] = [];
+                    for (const id of ids) {
+                        const sim = layout.byId.get(id);
+                        if (sim) sims.push(sim);
                     }
                     if (sims.length === 0) return null;
                     userDragActive = true;

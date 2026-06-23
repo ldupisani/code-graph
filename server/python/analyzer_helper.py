@@ -19,8 +19,13 @@ Invariants shared with the TS side:
 import ast
 import json
 import os
+import re
+import select
+import subprocess
 import sys
 import traceback
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 try:
     import jedi
@@ -533,6 +538,169 @@ def build_file_node(file_id, abs_path, source):
     }
 
 
+# --- pyright LSP client --------------------------------------------------
+
+
+def _uri(abs_path):
+    return Path(abs_path).as_uri()
+
+
+def _path_from_uri(uri):
+    return unquote(urlparse(uri).path)
+
+
+class PyrightClient:
+    """A minimal synchronous LSP client driving pyright's language server for
+    high-precision goto-definition. Speaks JSON-RPC with Content-Length framing
+    over the server's stdio. Single-threaded: each request reads messages until
+    its response arrives, replying to any server→client request so the server
+    never blocks. Any failure raises so the caller can fall back to Jedi."""
+
+    def __init__(self, argv, root):
+        # bufsize=0 → raw FileIO streams, so select() on stdout never misses
+        # bytes sitting in a Python-side buffer (a classic select+BufferedReader
+        # deadlock on larger payloads).
+        self.proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        self.next_id = 1
+        self.root = root
+        self._buf = b""
+        self._initialize()
+
+    def _send(self, msg):
+        data = json.dumps(msg).encode("utf-8")
+        header = f"Content-Length: {len(data)}\r\n\r\n".encode("ascii")
+        self.proc.stdin.write(header + data)
+        self.proc.stdin.flush()
+
+    def _read_message(self, timeout):
+        """Read one framed JSON message, or None on timeout / EOF."""
+        out = self.proc.stdout
+        while b"\r\n\r\n" not in self._buf:
+            if timeout is not None:
+                r, _, _ = select.select([out], [], [], timeout)
+                if not r:
+                    return None
+            chunk = out.read1(65536) if hasattr(out, "read1") else out.read(65536)
+            if not chunk:
+                return None
+            self._buf += chunk
+        head, _, rest = self._buf.partition(b"\r\n\r\n")
+        m = re.search(rb"Content-Length:\s*(\d+)", head, re.I)
+        if not m:
+            self._buf = rest
+            return None
+        length = int(m.group(1))
+        while len(rest) < length:
+            if timeout is not None:
+                r, _, _ = select.select([out], [], [], timeout)
+                if not r:
+                    self._buf = rest
+                    return None
+            chunk = out.read1(65536) if hasattr(out, "read1") else out.read(65536)
+            if not chunk:
+                return None
+            rest += chunk
+        body, self._buf = rest[:length], rest[length:]
+        try:
+            return json.loads(body.decode("utf-8"))
+        except Exception:
+            return None
+
+    def _request(self, method, params, timeout=15.0):
+        rid = self.next_id
+        self.next_id += 1
+        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        while True:
+            msg = self._read_message(timeout)
+            if msg is None:
+                raise RuntimeError(f"pyright request '{method}' timed out / EOF")
+            # Server→client request: answer so the server doesn't block.
+            if "id" in msg and "method" in msg:
+                if msg["method"] == "workspace/configuration":
+                    items = (msg.get("params") or {}).get("items", [])
+                    result = [{} for _ in items]
+                else:
+                    result = None
+                self._send({"jsonrpc": "2.0", "id": msg["id"], "result": result})
+                continue
+            if "id" in msg and msg.get("id") == rid:
+                if "error" in msg:
+                    raise RuntimeError(f"pyright error: {msg['error']}")
+                return msg.get("result")
+            # Notification or unrelated response — ignore.
+
+    def _notify(self, method, params):
+        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _initialize(self):
+        self._request(
+            "initialize",
+            {
+                "processId": os.getpid(),
+                "rootUri": _uri(self.root),
+                "workspaceFolders": [{"uri": _uri(self.root), "name": "root"}],
+                # Minimal capabilities — deliberately NOT advertising
+                # configuration/dynamic registration so pyright doesn't fire
+                # server→client requests we'd have to fully service.
+                "capabilities": {
+                    "textDocument": {
+                        "definition": {"linkSupport": True},
+                    },
+                    "workspace": {},
+                },
+            },
+            timeout=30.0,
+        )
+        self._notify("initialized", {})
+
+    def did_open(self, abs_path, source):
+        self._notify(
+            "textDocument/didOpen",
+            {"textDocument": {"uri": _uri(abs_path), "languageId": "python", "version": 1, "text": source}},
+        )
+
+    def did_close(self, abs_path):
+        self._notify("textDocument/didClose", {"textDocument": {"uri": _uri(abs_path)}})
+
+    def definition(self, abs_path, line0, char0):
+        """Return [(abs_path, line0, char0)] definition locations for a position."""
+        result = self._request(
+            "textDocument/definition",
+            {"textDocument": {"uri": _uri(abs_path)}, "position": {"line": line0, "character": char0}},
+            timeout=15.0,
+        )
+        if not result:
+            return []
+        items = result if isinstance(result, list) else [result]
+        out = []
+        for it in items:
+            if "targetUri" in it:  # LocationLink
+                uri = it.get("targetUri")
+                rng = it.get("targetSelectionRange") or it.get("targetRange")
+            else:  # Location
+                uri = it.get("uri")
+                rng = it.get("range")
+            if uri and rng:
+                out.append((_path_from_uri(uri), rng["start"]["line"], rng["start"]["character"]))
+        return out
+
+    def close(self):
+        try:
+            self._notify("exit", None)
+        except Exception:
+            pass
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+
+
 # --- the analyzer state machine ------------------------------------------
 
 
@@ -542,6 +710,7 @@ class Analyzer:
         self.files = {}  # fileId -> FileData
         self.module_to_file = {}  # module name -> fileId
         self.jedi_project = None
+        self.pyright = None  # PyrightClient | None — precision resolver
 
     # ---- discovery + parse ----
 
@@ -588,6 +757,16 @@ class Analyzer:
             except Exception as e:
                 log(f"jedi project init failed: {e}")
                 self.jedi_project = None
+        # Bring up pyright (precision resolver) if the Node side handed us an
+        # argv for its language server. Any failure → stay Jedi-only.
+        argv = msg.get("pyright")
+        if argv:
+            try:
+                self.pyright = PyrightClient(argv, self.root)
+                log("pyright resolver active")
+            except Exception as e:
+                log(f"pyright init failed, falling back to jedi: {e}")
+                self.pyright = None
         for abs_path in self.discover():
             self.parse_file(abs_path)
         files = [fd.file_node for fd in self.files.values()]
@@ -716,7 +895,8 @@ class Analyzer:
         return edges
 
     def build_semantic_edges(self, from_ids):
-        if jedi is None:
+        # Need at least one resolver.
+        if self.pyright is None and jedi is None:
             return []
         edges = []
         seen = set()
@@ -737,52 +917,108 @@ class Analyzer:
             fd = self.files.get(fid)
             if not fd or isinstance(fd, _StubFile):
                 continue
+            # Jedi script (used for the import-alias `via` routing and as the
+            # per-query target fallback when pyright can't resolve).
+            script = None
+            if jedi is not None:
+                try:
+                    script = jedi.Script(
+                        code=fd.source, path=fd.abs_path, project=self.jedi_project
+                    )
+                except Exception as e:
+                    log(f"jedi script failed {fid}: {e}")
+            # Open the document in pyright so definition queries bind it.
+            opened = False
+            if self.pyright is not None:
+                try:
+                    self.pyright.did_open(fd.abs_path, fd.source)
+                    opened = True
+                except Exception as e:
+                    log(f"pyright did_open failed {fid}, disabling: {e}")
+                    self.pyright = None
             try:
-                script = jedi.Script(
-                    code=fd.source, path=fd.abs_path, project=self.jedi_project
-                )
-            except Exception as e:
-                log(f"jedi script failed {fid}: {e}")
-                continue
-            for call in fd.call_sites:
-                target, via = self.resolve(script, fid, call["line"], call["col"])
-                if target:
-                    emit("calls", call["astId"], target, via)
-            for base in fd.class_bases:
-                target, via = self.resolve(script, fid, base["line"], base["col"])
-                if target:
-                    emit("extends", base["astId"], target, via)
+                for call in fd.call_sites:
+                    target, via = self.resolve(fd, script, call["line"], call["col"])
+                    if target:
+                        emit("calls", call["astId"], target, via)
+                for base in fd.class_bases:
+                    target, via = self.resolve(fd, script, base["line"], base["col"])
+                    if target:
+                        emit("extends", base["astId"], target, via)
+            finally:
+                if opened and self.pyright is not None:
+                    try:
+                        self.pyright.did_close(fd.abs_path)
+                    except Exception:
+                        pass
         return edges
 
-    def resolve(self, script, this_file, line, col):
-        """Return (targetAstId, viaImportNodeId) for a name at (line, col)."""
+    def resolve(self, fd, script, line, col):
+        """Return (targetAstId, viaImportNodeId) for a name at (line, col).
+
+        Target resolution prefers pyright (a real type checker) and falls back
+        to Jedi per-query; the `via` (local import-alias routing) stays on Jedi,
+        which exposes the pre-import-follow binding directly."""
         target = None
-        via = None
-        try:
-            for d in script.goto(line, col + 1, follow_imports=True):
-                tid = self.def_to_id(d)
-                if tid:
-                    target = tid
-                    break
-        except Exception:
-            return None, None
+
+        if self.pyright is not None:
+            try:
+                for path, l0, c0 in self.pyright.definition(fd.abs_path, line - 1, col):
+                    tid = self.loc_to_id(path, l0, c0)
+                    if tid:
+                        target = tid
+                        break
+            except Exception as e:
+                log(f"pyright definition failed, disabling: {e}")
+                self.pyright = None
+
+        if target is None and script is not None:
+            try:
+                for d in script.goto(line, col + 1, follow_imports=True):
+                    tid = self.def_to_id(d)
+                    if tid:
+                        target = tid
+                        break
+            except Exception:
+                pass
+
         if target is None:
             return None, None
+
         # Local binding (pre-import-follow): if it lands on an import alias in
-        # THIS file, route the connector through it.
-        try:
-            for d in script.goto(line, col + 1, follow_imports=False):
-                mp = getattr(d, "module_path", None)
-                if mp and self.path_to_file_id(str(mp)) == this_file:
-                    fd = self.files.get(this_file)
-                    if fd and not isinstance(fd, _StubFile):
+        # THIS file, route the connector through it. Jedi only.
+        via = None
+        if script is not None:
+            try:
+                for d in script.goto(line, col + 1, follow_imports=False):
+                    mp = getattr(d, "module_path", None)
+                    if mp and self.path_to_file_id(str(mp)) == fd.file_id:
                         aid = fd.alias_index.get((d.line, d.name))
                         if aid:
                             via = aid
                             break
-        except Exception:
-            pass
+            except Exception:
+                pass
         return target, via
+
+    # Map a pyright/jedi definition LOCATION (file path + 0-based line/char of
+    # the name) back to an emitted AST id, by reading the identifier at that
+    # position and looking it up in the target file's def_index.
+    def loc_to_id(self, abs_path, line0, char0):
+        fid = self.path_to_file_id(abs_path)
+        if fid is None:
+            return None
+        fd = self.files.get(fid)
+        if not fd or isinstance(fd, _StubFile):
+            return None
+        lines = fd.source.splitlines()
+        if line0 < 0 or line0 >= len(lines):
+            return None
+        seg = lines[line0][char0:]
+        m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", seg)
+        if not m:
+            return None
+        return fd.def_index.get((line0 + 1, m.group(0)))
 
     def def_to_id(self, d):
         mp = getattr(d, "module_path", None)
@@ -872,6 +1108,8 @@ def main():
         mid = msg.get("id")
         op = msg.get("op")
         if op == "close":
+            if analyzer.pyright is not None:
+                analyzer.pyright.close()
             break
         handler = handlers.get(op)
         if handler is None:

@@ -1,4 +1,5 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import type {
   FileAstResponse,
@@ -45,7 +46,13 @@ export class PythonAnalyzer implements LanguageAnalyzer {
 
   async open(): Promise<AnalyzerOpenResult> {
     this.spawnHelper();
-    const res = (await this.request('open', { root: this.rootPath })) as {
+    // Hand the helper an argv for pyright's language server (if available) so
+    // it can resolve calls/inheritance with a real type checker, falling back
+    // to Jedi per-query. null → Jedi-only (unchanged behaviour).
+    const res = (await this.request('open', {
+      root: this.rootPath,
+      pyright: resolvePyrightArgv(),
+    })) as {
       files: FileNode[];
       asts: Record<string, FileAstResponse>;
       importEdges: ImportEdge[];
@@ -222,6 +229,22 @@ function findInterpreter(): string {
     'Python project detected, but no usable Python 3.9+ interpreter was found. ' +
       'Install Python 3.9+ or set CODE_GRAPH_PYTHON to its path.',
   );
+}
+
+// Argv to launch pyright's language server over stdio, or null when pyright
+// isn't resolvable (the helper then uses Jedi only). Honors a
+// CODE_GRAPH_PYRIGHT override (a langserver command), else resolves the bundled
+// `pyright` npm package and runs it with this process's Node.
+function resolvePyrightArgv(): string[] | null {
+  const override = process.env.CODE_GRAPH_PYRIGHT;
+  if (override) return [override, '--stdio'];
+  try {
+    const require = createRequire(import.meta.url);
+    const entry = require.resolve('pyright/langserver.index.js');
+    return [process.execPath, entry, '--stdio'];
+  } catch {
+    return null;
+  }
 }
 
 function ensureJedi(interpreter: string): void {

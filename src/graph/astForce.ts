@@ -91,6 +91,16 @@ function isMemberContainer(tn: TreemapNode): boolean {
     return MEMBER_CONTAINER_KINDS.has(tn.syntaxKind);
 }
 
+// Import-statement kinds, arranged along the file's TOP arc when expanded.
+// TS: ImportDeclaration. Python: Import (`import x`) / ImportFrom (`from x
+// import y`). Keeping them in one predicate means a Python file's imports band
+// across the top exactly like a TypeScript file's.
+const IMPORT_KINDS = new Set(["ImportDeclaration", "Import", "ImportFrom"]);
+
+function isImportKind(kind: string): boolean {
+    return IMPORT_KINDS.has(kind);
+}
+
 // Visual rim added between a nested container's member cluster radius
 // and the drawn circle. The file's analogous constant FILE_RIM is owned
 // by PixiCanvas; this one stays here because it factors into rect.w/h
@@ -507,7 +517,7 @@ function middleCenterForce(strength: number) {
         middleNodes = [];
         for (const n of nodes) {
             const k = n.tree.syntaxKind;
-            if (k === "ImportDeclaration") continue;
+            if (isImportKind(k)) continue;
             if (k === "ExportDeclaration" || k === "ExportAssignment") continue;
             if (n.tree.exported === true) continue;
             middleNodes.push(n);
@@ -596,7 +606,7 @@ function importExportArcForce(
         exportNodes = [];
         middleNodes = [];
         for (const x of n) {
-            if (x.tree.syntaxKind === "ImportDeclaration") {
+            if (isImportKind(x.tree.syntaxKind)) {
                 importNodes.push(x);
                 continue;
             }
@@ -748,7 +758,7 @@ function buildContainerForceLayout(
     const exportMembers: TreemapNode[] = [];
     const middleMembers: TreemapNode[] = [];
     for (const tn of members) {
-        if (tn.syntaxKind === "ImportDeclaration") importMembers.push(tn);
+        if (isImportKind(tn.syntaxKind)) importMembers.push(tn);
         else if (isExportedTopLevel(tn)) exportMembers.push(tn);
         else middleMembers.push(tn);
     }

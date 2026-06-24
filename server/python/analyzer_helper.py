@@ -771,8 +771,15 @@ class Analyzer:
             self.parse_file(abs_path)
         files = [fd.file_node for fd in self.files.values()]
         asts = {fid: fd.ast_response() for fid, fd in self.files.items()}
-        import_edges = self.build_import_edges(set(self.files.keys()))
-        semantic_edges = self.build_semantic_edges(set(self.files.keys()))
+        # Warm reopen: build edges only for the affected files (the Node side
+        # splices cached edges for the rest). Every file is still parsed above,
+        # so cross-file resolution into unchanged files works; what's skipped is
+        # the expensive Jedi/pyright resolution for unaffected files. None =
+        # cold open = resolve everything.
+        affected = msg.get("affected")
+        edge_from = set(self.files.keys()) if affected is None else set(affected)
+        import_edges = self.build_import_edges(edge_from)
+        semantic_edges = self.build_semantic_edges(edge_from)
         return {
             "files": files,
             "asts": asts,

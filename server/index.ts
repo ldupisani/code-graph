@@ -9,6 +9,8 @@ import {
   applyFileEvent,
   getCachedAst,
   getLoadedProject,
+  noteWatchClose,
+  noteWatchOpen,
   openProject,
 } from './project';
 
@@ -119,6 +121,10 @@ app.get<{ Params: { projectId: string } }>(
     });
     raw.write(`: connected to ${projectId}\n\n`);
 
+    // Mark this project as actively watched so eviction leaves it alone while a
+    // window is connected; decremented in cleanup.
+    noteWatchOpen(loaded);
+
     const unsubscribe = loaded.watcher.subscribe((event) => {
       // Translate the raw filesystem event into an incremental GraphDelta:
       // re-walk only the changed file, recompute only the edges that can touch
@@ -146,9 +152,13 @@ app.get<{ Params: { projectId: string } }>(
       raw.write(': ping\n\n');
     }, 25_000);
 
+    let cleanedUp = false;
     const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
       clearInterval(heartbeat);
       unsubscribe();
+      noteWatchClose(loaded);
     };
     req.raw.on('close', cleanup);
     req.raw.on('error', cleanup);

@@ -8,11 +8,15 @@ import type {
   SemanticEdge,
 } from '../src/api/types';
 import {
+  excludeDirsFingerprint,
   isExcludedDir,
+  walkSourceFiles,
   type AnalyzerOpenResult,
+  type FileStat,
   type FileUpdate,
   type Language,
   type LanguageAnalyzer,
+  type WarmSeed,
 } from './analyzer';
 
 // The Python engine. Drives a long-lived Python helper process (stdlib `ast`
@@ -44,14 +48,18 @@ export class PythonAnalyzer implements LanguageAnalyzer {
     ensureJedi(this.interpreter);
   }
 
-  async open(): Promise<AnalyzerOpenResult> {
+  async open(seed?: WarmSeed): Promise<AnalyzerOpenResult> {
     this.spawnHelper();
     // Hand the helper an argv for pyright's language server (if available) so
     // it can resolve calls/inheritance with a real type checker, falling back
     // to Jedi per-query. null → Jedi-only (unchanged behaviour).
+    // `affected` (warm reopen) scopes edge resolution — the helper still parses
+    // every file but only runs Jedi/pyright for the affected set; the
+    // orchestrator splices cached edges for the rest. null → resolve all (cold).
     const res = (await this.request('open', {
       root: this.rootPath,
       pyright: resolvePyrightArgv(),
+      affected: seed ? [...seed.affected] : null,
     })) as {
       files: FileNode[];
       asts: Record<string, FileAstResponse>;
@@ -63,6 +71,34 @@ export class PythonAnalyzer implements LanguageAnalyzer {
       asts: new Map(Object.entries(res.asts)),
       importEdges: res.importEdges,
       semanticEdges: res.semanticEdges,
+    };
+  }
+
+  async listFiles(): Promise<FileStat[]> {
+    // Plain directory walk (no parse) — matches the helper's discover() set.
+    return walkSourceFiles(this.rootPath, (p) => this.watches(p));
+  }
+
+  async fingerprint(): Promise<Record<string, unknown>> {
+    let python = '?';
+    let jedi = '?';
+    try {
+      const v = spawnSync(this.interpreter, ['-c', 'import sys;print("%d.%d.%d" % sys.version_info[:3])'], { encoding: 'utf8' });
+      if (v.status === 0) python = (v.stdout || '').trim();
+    } catch {
+      // leave '?'
+    }
+    try {
+      const v = spawnSync(this.interpreter, ['-c', 'import jedi;print(jedi.__version__)'], { encoding: 'utf8' });
+      if (v.status === 0) jedi = (v.stdout || '').trim();
+    } catch {
+      // leave '?'
+    }
+    return {
+      python,
+      jedi,
+      pyright: resolvePyrightArgv() !== null,
+      excludeDirs: excludeDirsFingerprint(),
     };
   }
 

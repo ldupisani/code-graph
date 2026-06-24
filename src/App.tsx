@@ -13,6 +13,7 @@ import { HoverTooltip } from './ui/HoverTooltip';
 import { SearchPalette } from './ui/SearchPalette';
 import { EditorPane } from './ui/EditorPane';
 import { FolderPicker } from './ui/FolderPicker';
+import { addRecentPath } from './ui/recentPaths';
 import { SettingsPanel } from './ui/settings/SettingsPanel';
 import type { AstNode, FileNode, GraphDelta, ProjectResponse } from './api/types';
 
@@ -49,13 +50,14 @@ export function App() {
     else p.collapse();
   }
 
-  // Last-opened path is restored from localStorage so a dev-server reload
-  // (triggered by editing force-graph tunables — see the HMR hook in
-  // PixiCanvas.tsx) lands back where we left off instead of on the empty
-  // form. Read once via useState's initializer so it's available on first
-  // render — both for auto-reopen and for seeding the FolderPicker input.
+  // Per-window project identity lives in the URL (`?path=…`). Different browser
+  // windows therefore hold different projects independently, a reload reopens
+  // THIS window's project (and survives the dev-server reload the PixiCanvas HMR
+  // hook triggers), and the URL is shareable. localStorage is NOT used as the
+  // source of truth — it's shared across windows, so it would let one window's
+  // open clobber another's. Read once via useState's initializer.
   const [initialPath] = useState<string>(() => {
-    try { return localStorage.getItem('code-graph:lastPath') ?? ''; } catch { return ''; }
+    try { return new URLSearchParams(window.location.search).get('path') ?? ''; } catch { return ''; }
   });
 
   async function handleOpen(path: string) {
@@ -64,8 +66,13 @@ export function App() {
     try {
       const data = await openProject({ path });
       setProject(data);
-      // Only stored on success so a bad path can't trap us across reloads.
-      try { localStorage.setItem('code-graph:lastPath', path); } catch {}
+      // Reflect the open project in THIS window's URL so a reload reopens it.
+      try {
+        const u = new URL(window.location.href);
+        u.searchParams.set('path', path);
+        window.history.replaceState(null, '', u);
+      } catch {}
+      addRecentPath(path);
       console.log('[code-graph] project loaded', data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -75,8 +82,9 @@ export function App() {
     }
   }
 
-  // On mount, auto-reopen the saved path. Runs once; if it fails the error
-  // surfaces in the FolderPicker and the user can pick a new path.
+  // On mount, auto-reopen this window's project from its URL `?path=`. Runs
+  // once; if it fails the error surfaces in the FolderPicker. Windows with no
+  // `?path=` just show the picker.
   useEffect(() => {
     if (initialPath) void handleOpen(initialPath);
     // eslint-disable-next-line react-hooks/exhaustive-deps

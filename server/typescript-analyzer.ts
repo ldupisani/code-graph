@@ -1,4 +1,5 @@
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { Project, ts, type Node, type SourceFile } from 'ts-morph';
 import type {
@@ -10,12 +11,16 @@ import type {
 import { extractAst } from './ast-extractor';
 import { buildSemanticEdges } from './semantic-edges';
 import {
+  excludeDirsFingerprint,
   isExcludedDir,
   type AnalyzerOpenResult,
+  type FileStat,
   type FileUpdate,
   type Language,
   type LanguageAnalyzer,
+  type WarmSeed,
 } from './analyzer';
+import { packageVersion } from './cache';
 
 // The TypeScript engine, wrapping ts-morph behind the LanguageAnalyzer façade.
 // This is the project.ts ts-morph code lifted essentially verbatim — only the
@@ -71,11 +76,15 @@ export class TypeScriptAnalyzer implements LanguageAnalyzer {
     this.project = project;
   }
 
-  async open(): Promise<AnalyzerOpenResult> {
+  async open(seed?: WarmSeed): Promise<AnalyzerOpenResult> {
     const sourceFiles = this.project.getSourceFiles();
     const files: FileNode[] = sourceFiles.map((sf) => this.buildFileNode(sf));
     const fileIdByAbs = new Map(files.map((f) => [f.absolutePath, f.id]));
 
+    // Extract every file's AST. This runs even on a warm reopen — it's needed
+    // to populate idByNode for ALL files so a changed file's edges can resolve
+    // into unchanged ones. (ts-morph's parse, in the constructor, is the
+    // dominant unavoidable cost; what the cache skips is edge resolution.)
     const asts = new Map<string, FileAstResponse>();
     for (const sf of sourceFiles) {
       const fileId = fileIdByAbs.get(sf.getFilePath());
@@ -90,12 +99,51 @@ export class TypeScriptAnalyzer implements LanguageAnalyzer {
       this.nodesByFile.set(fileId, fileNodes);
     }
 
-    // Import edges built after AST extraction so each can be stamped with the
-    // AST id of the ImportDeclaration it originated from.
-    const importEdges = this.buildImportEdges(sourceFiles, fileIdByAbs);
-    const semanticEdges = buildSemanticEdges(sourceFiles, this.idByNode);
+    // Edge sources: only the affected files on a warm reopen (the orchestrator
+    // splices in the cached edges for everything else); all files on a cold
+    // open. Building semantic edges is the expensive symbol-resolution pass
+    // the cache exists to skip.
+    const edgeSources = seed
+      ? sourceFiles.filter((sf) => {
+          const id = fileIdByAbs.get(sf.getFilePath());
+          return id != null && seed.affected.has(id);
+        })
+      : sourceFiles;
+    const importEdges = this.buildImportEdges(edgeSources, fileIdByAbs);
+    const semanticEdges = buildSemanticEdges(edgeSources, this.idByNode);
 
     return { files, asts, importEdges, semanticEdges };
+  }
+
+  async listFiles(): Promise<FileStat[]> {
+    const out: FileStat[] = [];
+    for (const sf of this.project.getSourceFiles()) {
+      try {
+        const s = statSync(sf.getFilePath());
+        out.push({ fileId: this.relativeFileId(sf), mtimeMs: s.mtimeMs, sizeBytes: s.size });
+      } catch {
+        // skip unreadable
+      }
+    }
+    return out;
+  }
+
+  // Cache fingerprint — cheap. Changing tsconfig, ts-morph, typescript, or the
+  // exclude rule invalidates the cached graph.
+  async fingerprint(): Promise<Record<string, unknown>> {
+    const require = createRequire(import.meta.url);
+    let tsConfigMtimeMs = 0;
+    try {
+      tsConfigMtimeMs = statSync(this.tsConfigPath).mtimeMs;
+    } catch {
+      // no tsconfig stat — leave 0
+    }
+    return {
+      tsConfigMtimeMs,
+      tsMorph: packageVersion(require, 'ts-morph'),
+      typescript: packageVersion(require, 'typescript'),
+      excludeDirs: excludeDirsFingerprint(),
+    };
   }
 
   async extract(fileId: string): Promise<FileAstResponse | undefined> {

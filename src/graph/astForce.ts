@@ -645,9 +645,19 @@ function importExportArcForce(
 // the wider axis inward (toward 0, the cluster center) and the narrower
 // axis outward. forceCenter(0,0) cooperates by holding the cluster
 // centered, so "toward 0" reads as "toward the centroid."
+//
+// Deliberately NOT scaled by `alpha`: this is a shape constraint, not a
+// settling force, and it competes every tick against `aabbCollideForce`
+// (also alpha-independent — see its comment). For wide-short leaf boxes,
+// collide's min-overlap-axis heuristic resolves along y far more often
+// than x, so a growing file (50+ top-level members) keeps stacking
+// vertically tick after tick. If this force faded with alpha like the
+// rest of the stack, it could only counteract that stacking during the
+// first few ticks — by mid-settle collide would win outright and the
+// cluster would end up a tall column with empty space on both sides.
 function squareBiasForce(strength: number) {
     let nodes: SimAstNode[] = [];
-    function force(alpha: number): void {
+    function force(): void {
         if (nodes.length < 2) return;
         let minX = Infinity;
         let maxX = -Infinity;
@@ -665,8 +675,8 @@ function squareBiasForce(strength: number) {
         const ry = maxY - minY;
         if (rx <= 0 || ry <= 0) return;
         const target = Math.sqrt(rx * ry);
-        const kx = (rx / target - 1) * strength * alpha;
-        const ky = (ry / target - 1) * strength * alpha;
+        const kx = (rx / target - 1) * strength;
+        const ky = (ry / target - 1) * strength;
         for (const n of nodes) {
             n.vx = (n.vx ?? 0) - n.x * kx;
             n.vy = (n.vy ?? 0) - n.y * ky;

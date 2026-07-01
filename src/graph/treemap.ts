@@ -498,11 +498,11 @@ export function layoutAst(
     ) {
       return ternary(
         node,
-        size(kids[0]),
+        sizeOrCollapse(kids[0], node.syntaxKind),
         '?',
-        size(kids[1]),
+        sizeOrCollapse(kids[1], node.syntaxKind),
         ':',
-        size(kids[2]),
+        sizeOrCollapse(kids[2], node.syntaxKind),
       );
     }
 
@@ -511,7 +511,13 @@ export function layoutAst(
       // Also covers operator-bearing types: UnionType `A | B` /
       // IntersectionType `A & B` (no label, op set by server, 2 kids).
       if (!label && kids.length === 2) {
-        return relational(node, node.op, size(kids[0]), null, size(kids[1]));
+        return relational(
+          node,
+          node.op,
+          sizeOrCollapse(kids[0], node.syntaxKind),
+          null,
+          sizeOrCollapse(kids[1], node.syntaxKind),
+        );
       }
       // `let i = j` / `const Icon = forwardRef(...)`: name as a top
       // label BAND, then `op [init]` in a row below. A top band —
@@ -522,7 +528,7 @@ export function layoutAst(
       // header shows while the whole node — initializer included —
       // is wide enough on screen, which happens far below 1:1).
       if (label && kids.length === 1) {
-        const right = size(kids[0]);
+        const right = sizeOrCollapse(kids[0], node.syntaxKind);
         const ob = opts.measure(node.op);
         const rowH = Math.max(right.h, ob.h);
         const rightX = ob.w + GAP;
@@ -543,8 +549,8 @@ export function layoutAst(
       // (the declaration's name), then [k0] op [k1] below — k0 is the
       // type annotation, k1 is the initializer, op is `=`.
       if (label && kids.length === 2) {
-        const left = size(kids[0]);
-        const right = size(kids[1]);
+        const left = sizeOrCollapse(kids[0], node.syntaxKind);
+        const right = sizeOrCollapse(kids[1], node.syntaxKind);
         const ob = opts.measure(node.op);
         const rowH = Math.max(left.h, right.h, ob.h);
         const rightX = left.w + GAP + ob.w + GAP;

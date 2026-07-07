@@ -3,8 +3,11 @@ import type {
   ConflictResponse,
   FileAstResponse,
   GraphDelta,
+  PresenceEvent,
+  PresenceState,
   ProjectRequest,
   ProjectResponse,
+  SessionInfo,
   SourceForEditResponse,
   ValidateResponse,
   WriteRequest,
@@ -46,13 +49,33 @@ export function getFileAst(projectId: string, fileId: string): Promise<FileAstRe
 // filesystem change the server detects is re-walked (changed file only) and
 // emitted as a GraphDelta the caller merges into the live graph. The browser
 // reconnects automatically; we just close on cleanup.
+export interface SubscribeOptions {
+  // Presence identity announced on the watch connection. When present the
+  // server registers this client as a session and streams roster + presence
+  // updates back as named SSE events.
+  identity?: { id: string; name: string; color: string };
+  onSessions?: (sessions: SessionInfo[]) => void;
+  onPresence?: (event: PresenceEvent) => void;
+  onError?: (e: Event) => void;
+}
+
 export function subscribeToDeltas(
   projectId: string,
   onDelta: (delta: GraphDelta) => void,
-  onError?: (e: Event) => void,
+  opts?: SubscribeOptions,
 ): () => void {
-  const url = `/api/project/${encodeURIComponent(projectId)}/watch`;
+  let url = `/api/project/${encodeURIComponent(projectId)}/watch`;
+  if (opts?.identity) {
+    const q = new URLSearchParams({
+      sessionId: opts.identity.id,
+      name: opts.identity.name,
+      color: opts.identity.color,
+    });
+    url += `?${q}`;
+  }
   const es = new EventSource(url);
+  // Deltas stay on the default (unnamed) event; presence rides NAMED events
+  // ('sessions' / 'presence') so the two streams can't be confused.
   es.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data) as GraphDelta;
@@ -61,8 +84,43 @@ export function subscribeToDeltas(
       // ignore malformed payloads
     }
   };
-  if (onError) es.onerror = onError;
+  if (opts?.onSessions) {
+    es.addEventListener('sessions', (e) => {
+      try {
+        opts.onSessions?.(JSON.parse((e as MessageEvent).data) as SessionInfo[]);
+      } catch {
+        // ignore malformed payloads
+      }
+    });
+  }
+  if (opts?.onPresence) {
+    es.addEventListener('presence', (e) => {
+      try {
+        opts.onPresence?.(JSON.parse((e as MessageEvent).data) as PresenceEvent);
+      } catch {
+        // ignore malformed payloads
+      }
+    });
+  }
+  if (opts?.onError) es.onerror = opts.onError;
   return () => es.close();
+}
+
+// Throttled presence report (see App.tsx). Fire-and-forget: a failed update
+// is superseded by the next tick anyway.
+export function postPresence(
+  projectId: string,
+  sessionId: string,
+  state: PresenceState,
+): void {
+  const url = `/api/project/${encodeURIComponent(projectId)}/presence`;
+  void fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId, state }),
+  }).catch(() => {
+    // Server restarting / connection blip — the next report retries.
+  });
 }
 
 // --- Editing (write path) --------------------------------------------------

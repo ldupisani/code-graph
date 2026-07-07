@@ -277,3 +277,65 @@ export interface ConflictResponse {
   currentMtimeMs: number;
   currentHash: string;
 }
+
+// --- Presence / sessions -----------------------------------------------------
+
+// One connected window on a project's SSE stream. Identity is generated
+// client-side (per browser tab) and carried on the /watch query string; the
+// server only relays it.
+export interface SessionInfo {
+  id: string;
+  name: string; // human-readable, e.g. "Amber Fox"
+  color: string; // css hex, stable per session
+  connectedAt: number;
+}
+
+// Camera transform + content anchor, structurally matching the renderer's
+// CameraState. The anchor matters across windows: two windows' force layouts
+// place files differently, so a follower re-frames relative to the anchor
+// FILE rather than trusting raw world coordinates.
+export interface PresenceCamera {
+  x: number;
+  y: number;
+  scale: number;
+  anchorId?: string | null;
+  anchorScreenX?: number;
+  anchorScreenY?: number;
+}
+
+// What a session broadcasts about itself (throttled). Followers mirror this.
+export interface PresenceState {
+  selection: string | null;
+  selectionSet: readonly string[];
+  // User-toggled drill-down state: expanded Block/AST nodes and toggled-on
+  // story previews. File expansion itself is deliberately NOT here — it's
+  // DERIVED state (the renderer's syncExpansion recomputes it every frame
+  // from selectionSet × zoom), so mirroring selectionSet + camera reproduces
+  // it on the follower, and mirroring it directly would fight the renderer.
+  expandedAstNodes: readonly string[];
+  previewedAstNodes: readonly string[];
+  // User-pinned file positions (drag-to-pin IS the manual arrangement
+  // mechanism). World coordinates transfer as-is: pins FIX positions, so
+  // applying them reproduces the arranger's spatial layout on the follower
+  // regardless of how each window's force sim had settled.
+  pins: readonly { id: string; x: number; y: number }[];
+  camera: PresenceCamera | null;
+  // Non-null while the session is in edit mode: the file being edited and the
+  // LIVE (unsaved) buffer, so followers see keystrokes before any save.
+  editFileId: string | null;
+  bufferText: string | null;
+  dirty: boolean;
+}
+
+// POST /presence request body; the server stores it per-session and fans it
+// out to every OTHER session as an SSE `presence` event.
+export interface PresenceUpdateRequest {
+  sessionId: string;
+  state: PresenceState;
+}
+
+// SSE `presence` event payload.
+export interface PresenceEvent {
+  sessionId: string;
+  state: PresenceState;
+}

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Group, Panel, Separator, usePanelRef } from 'react-resizable-panels';
-import { openProject, subscribeToDeltas } from './api/client';
+import { openProject, postPresence, subscribeToDeltas } from './api/client';
+import { getSessionIdentity, usePresenceStore } from './graph/presence';
 import { selfSavedFileIds, useGraphStore } from './graph/store';
 import { useSourceStore } from './graph/sourceStore';
 import { PixiCanvas, requestSelectionFrame, type CameraApi } from './render/PixiCanvas';
@@ -12,11 +13,12 @@ import { useSnapshotStore } from './graph/snapshots/store';
 import { EdgeFilterPills } from './ui/EdgeFilterPills';
 import { HoverTooltip } from './ui/HoverTooltip';
 import { SearchPalette } from './ui/SearchPalette';
-import { EditorPane } from './ui/EditorPane';
+import { EditorPane, liveEditBuffer } from './ui/EditorPane';
 import { FolderPicker } from './ui/FolderPicker';
+import { SessionsPill } from './ui/SessionsPill';
 import { addRecentPath } from './ui/recentPaths';
 import { SettingsPanel } from './ui/settings/SettingsPanel';
-import type { AstNode, FileNode, GraphDelta, ProjectResponse } from './api/types';
+import type { AstNode, FileNode, GraphDelta, PresenceState, ProjectResponse } from './api/types';
 
 // Membership equality for two string sets — used to detect whether a delta
 // actually changed the selected-file set (and thus warrants a camera re-frame).
@@ -241,7 +243,10 @@ export function App() {
       const selfGuard =
         buffer.length > 0 && buffer.every((d) => selfSavedFileIds.has(d.fileId));
       for (const d of buffer) selfSavedFileIds.delete(d.fileId);
-      const viewGuard = editGuard || selfGuard;
+      // While FOLLOWING another session, deltas must not steal the view
+      // either — the followed session's presence drives selection/camera.
+      const followGuard = usePresenceStore.getState().followingId != null;
+      const viewGuard = editGuard || selfGuard || followGuard;
       const touched: string[] = [];
       for (const d of buffer) {
         applyDelta(d);
@@ -271,25 +276,155 @@ export function App() {
       if (clearFlash) clearTimeout(clearFlash);
       clearFlash = setTimeout(() => setRefreshing(false), 400);
     };
-    const unsub = subscribeToDeltas(project.projectId, (delta) => {
-      console.log(
-        `[code-graph] delta ${delta.kind} ${delta.fileId}: ${delta.imports.length} imports, ${delta.semanticEdges.length} semantic`,
-      );
-      buffer.push(delta);
-      if (flushTimer) clearTimeout(flushTimer);
-      flushTimer = setTimeout(flush, 120);
-    });
+    const unsub = subscribeToDeltas(
+      project.projectId,
+      (delta) => {
+        console.log(
+          `[code-graph] delta ${delta.kind} ${delta.fileId}: ${delta.imports.length} imports, ${delta.semanticEdges.length} semantic`,
+        );
+        buffer.push(delta);
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = setTimeout(flush, 120);
+      },
+      {
+        // Announce this window as a session and mirror the server's roster /
+        // presence fan-out into the presence store (HUD + follow read it).
+        identity: getSessionIdentity(),
+        onSessions: (sessions) =>
+          usePresenceStore.getState().setSessions(sessions),
+        onPresence: (e) =>
+          usePresenceStore.getState().setPresence(e.sessionId, e.state),
+      },
+    );
     return () => {
       unsub();
+      usePresenceStore.getState().clear();
       if (flushTimer) clearTimeout(flushTimer);
       if (clearFlash) clearTimeout(clearFlash);
     };
   }, [project?.projectId, applyDelta, setSelection]);
 
+  // --- Presence: report / follow -------------------------------------------
+  // Report this window's state on a 200ms clock, skipping ticks where nothing
+  // changed (the JSON snapshot doubles as the change key). Polling — rather
+  // than subscribing to every store — keeps one cheap code path that also
+  // captures camera pans and edit-buffer keystrokes, which live outside React
+  // state entirely.
+  useEffect(() => {
+    if (!project) return;
+    const projectId = project.projectId;
+    const identity = getSessionIdentity();
+    let lastSent = '';
+    const timer = setInterval(() => {
+      // Solo? Nothing is listening; skip the wire entirely.
+      if (usePresenceStore.getState().sessions.length <= 1) return;
+      const st = useGraphStore.getState();
+      const editFileId = st.editMode ? st.editFileId : null;
+      const state: PresenceState = {
+        selection: st.selection,
+        selectionSet: [...st.selectionSet],
+        expandedAstNodes: [...st.expandedAstNodes],
+        previewedAstNodes: [...st.previewedAstNodes],
+        pins: cameraApiRef.current?.getPins() ?? [],
+        camera: cameraApiRef.current?.getCamera() ?? null,
+        editFileId,
+        bufferText: editFileId ? liveEditBuffer.text : null,
+        dirty: editFileId ? liveEditBuffer.dirty : false,
+      };
+      const key = JSON.stringify(state);
+      if (key === lastSent) return;
+      lastSent = key;
+      postPresence(projectId, identity.id, state);
+    }, 200);
+    return () => clearInterval(timer);
+  }, [project?.projectId]);
+
+  // Follow: mirror the followed session's presence as it streams in.
+  // Selection applies directly; camera goes through setCamera with animate so
+  // the 200ms-spaced updates ease into each other, and its anchor field
+  // re-frames against a FILE — robust to the two windows' force layouts
+  // having placed things differently.
+  useEffect(() => {
+    let lastCameraKey = '';
+    let lastPinsKey = '';
+    const unsub = usePresenceStore.subscribe((s, prev) => {
+      const fid = s.followingId;
+      if (!fid) return;
+      const p = s.presence.get(fid);
+      if (!p) return;
+      // Apply on either trigger: their presence changed, OR we JUST started
+      // following (their last-known state is already in the store and won't
+      // re-fire on its own — an idle session would otherwise never mirror).
+      const justStarted = fid !== prev.followingId;
+      if (!justStarted && p === prev.presence.get(fid)) return;
+      const gs = useGraphStore.getState();
+      // Mirror selection + drill-down state wholesale (that's what following
+      // means), but only patch the slices whose MEMBERSHIP differs — a new
+      // Set identity per presence tick (camera pans arrive every 200ms) would
+      // otherwise churn the renderer's expansion effects for nothing. The
+      // renderer fetches ASTs for newly-expanded files itself, so mirroring
+      // the id sets is sufficient.
+      const patch: Partial<Parameters<typeof useGraphStore.setState>[0]> = {};
+      const selSet = new Set(p.selectionSet);
+      if (p.selection !== gs.selection || !sameStringSet(selSet, gs.selectionSet)) {
+        patch.selection = p.selection;
+        patch.selectionSet = selSet;
+      }
+      const mirrorSet = (
+        incoming: readonly string[] | undefined,
+        current: ReadonlySet<string>,
+        key: 'expandedAstNodes' | 'previewedAstNodes',
+      ) => {
+        const next = new Set(incoming ?? []);
+        if (!sameStringSet(next, current)) patch[key] = next;
+      };
+      mirrorSet(p.expandedAstNodes, gs.expandedAstNodes, 'expandedAstNodes');
+      mirrorSet(p.previewedAstNodes, gs.previewedAstNodes, 'previewedAstNodes');
+      if (Object.keys(patch).length > 0) useGraphStore.setState(patch);
+      // Pins reproduce the followed session's manual arrangement. Key-guarded
+      // because setPins is a full replace (unpin-all + re-pin + sim reheat) —
+      // it must run only when the pin set actually changed, not on every
+      // camera tick.
+      if (p.pins) {
+        const key = JSON.stringify(p.pins);
+        if (key !== lastPinsKey) {
+          lastPinsKey = key;
+          cameraApiRef.current?.setPins(p.pins as { id: string; x: number; y: number }[]);
+        }
+      }
+      if (p.camera) {
+        const key = JSON.stringify(p.camera);
+        if (key !== lastCameraKey) {
+          lastCameraKey = key;
+          cameraApiRef.current?.setCamera(p.camera, { animate: true });
+        }
+      }
+    });
+    return unsub;
+  }, []);
+
+  // Break follow on any LOCAL interaction (Figma/Live Share convention):
+  // pointer or wheel on the canvas half means the user took the controls
+  // back. Capture phase so it fires regardless of what the canvas does with
+  // the event. (The SessionsPill lives in the header, outside this handler,
+  // so clicking unfollow there doesn't double-trigger.)
+  const breakFollow = () => {
+    if (usePresenceStore.getState().followingId) {
+      usePresenceStore.getState().setFollowing(null);
+    }
+  };
+
   // Entering edit mode (e.g. via the 'e' hotkey while the canvas is focused)
   // auto-expands the editor panel so the user can actually see what they're
   // editing.
   const editMode = useGraphStore((s) => s.editMode);
+
+  // Local edit mode is also "taking the controls back" — and the editor pane
+  // is busy mirroring the followed buffer while following, so the two can't
+  // coexist.
+  useEffect(() => {
+    if (editMode) breakFollow();
+  }, [editMode]);
   useEffect(() => {
     if (!editMode) return;
     const p = editorPanelRef.current;
@@ -316,6 +451,7 @@ export function App() {
           initialPath={initialPath}
         />
         {project ? <ProjectStats project={project} refreshing={refreshing} /> : null}
+        {project ? <SessionsPill /> : null}
         {project ? (
           <button
             type="button"
@@ -343,7 +479,11 @@ export function App() {
         {project ? (
           <Group orientation="horizontal" style={{ width: '100%', height: '100%' }}>
             <Panel defaultSize="62%" minSize="30%">
-              <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+              <div
+                style={{ position: 'relative', width: '100%', height: '100%' }}
+                onPointerDownCapture={breakFollow}
+                onWheelCapture={breakFollow}
+              >
                 <PixiCanvas project={project} cameraApiRef={cameraApiRef} />
                 <SelectionPanel />
                 <EdgeFilterPills />

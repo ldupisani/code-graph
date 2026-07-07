@@ -14,8 +14,19 @@ import type {
   FileAstResponse,
   ProjectResponse,
 } from '../api/types';
+import { usePresenceStore } from '../graph/presence';
 import { selfSavedFileIds, useGraphStore } from '../graph/store';
 import { useSourceStore } from '../graph/sourceStore';
+
+// The live (unsaved) edit buffer, exposed for the presence reporter in
+// App.tsx: while this session is in edit mode, other sessions following it
+// see these keystrokes streamed as PresenceState.bufferText. A plain module
+// object (not store state) — it changes on every keystroke and nothing
+// should re-render off it; the reporter samples it on its own clock.
+export const liveEditBuffer: { text: string | null; dirty: boolean } = {
+  text: null,
+  dirty: false,
+};
 
 interface EditorPaneProps {
   project: ProjectResponse;
@@ -88,6 +99,18 @@ export function EditorPane({ project, exitRef }: EditorPaneProps) {
   const setSelection = useGraphStore((s) => s.setSelection);
   const editMode = useGraphStore((s) => s.editMode);
   const editFileId = useGraphStore((s) => s.editFileId);
+
+  // Followed session's live edit, when there is one: while we're following a
+  // session that is in edit mode, the pane mirrors their unsaved buffer
+  // read-only instead of our own view (see the render branch below).
+  const followedEdit = usePresenceStore((s) => {
+    if (!s.followingId) return null;
+    const p = s.presence.get(s.followingId);
+    return p && p.editFileId != null && p.bufferText != null ? p : null;
+  });
+  const followedSession = usePresenceStore((s) =>
+    s.followingId ? s.sessions.find((x) => x.id === s.followingId) ?? null : null,
+  );
 
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
@@ -368,11 +391,26 @@ export function EditorPane({ project, exitRef }: EditorPaneProps) {
       if (!useGraphStore.getState().editMode) return;
       const v = value ?? '';
       currentTextRef.current = v;
+      liveEditBuffer.text = v;
+      liveEditBuffer.dirty = v !== baselineTextRef.current;
       setDirty(v !== baselineTextRef.current);
       scheduleValidate(v);
     },
     [scheduleValidate],
   );
+
+  // Keep the exported live buffer in sync with edit-mode boundaries: entering
+  // edit seeds it with the loaded text (so followers see the buffer before the
+  // first keystroke), leaving edit clears it.
+  useEffect(() => {
+    if (isEditing) {
+      liveEditBuffer.text = currentTextRef.current;
+      liveEditBuffer.dirty = dirtyRef.current;
+    } else {
+      liveEditBuffer.text = null;
+      liveEditBuffer.dirty = false;
+    }
+  }, [isEditing]);
 
   // --- Save ----------------------------------------------------------------
   const save = useCallback(async () => {
@@ -565,6 +603,65 @@ export function EditorPane({ project, exitRef }: EditorPaneProps) {
     },
     [setSelection],
   );
+
+  // Following a session that's editing: mirror their live buffer read-only.
+  // Takes precedence over the local view — the whole point of following is
+  // watching THEIR edits. Local edit mode can't collide: entering it breaks
+  // follow (App.tsx), so the two states are mutually exclusive.
+  if (followedEdit && followedSession) {
+    return (
+      <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+            padding: '0.3rem 0.6rem',
+            height: 30,
+            boxSizing: 'border-box',
+            fontSize: '0.8rem',
+            background: '#1d1d20',
+            borderBottom: `2px solid ${followedSession.color}`,
+            fontFamily: 'ui-monospace, monospace',
+          }}
+        >
+          <span
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              background: followedSession.color,
+              flexShrink: 0,
+            }}
+          />
+          <span style={{ opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {followedSession.name} editing {followedEdit.editFileId}
+            {followedEdit.dirty ? <span style={{ color: '#e0b050' }}> ●</span> : null}
+          </span>
+        </div>
+        <div style={{ position: 'absolute', top: 30, bottom: 0, left: 0, right: 0 }}>
+          <Editor
+            theme="vs-dark"
+            language={languageForFile(followedEdit.editFileId)}
+            // Distinct scheme so this model can't collide with the file:///
+            // sibling models the IntelliSense closure feeds.
+            path={`follow:///${followedEdit.editFileId}`}
+            value={followedEdit.bufferText ?? ''}
+            options={{
+              readOnly: true,
+              minimap: { enabled: false },
+              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+              fontSize: 12,
+              scrollBeyondLastLine: false,
+              renderWhitespace: 'none',
+              wordWrap: 'on',
+              automaticLayout: true,
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
 
   if (error) {
     return (

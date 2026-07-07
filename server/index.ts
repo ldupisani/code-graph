@@ -3,8 +3,11 @@ import type {
   ApiError,
   ConflictResponse,
   FileAstResponse,
+  PresenceState,
+  PresenceUpdateRequest,
   ProjectRequest,
   ProjectResponse,
+  SessionInfo,
   SourceForEditResponse,
   ValidateRequest,
   ValidateResponse,
@@ -27,6 +30,50 @@ const PORT = 5174;
 const HOST = '127.0.0.1';
 
 const app = Fastify({ logger: true });
+
+// --- Presence: connected sessions per project --------------------------------
+// One entry per open SSE /watch connection. The server is a pure relay:
+// identity is minted client-side (per tab) and carried on the /watch query
+// string; presence state arrives via POST /presence and is fanned out to the
+// other sessions on the same project as SSE `presence` events. Named events
+// keep the default (unnamed) delta stream untouched for old clients.
+interface PresenceSession extends SessionInfo {
+  state: PresenceState | null;
+  write: (chunk: string) => void;
+}
+const sessionsByProject = new Map<string, Map<string, PresenceSession>>();
+
+function sseEvent(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function broadcastToProject(
+  projectId: string,
+  payload: string,
+  excludeId?: string,
+): void {
+  const sessions = sessionsByProject.get(projectId);
+  if (!sessions) return;
+  for (const s of sessions.values()) {
+    if (s.id === excludeId) continue;
+    try {
+      s.write(payload);
+    } catch {
+      // A torn-down socket races its own close handler; drop silently.
+    }
+  }
+}
+
+function rosterOf(projectId: string): SessionInfo[] {
+  const sessions = sessionsByProject.get(projectId);
+  if (!sessions) return [];
+  return [...sessions.values()].map(({ id, name, color, connectedAt }) => ({
+    id,
+    name,
+    color,
+    connectedAt,
+  }));
+}
 
 app.post<{ Body: ProjectRequest; Reply: ProjectResponse | ApiError }>(
   '/api/project',
@@ -216,7 +263,10 @@ app.post<{
 // SSE endpoint that streams filesystem events for a project. Connection is
 // kept open until the client closes the EventSource. A keep-alive comment
 // is sent every 25s in case a proxy expects periodic traffic.
-app.get<{ Params: { projectId: string } }>(
+app.get<{
+  Params: { projectId: string };
+  Querystring: { sessionId?: string; name?: string; color?: string };
+}>(
   '/api/project/:projectId/watch',
   async (req, reply) => {
     const { projectId } = req.params;
@@ -239,6 +289,33 @@ app.get<{ Params: { projectId: string } }>(
     // Mark this project as actively watched so eviction leaves it alone while a
     // window is connected; decremented in cleanup.
     noteWatchOpen(loaded);
+
+    // Register this connection as a presence session (when the client sent an
+    // identity — old clients without one still get deltas, just no presence).
+    const { sessionId, name, color } = req.query;
+    let session: PresenceSession | null = null;
+    if (sessionId) {
+      session = {
+        id: sessionId,
+        name: name || 'Anonymous',
+        color: color || '#888888',
+        connectedAt: Date.now(),
+        state: null,
+        write: (chunk) => raw.write(chunk),
+      };
+      let sessions = sessionsByProject.get(projectId);
+      if (!sessions) sessionsByProject.set(projectId, (sessions = new Map()));
+      sessions.set(sessionId, session);
+      // Everyone (including the newcomer) gets the fresh roster; the newcomer
+      // additionally gets a replay of each existing session's last presence so
+      // a late joiner immediately sees who's where without waiting a tick.
+      broadcastToProject(projectId, sseEvent('sessions', rosterOf(projectId)));
+      for (const other of sessions.values()) {
+        if (other.id === sessionId || !other.state) continue;
+        raw.write(sseEvent('presence', { sessionId: other.id, state: other.state }));
+      }
+      app.log.info(`session ${name} (${sessionId}) joined ${projectId}`);
+    }
 
     const unsubscribe = loaded.watcher.subscribe((event) => {
       // Translate the raw filesystem event into an incremental GraphDelta:
@@ -274,11 +351,40 @@ app.get<{ Params: { projectId: string } }>(
       clearInterval(heartbeat);
       unsubscribe();
       noteWatchClose(loaded);
+      if (session) {
+        const sessions = sessionsByProject.get(projectId);
+        sessions?.delete(session.id);
+        if (sessions && sessions.size === 0) sessionsByProject.delete(projectId);
+        broadcastToProject(projectId, sseEvent('sessions', rosterOf(projectId)));
+        app.log.info(`session ${session.name} (${session.id}) left ${projectId}`);
+      }
     };
     req.raw.on('close', cleanup);
     req.raw.on('error', cleanup);
   },
 );
+
+// Presence update: store the session's latest state and fan it out to every
+// OTHER session on the project. Fire-and-forget from the client's point of
+// view — an unknown session (SSE still connecting, or just dropped) is not an
+// error, the next update after the stream lands will register.
+app.post<{
+  Params: { projectId: string };
+  Body: PresenceUpdateRequest;
+  Reply: { ok: boolean } | ApiError;
+}>('/api/project/:projectId/presence', async (req, reply) => {
+  const { projectId } = req.params;
+  const { sessionId, state } = req.body ?? {};
+  if (!sessionId || !state) {
+    reply.code(400);
+    return { error: 'Missing sessionId or state.' };
+  }
+  const session = sessionsByProject.get(projectId)?.get(sessionId);
+  if (!session) return { ok: false };
+  session.state = state;
+  broadcastToProject(projectId, sseEvent('presence', { sessionId, state }), sessionId);
+  return { ok: true };
+});
 
 app.get('/api/health', async () => ({ ok: true }));
 

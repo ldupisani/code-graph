@@ -1,6 +1,6 @@
 import { Editor, type Monaco, type OnMount } from '@monaco-editor/react';
 import type { editor } from 'monaco-editor';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ConflictError,
   getSourceForEdit,
@@ -23,6 +23,48 @@ interface EditorPaneProps {
   // trigger it. Optional so the component still renders standalone (Storybook).
   exitRef?: React.MutableRefObject<(() => void) | null>;
 }
+
+// One-time (per app, not per mount) configuration of Monaco's TS worker.
+// Two decisions:
+//   1. Semantic validation OFF. Monaco can never see npm packages' .d.ts or
+//      the project's real tsconfig, so its semantic squiggles are false
+//      positives by construction ("cannot find module 'zustand'", JSX
+//      intrinsics, strictness mismatches). The save gate is the server's
+//      syntax-only validate; semantic truth is the analysis graph itself.
+//      Syntax validation stays ON for instant local feedback while typing.
+//   2. Compiler options that make RELATIVE imports resolve across the
+//      sibling models we feed it (see the closure-sync effect below), so
+//      completions / hover / inherited members work cross-file.
+// Runs via beforeMount with the LOADER's monaco instance — importing
+// 'monaco-editor' directly would configure a different copy of Monaco than
+// the one the Editor component actually uses.
+let monacoConfigured = false;
+function configureMonaco(mon: Monaco): void {
+  if (monacoConfigured) return;
+  monacoConfigured = true;
+  const ts = mon.languages.typescript;
+  for (const defaults of [ts.typescriptDefaults, ts.javascriptDefaults]) {
+    defaults.setDiagnosticsOptions({
+      noSemanticValidation: true,
+      noSyntaxValidation: false,
+    });
+    defaults.setCompilerOptions({
+      target: ts.ScriptTarget.ESNext,
+      module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeJs,
+      jsx: ts.JsxEmit.ReactJSX,
+      esModuleInterop: true,
+      allowJs: true,
+      allowNonTsExtensions: true,
+    });
+  }
+}
+
+// Sibling models cap. The import closure of one file is usually small, but a
+// hub file in a big project could pull in hundreds; past this many the worker
+// gets the nearest N files (BFS order = closest hops first) and the rest
+// simply don't resolve — degraded IntelliSense, never an error the user sees.
+const MAX_SIBLING_MODELS = 75;
 
 // Monaco syntax mode from the file extension. Monaco ships Python and
 // TS/JS grammars; anything else falls back to plain text.
@@ -103,6 +145,78 @@ export function EditorPane({ project, exitRef }: EditorPaneProps) {
   useEffect(() => {
     activeFileIdRef.current = activeFileId;
   }, [activeFileId]);
+
+  // The loader's monaco instance as STATE (monacoRef exists too, but a ref
+  // change doesn't re-run effects) so the sibling-model sync below can begin
+  // once the editor has mounted.
+  const [monacoInst, setMonacoInst] = useState<Monaco | null>(null);
+
+  // --- Monaco project context ------------------------------------------------
+  // Transitive import closure of the active file: the sibling files Monaco
+  // needs as models for relative imports and inherited members to resolve.
+  // BFS over the file-level import graph (already on the client), nearest
+  // hops first so the cap keeps the most relevant files. TS-only — Monaco
+  // has no Python language service to feed.
+  const closureFileIds = useMemo(() => {
+    if (!activeFileId || project.language === 'python') return [];
+    const importsOf = new Map<string, string[]>();
+    for (const e of project.edges) {
+      let targets = importsOf.get(e.fromId);
+      if (!targets) importsOf.set(e.fromId, (targets = []));
+      targets.push(e.toId);
+    }
+    const seen = new Set<string>([activeFileId]);
+    const queue = [activeFileId];
+    const result: string[] = [];
+    while (queue.length > 0 && result.length < MAX_SIBLING_MODELS) {
+      const cur = queue.shift();
+      if (cur == null) break;
+      for (const next of importsOf.get(cur) ?? []) {
+        if (seen.has(next)) continue;
+        seen.add(next);
+        result.push(next);
+        queue.push(next);
+        if (result.length >= MAX_SIBLING_MODELS) break;
+      }
+    }
+    return result;
+  }, [activeFileId, project.edges, project.language]);
+
+  // Mirror closure sources into Monaco models. sourceStore fetches and caches
+  // each file (idempotent, fire-and-forget); when a fetch lands, `sources`
+  // gets a new identity and this effect re-runs to create/refresh the model.
+  // Deltas invalidate the changed file's entry (App.tsx flush), so an external
+  // edit to a sibling re-fetches and re-syncs here. The ACTIVE file's model is
+  // never touched — <Editor> owns it via the `path` prop.
+  const sources = useSourceStore((s) => s.sources);
+  useEffect(() => {
+    if (!monacoInst || closureFileIds.length === 0) return;
+    const { ensure } = useSourceStore.getState();
+    for (const fileId of closureFileIds) {
+      ensure(project.projectId, fileId);
+      if (fileId === activeFileId) continue;
+      const text = sources.get(fileId);
+      if (text == null) continue; // fetch in flight; effect re-runs when it lands
+      const uri = monacoInst.Uri.file('/' + fileId);
+      const model = monacoInst.editor.getModel(uri);
+      if (!model) monacoInst.editor.createModel(text, undefined, uri);
+      else if (model.getValue() !== text) model.setValue(text);
+    }
+  }, [monacoInst, closureFileIds, sources, project.projectId, activeFileId]);
+
+  // Project switch: dispose every file:// model except the one attached to
+  // the editor (its lifecycle belongs to <Editor>). Two projects can share
+  // relative paths ('src/index.ts'), so a stale model would otherwise leak
+  // the old project's content into the new one's IntelliSense.
+  useEffect(() => {
+    if (!monacoInst) return;
+    return () => {
+      const attached = editorRef.current?.getModel() ?? null;
+      for (const m of monacoInst.editor.getModels()) {
+        if (m.uri.scheme === 'file' && m !== attached) m.dispose();
+      }
+    };
+  }, [monacoInst, project.projectId]);
 
   const resolvedFromSelection = resolveSelection(selection, project, asts);
 
@@ -390,6 +504,7 @@ export function EditorPane({ project, exitRef }: EditorPaneProps) {
     (ed, mon) => {
       editorRef.current = ed;
       monacoRef.current = mon;
+      setMonacoInst(mon);
       decorationsRef.current = ed.createDecorationsCollection();
 
       // Cmd/Ctrl-S saves (and preventDefaults the browser's save dialog while
@@ -530,7 +645,13 @@ export function EditorPane({ project, exitRef }: EditorPaneProps) {
         <Editor
           theme="vs-dark"
           language={languageForFile(activeFileId)}
+          // Real per-file URI (file:///src/Dog.ts) instead of the default
+          // anonymous inmemory model — relative-import resolution keys off
+          // model URIs, so this is what lets './Animal' find the sibling
+          // model at file:///src/Animal.ts.
+          path={`file:///${activeFileId}`}
           value={source}
+          beforeMount={configureMonaco}
           onMount={onMount}
           onChange={onChange}
           options={{

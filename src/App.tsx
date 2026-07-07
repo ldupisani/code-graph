@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Group, Panel, Separator, usePanelRef } from 'react-resizable-panels';
 import { openProject, subscribeToDeltas } from './api/client';
 import { selfSavedFileIds, useGraphStore } from './graph/store';
+import { useSourceStore } from './graph/sourceStore';
 import { PixiCanvas, requestSelectionFrame, type CameraApi } from './render/PixiCanvas';
 import { ZoomControls } from './ui/ZoomControls';
 import { PinControls } from './ui/PinControls';
@@ -244,6 +245,10 @@ export function App() {
       const touched: string[] = [];
       for (const d of buffer) {
         applyDelta(d);
+        // Drop the changed file's cached source so consumers re-fetch fresh
+        // text: JSX previews slice offsets out of it, and EditorPane mirrors
+        // it into Monaco sibling models for cross-file IntelliSense.
+        useSourceStore.getState().invalidate(d.fileId);
         if (d.kind !== 'removed') touched.push(d.fileId);
       }
       buffer.length = 0;

@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { Project, ts, type Node, type SourceFile } from 'ts-morph';
 import type {
+  Diagnostic,
   FileAstResponse,
   FileNode,
   ImportEdge,
@@ -155,6 +156,37 @@ export class TypeScriptAnalyzer implements LanguageAnalyzer {
   async readSource(fileId: string): Promise<string | undefined> {
     const sf = this.findSourceFile(fileId);
     return sf?.getFullText();
+  }
+
+  // Dry-run on a THROWAWAY in-memory Project — fully isolated, so it can never
+  // corrupt the live `project` / `idByNode` (mutating the live SourceFile and
+  // restoring it would swap node identities and invalidate idByNode). We assert
+  // two things: the buffer parses (no syntactic diagnostics) and our own AST
+  // walk (extractAst) doesn't throw on it. Semantic/type diagnostics are
+  // deliberately ignored — the gate is "won't break analysis", not "typechecks".
+  async validate(
+    fileId: string,
+    text: string,
+  ): Promise<{ ok: boolean; diagnostics: Diagnostic[] }> {
+    const absPath = path.join(this.rootPath, fileId);
+    const diagnostics: Diagnostic[] = [];
+    let sf: SourceFile;
+    try {
+      const scratch = new Project({
+        useInMemoryFileSystem: true,
+        compilerOptions: this.project.getCompilerOptions(),
+      });
+      sf = scratch.createSourceFile(absPath, text, { overwrite: true });
+      const program = scratch.getProgram().compilerObject;
+      for (const d of program.getSyntacticDiagnostics(sf.compilerNode)) {
+        diagnostics.push(tsDiagnosticToMonaco(d, sf.compilerNode));
+      }
+      // Only run our walk if it parsed — extractAst assumes a well-formed tree.
+      if (diagnostics.length === 0) extractAst(sf, fileId);
+    } catch (e) {
+      diagnostics.push(wholeFileDiagnostic(text, `Analysis failed: ${msgOf(e)}`));
+    }
+    return { ok: !diagnostics.some((d) => d.severity === 'error'), diagnostics };
   }
 
   async applyChange(
@@ -312,4 +344,37 @@ function countLines(text: string): number {
   let n = 1;
   for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) n++;
   return n;
+}
+
+function msgOf(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+// Convert a ts.Diagnostic (char offset + length) to Monaco's 1-based line/col.
+function tsDiagnosticToMonaco(d: ts.Diagnostic, sf: ts.SourceFile): Diagnostic {
+  const start = d.start ?? 0;
+  const length = d.length ?? 1;
+  const s = sf.getLineAndCharacterOfPosition(start);
+  const e = sf.getLineAndCharacterOfPosition(start + length);
+  return {
+    severity: 'error',
+    message: ts.flattenDiagnosticMessageText(d.messageText, '\n'),
+    startLineNumber: s.line + 1,
+    startColumn: s.character + 1,
+    endLineNumber: e.line + 1,
+    endColumn: e.character + 1,
+  };
+}
+
+// Fallback diagnostic spanning the whole file when we can't localize the error.
+function wholeFileDiagnostic(text: string, message: string): Diagnostic {
+  const lines = text.length === 0 ? 1 : text.split('\n').length;
+  return {
+    severity: 'error',
+    message,
+    startLineNumber: 1,
+    startColumn: 1,
+    endLineNumber: lines,
+    endColumn: 1,
+  };
 }

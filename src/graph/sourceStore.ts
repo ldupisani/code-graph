@@ -20,6 +20,9 @@ import {getFileSource} from "../api/client";
 interface SourceStore {
     sources: ReadonlyMap<string, string>;
     ensure: (projectId: string, fileId: string) => void;
+    // Drop one file's cached source — called after a save so previews re-fetch
+    // the new content instead of slicing offsets out of stale text.
+    invalidate: (fileId: string) => void;
     // Drop everything — called on project switch / re-walk, where file
     // contents (and the offsets pointing into them) may have changed.
     clear: () => void;
@@ -49,6 +52,14 @@ export const useSourceStore = create<SourceStore>()((set, get) => ({
                 inFlight.delete(fileId);
             });
     },
+
+    invalidate: (fileId) =>
+        set((s) => {
+            if (!s.sources.has(fileId)) return s;
+            const next = new Map(s.sources);
+            next.delete(fileId);
+            return {sources: next};
+        }),
 
     clear: () => set({sources: new Map()}),
 }));

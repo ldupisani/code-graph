@@ -1,4 +1,5 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type {
   FileAstResponse,
@@ -315,6 +316,105 @@ export function getCachedAst(
   fileId: string,
 ): FileAstResponse | undefined {
   return loaded.asts.get(fileId);
+}
+
+// --- Editing (write path) --------------------------------------------------
+
+function hashText(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+export interface SourceForEdit {
+  text: string;
+  mtimeMs: number;
+  hash: string;
+}
+
+// Read a file's source straight from DISK (not the analyzer's in-memory buffer,
+// which can lag disk for ts-morph). Returned to the editor as both the content
+// and the conflict baseline, so text and hash are always coherent.
+export function readSourceForEdit(
+  loaded: LoadedProject,
+  fileId: string,
+): SourceForEdit | undefined {
+  const abs = path.join(loaded.rootPath, fileId);
+  try {
+    const text = readFileSync(abs, 'utf8');
+    return { text, mtimeMs: statSync(abs).mtimeMs, hash: hashText(text) };
+  } catch {
+    return undefined;
+  }
+}
+
+export function validateSource(
+  loaded: LoadedProject,
+  fileId: string,
+  text: string,
+) {
+  return loaded.analyzer.validate(fileId, text);
+}
+
+export interface WriteResult {
+  delta: GraphDelta | null;
+  newMtimeMs: number;
+  newHash: string;
+}
+export interface WriteConflict {
+  conflict: {
+    error: string;
+    currentText: string;
+    currentMtimeMs: number;
+    currentHash: string;
+  };
+}
+
+// Conflict-checked write, then reuse the SAME incremental pipeline as an
+// external edit (applyFileEvent) to re-analyze the file and recompute the edges
+// over {fileId} ∪ importers, returning the delta. The write also fires a
+// chokidar 'change' event that fans out over SSE to every window (including
+// this one) — applyDelta is idempotent, so the echo re-applying the same delta
+// is a no-op, and NOT suppressing it is what keeps other windows in sync.
+export async function writeSource(
+  loaded: LoadedProject,
+  fileId: string,
+  req: { text: string; baseHash: string | null; force?: boolean },
+): Promise<WriteResult | WriteConflict> {
+  const abs = path.join(loaded.rootPath, fileId);
+  const exists = existsSync(abs);
+
+  if (!req.force) {
+    if (exists) {
+      const cur = readFileSync(abs, 'utf8');
+      const curHash = hashText(cur);
+      if (req.baseHash !== curHash) {
+        return {
+          conflict: {
+            error: 'File changed on disk since you started editing.',
+            currentText: cur,
+            currentMtimeMs: statSync(abs).mtimeMs,
+            currentHash: curHash,
+          },
+        };
+      }
+    } else if (req.baseHash !== null) {
+      // The client edited an existing file, but it's gone from disk now.
+      return {
+        conflict: {
+          error: 'File no longer exists on disk.',
+          currentText: '',
+          currentMtimeMs: 0,
+          currentHash: '',
+        },
+      };
+    }
+  }
+
+  writeFileSync(abs, req.text, 'utf8');
+  const delta = await applyFileEvent(loaded, {
+    kind: exists ? 'changed' : 'added',
+    fileId,
+  });
+  return { delta, newMtimeMs: statSync(abs).mtimeMs, newHash: hashText(req.text) };
 }
 
 // Apply a single filesystem event to a loaded project IN PLACE, re-walking

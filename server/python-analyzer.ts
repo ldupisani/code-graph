@@ -2,6 +2,7 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:chil
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import type {
+  Diagnostic,
   FileAstResponse,
   FileNode,
   ImportEdge,
@@ -114,6 +115,19 @@ export class PythonAnalyzer implements LanguageAnalyzer {
       source: string | null;
     };
     return res.source ?? undefined;
+  }
+
+  async validate(
+    fileId: string,
+    text: string,
+  ): Promise<{ ok: boolean; diagnostics: Diagnostic[] }> {
+    // The helper returns `valid` (not `ok`) — the RPC layer reserves `ok` for
+    // transport success and overwrites it on the way out.
+    const res = (await this.request('validate', { fileId, text })) as {
+      valid: boolean;
+      diagnostics: Diagnostic[];
+    };
+    return { ok: res.valid, diagnostics: res.diagnostics };
   }
 
   async applyChange(

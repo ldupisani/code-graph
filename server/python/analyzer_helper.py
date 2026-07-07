@@ -795,6 +795,41 @@ class Analyzer:
         fd = self.files.get(msg["fileId"])
         return {"source": fd.source if fd else None}
 
+    def op_validate(self, msg):
+        # Dry-run parse + node walk on a PROPOSED buffer. Constructs a LOCAL
+        # FileData without assigning into self.files, so live state is untouched
+        # (FileData only becomes shared when parse_file stores it). ok=False if
+        # the buffer wouldn't parse / would break our walk.
+        file_id = msg["fileId"]
+        text = msg["text"]
+        abs_path = os.path.join(self.root, file_id.replace("/", os.sep))
+        diags = []
+        try:
+            FileData(file_id, abs_path, text)
+        except SyntaxError as e:
+            line = e.lineno or 1
+            col = e.offset or 1
+            diags.append({
+                "severity": "error",
+                "message": e.msg or "SyntaxError",
+                "startLineNumber": line,
+                "startColumn": col,
+                "endLineNumber": line,
+                "endColumn": col + 1,
+            })
+        except Exception as e:
+            diags.append({
+                "severity": "error",
+                "message": str(e),
+                "startLineNumber": 1,
+                "startColumn": 1,
+                "endLineNumber": 1,
+                "endColumn": 2,
+            })
+        # NB: use "valid", NOT "ok" — the RPC main loop overwrites result["ok"]
+        # with the transport-level success flag, which would clobber ours.
+        return {"valid": not any(d["severity"] == "error" for d in diags), "diagnostics": diags}
+
     def op_apply_change(self, msg):
         kind = msg["kind"]
         file_id = msg["fileId"]
@@ -1099,6 +1134,7 @@ def main():
         "open": analyzer.op_open,
         "extract": analyzer.op_extract,
         "source": analyzer.op_source,
+        "validate": analyzer.op_validate,
         "applyChange": analyzer.op_apply_change,
         "buildEdges": analyzer.op_build_edges,
         "importersOf": analyzer.op_importers_of,

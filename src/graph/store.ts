@@ -1,6 +1,14 @@
 import { create } from 'zustand';
 import type { FileAstResponse, GraphDelta, ProjectResponse } from '../api/types';
 
+// Files the client just wrote itself (populated by EditorPane on save). The SSE
+// delta flush in App.tsx consults this so a save's OWN watcher echo doesn't
+// auto-select the file and re-frame the camera — which the edit-mode guard can
+// no longer cover once "Save & exit" has left edit mode before the echo lands.
+// Consumed (deleted) by the flush; a timeout sweeps any entry whose echo never
+// arrives. A plain module Set, not store state — nothing renders off it.
+export const selfSavedFileIds = new Set<string>();
+
 // Which edge kinds the renderer should draw. The user toggles these
 // via the EdgeFilterPills HUD; the renderer consults this set each
 // frame and skips passes / individual edges accordingly. Default is
@@ -74,11 +82,19 @@ export interface GraphStore {
   // current question and should never disappear.
   tracedPath: readonly string[] | null;
   // When false, files matching the support-file pattern (.test /
-  // .spec / .stories / __tests__/* / __mocks__/*) and edges
-  // touching them aren't rendered. They're typically the majority
-  // by count in a React project and dominate the visual without
-  // adding to the architectural story.
+  // .spec / .stories / __tests__/* / __mocks__/* for JS/TS, and
+  // test_*.py / *_test.py / conftest.py / tests/* for Python) and
+  // edges touching them aren't rendered. They're typically the
+  // majority by count and dominate the visual without adding to the
+  // architectural story.
   showSupportFiles: boolean;
+  // Edit mode: when true, the Monaco pane for `editFileId` is editable and the
+  // canvas single-key hotkeys yield to typing (see App.tsx onKey). Lives in the
+  // graph store because both the global keydown handler and the SSE-delta flush
+  // guard need to read it — the flush must NOT auto-select/re-frame when the
+  // delta is the echo of the user's own save on the file they're editing.
+  editMode: boolean;
+  editFileId: string | null;
   // NOTE: the "isolate" direction toggles moved to useConfigStore
   // (config.behavioral.isolateImports / isolateExports) so they persist and
   // travel with layout templates. The renderer reads them from there.
@@ -121,6 +137,8 @@ export interface GraphStore {
   setFocusDirection: (d: 'both' | 'in' | 'out') => void;
   setTracedPath: (ids: readonly string[] | null) => void;
   setShowSupportFiles: (show: boolean) => void;
+  enterEditMode: (fileId: string) => void;
+  exitEditMode: () => void;
 }
 
 const ALL_EDGES_ON: EdgeFilter = { imports: true, calls: true, extends: true };
@@ -141,6 +159,8 @@ export const useGraphStore = create<GraphStore>((set) => ({
   focusDirection: 'both',
   tracedPath: null,
   showSupportFiles: false,
+  editMode: false,
+  editFileId: null,
   setProject: (project) =>
     set((s) => ({
       project,
@@ -159,6 +179,9 @@ export const useGraphStore = create<GraphStore>((set) => ({
       // switches — it's a "how I like to look at code" setting,
       // not a per-project one.
       showSupportFiles: s.showSupportFiles,
+      // A new project can't inherit an edit session from the old one.
+      editMode: false,
+      editFileId: null,
     })),
   // Used after a filesystem-driven re-walk: file-level identity is stable so
   // we keep expansion state, but AST node IDs may have shifted (sequential
@@ -351,6 +374,8 @@ export const useGraphStore = create<GraphStore>((set) => ({
   setFocusDirection: (focusDirection) => set({ focusDirection }),
   setTracedPath: (tracedPath) => set({ tracedPath }),
   setShowSupportFiles: (showSupportFiles) => set({ showSupportFiles }),
+  enterEditMode: (editFileId) => set({ editMode: true, editFileId }),
+  exitEditMode: () => set({ editMode: false, editFileId: null }),
 }));
 
 // Test / story / spec / __tests__ / __mocks__: typically the majority
@@ -358,8 +383,14 @@ export const useGraphStore = create<GraphStore>((set) => ({
 // Hidden by default; the EdgeFilterPills HUD has a toggle to surface
 // them.
 export function isSupportFile(relativePath: string): boolean {
+  // JS/TS: .test / .spec / .stories files, __tests__ / __mocks__ dirs.
   if (/\.(test|spec|stories)\.[jt]sx?$/.test(relativePath)) return true;
   if (/(^|\/)__(tests|mocks)__\//.test(relativePath)) return true;
+  // Python: pytest/unittest use a test_ prefix or _test suffix, a plain
+  // tests/ (or test/) dir, and conftest.py for shared fixtures.
+  if (/(^|\/)(test_[^/]+|[^/]+_test|conftest)\.py$/.test(relativePath))
+    return true;
+  if (/(^|\/)tests?\//.test(relativePath)) return true;
   return false;
 }
 

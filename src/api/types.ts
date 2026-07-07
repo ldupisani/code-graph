@@ -210,3 +210,70 @@ export interface FileAstResponse {
   rootId: string;
   nodes: AstNode[];
 }
+
+// --- Editing (write path) --------------------------------------------------
+// Everything below drives "edit the codebase from the app": the editor loads
+// disk-truth source + a baseline, validates a proposed buffer WITHOUT writing
+// (the save gate — a save is only allowed when the edit won't break graph
+// analysis), then writes with a conflict check. After a successful write the
+// existing watcher→SSE→applyDelta pipeline re-analyzes and re-renders in place.
+
+// A parse/analysis diagnostic, pre-converted to Monaco's 1-based line/column
+// coordinates so the client can push it straight into setModelMarkers.
+export interface Diagnostic {
+  severity: 'error' | 'warning';
+  message: string;
+  startLineNumber: number;
+  startColumn: number;
+  endLineNumber: number;
+  endColumn: number;
+}
+
+// GET /source-for-edit — disk-truth source plus the baseline the client echoes
+// back on save so the server can detect a concurrent on-disk change. Read from
+// disk (not the analyzer's in-memory buffer) so text and baseline are coherent.
+export interface SourceForEditResponse {
+  text: string;
+  mtimeMs: number;
+  hash: string; // sha256 hex of the exact bytes returned
+}
+
+// POST /validate — dry-run parse → AST-extract on a proposed buffer, no write.
+export interface ValidateRequest {
+  text: string;
+}
+export interface ValidateResponse {
+  ok: boolean; // false when the buffer would break graph analysis
+  diagnostics: Diagnostic[];
+}
+
+// POST /source — write the buffer to disk (guarded by the baseline).
+export interface WriteRequest {
+  text: string;
+  // Baseline the edit was based on, from SourceForEditResponse. null asserts
+  // the file did NOT exist when editing began (future new-file scaffolding).
+  baseMtimeMs: number | null;
+  baseHash: string | null;
+  // Set by the "overwrite" path after a 409 to bypass the conflict check.
+  force?: boolean;
+}
+export interface WriteResponse {
+  ok: true;
+  newMtimeMs: number;
+  newHash: string;
+  // The same GraphDelta the SSE watcher will also emit — an optional latency
+  // shortcut so the client can merge immediately. Safe to ignore: applyDelta
+  // is idempotent and the watcher echo re-applies it.
+  delta?: GraphDelta;
+}
+
+// 409 body when the on-disk file changed under the edit (external editor or
+// another window sharing this project's analyzer). Carries the current disk
+// content so the client can offer reload-or-overwrite.
+export interface ConflictResponse {
+  error: string;
+  conflict: true;
+  currentText: string;
+  currentMtimeMs: number;
+  currentHash: string;
+}

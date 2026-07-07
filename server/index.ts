@@ -1,9 +1,15 @@
 import Fastify from 'fastify';
 import type {
   ApiError,
+  ConflictResponse,
   FileAstResponse,
   ProjectRequest,
   ProjectResponse,
+  SourceForEditResponse,
+  ValidateRequest,
+  ValidateResponse,
+  WriteRequest,
+  WriteResponse,
 } from '../src/api/types';
 import {
   applyFileEvent,
@@ -12,6 +18,9 @@ import {
   noteWatchClose,
   noteWatchOpen,
   openProject,
+  readSourceForEdit,
+  validateSource,
+  writeSource,
 } from './project';
 
 const PORT = 5174;
@@ -96,6 +105,112 @@ app.get<{
   }
   reply.type('text/plain; charset=utf-8');
   return source;
+});
+
+// Editor load: disk-truth source + the baseline (mtime + hash) the client
+// echoes back on save so we can detect a concurrent on-disk change. Distinct
+// from GET /source (in-memory text for previews) so that contract stays intact.
+app.get<{
+  Params: { projectId: string };
+  Querystring: { fileId?: string };
+  Reply: SourceForEditResponse | ApiError;
+}>('/api/project/:projectId/source-for-edit', async (req, reply) => {
+  const { projectId } = req.params;
+  const fileId = req.query.fileId;
+  if (!fileId) {
+    reply.code(400);
+    return { error: 'Missing required query param: fileId' };
+  }
+  const loaded = getLoadedProject(projectId);
+  if (!loaded) {
+    reply.code(404);
+    return { error: `Unknown projectId: ${projectId}. Re-open the project.` };
+  }
+  const res = readSourceForEdit(loaded, fileId);
+  if (!res) {
+    reply.code(404);
+    return { error: `Unknown fileId: ${fileId}` };
+  }
+  return res;
+});
+
+// Dry-run the analysis on a proposed buffer WITHOUT writing — the save gate.
+app.post<{
+  Params: { projectId: string };
+  Querystring: { fileId?: string };
+  Body: ValidateRequest;
+  Reply: ValidateResponse | ApiError;
+}>('/api/project/:projectId/validate', async (req, reply) => {
+  const { projectId } = req.params;
+  const fileId = req.query.fileId;
+  if (!fileId) {
+    reply.code(400);
+    return { error: 'Missing required query param: fileId' };
+  }
+  if (typeof req.body?.text !== 'string') {
+    reply.code(400);
+    return { error: 'Missing required body field: text (string).' };
+  }
+  const loaded = getLoadedProject(projectId);
+  if (!loaded) {
+    reply.code(404);
+    return { error: `Unknown projectId: ${projectId}. Re-open the project.` };
+  }
+  return validateSource(loaded, fileId, req.body.text);
+});
+
+// Write the buffer to disk (baseline-guarded) and return the resulting delta.
+// 409 with the current disk content when the baseline no longer matches.
+app.post<{
+  Params: { projectId: string };
+  Querystring: { fileId?: string };
+  Body: WriteRequest;
+  Reply: WriteResponse | ConflictResponse | ApiError;
+}>('/api/project/:projectId/source', async (req, reply) => {
+  const { projectId } = req.params;
+  const fileId = req.query.fileId;
+  if (!fileId) {
+    reply.code(400);
+    return { error: 'Missing required query param: fileId' };
+  }
+  if (typeof req.body?.text !== 'string') {
+    reply.code(400);
+    return { error: 'Missing required body field: text (string).' };
+  }
+  const loaded = getLoadedProject(projectId);
+  if (!loaded) {
+    reply.code(404);
+    return { error: `Unknown projectId: ${projectId}. Re-open the project.` };
+  }
+  try {
+    const result = await writeSource(loaded, fileId, {
+      text: req.body.text,
+      baseHash: req.body.baseHash ?? null,
+      force: req.body.force,
+    });
+    if ('conflict' in result) {
+      reply.code(409);
+      return {
+        error: result.conflict.error,
+        conflict: true,
+        currentText: result.conflict.currentText,
+        currentMtimeMs: result.conflict.currentMtimeMs,
+        currentHash: result.conflict.currentHash,
+      };
+    }
+    app.log.info(`wrote ${fileId} (${req.body.text.length} chars)`);
+    return {
+      ok: true,
+      newMtimeMs: result.newMtimeMs,
+      newHash: result.newHash,
+      delta: result.delta ?? undefined,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    app.log.warn({ err: msg }, `writeSource failed for ${fileId}`);
+    reply.code(400);
+    return { error: msg };
+  }
 });
 
 // SSE endpoint that streams filesystem events for a project. Connection is

@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, statSync, type Dirent } from 'node:fs';
 import path from 'node:path';
 import type {
+  Diagnostic,
   FileAstResponse,
   FileNode,
   ImportEdge,
@@ -80,6 +81,18 @@ export interface LanguageAnalyzer {
 
   // Raw source text for GET /source.
   readSource(fileId: string): Promise<string | undefined>;
+
+  // Dry-run the parse → AST-extract pipeline on a PROPOSED buffer WITHOUT
+  // mutating any live engine state (the write gate for editing). ok=false when
+  // the buffer would break graph analysis — a syntax error, or our AST walk
+  // throwing on it. Diagnostics are Monaco-ready (1-based line/col). Cross-file
+  // edge resolution is intentionally NOT part of this check: an edit that
+  // changes which symbols resolve produces *different* edges, not *broken*
+  // analysis, and the authoritative edges are recomputed after the write.
+  validate(
+    fileId: string,
+    text: string,
+  ): Promise<{ ok: boolean; diagnostics: Diagnostic[] }>;
 
   // Apply a single filesystem change, re-parsing ONLY this file. Edge
   // recomputation is driven separately by the orchestrator via buildEdges

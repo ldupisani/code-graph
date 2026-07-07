@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Group, Panel, Separator, usePanelRef } from 'react-resizable-panels';
 import { openProject, subscribeToDeltas } from './api/client';
-import { useGraphStore } from './graph/store';
+import { selfSavedFileIds, useGraphStore } from './graph/store';
 import { PixiCanvas, requestSelectionFrame, type CameraApi } from './render/PixiCanvas';
 import { ZoomControls } from './ui/ZoomControls';
 import { PinControls } from './ui/PinControls';
@@ -29,13 +29,16 @@ export function App() {
   const project = useGraphStore((s) => s.project);
   const setProject = useGraphStore((s) => s.setProject);
   const applyDelta = useGraphStore((s) => s.applyDelta);
-  const addSelection = useGraphStore((s) => s.addSelection);
+  const setSelection = useGraphStore((s) => s.setSelection);
 
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   // Imperative camera handle the PixiCanvas fills in; drives the zoom buttons.
   const cameraApiRef = useRef<CameraApi | null>(null);
+  // EditorPane registers its dirty-guarded edit-mode exit here so the global
+  // Esc handler can trigger it (with a "discard unsaved edits?" confirm).
+  const editExitRef = useRef<(() => void) | null>(null);
 
   // Imperative handle for the right-hand editor Panel so a header button can
   // collapse / expand it. `editorCollapsed` mirrors its state to flip the
@@ -120,6 +123,16 @@ export function App() {
         setSearchOpen((v) => !v);
         return;
       }
+      // Edit mode owns the keyboard: every canvas single-key hotkey yields to
+      // typing. Only Esc is handled here — routed to EditorPane's dirty-guarded
+      // exit. (Cmd-S is a Monaco command registered in EditorPane, not here.)
+      if (useGraphStore.getState().editMode) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          (editExitRef.current ?? useGraphStore.getState().exitEditMode)();
+        }
+        return;
+      }
       if (isTypingTarget(e.target)) return;
       const st = useGraphStore.getState();
       // View snapshots — only meaningful with a project open. Read project
@@ -146,6 +159,20 @@ export function App() {
           if (snap) {
             e.preventDefault();
             applySnapshot(snap, cameraApiRef.current);
+          }
+          return;
+        }
+        // 'e' enters edit mode on the file owning the current selection (a file
+        // id, or the file half of a `${fileId}#seq` AST-node id). EditorPane
+        // becomes editable and the panel auto-expands (effect below).
+        if (e.key === 'e' || e.key === 'E') {
+          const sel = st.selection;
+          if (sel) {
+            const fileId = sel.includes('#') ? sel.slice(0, sel.lastIndexOf('#')) : sel;
+            if (st.project.files.some((f) => f.id === fileId)) {
+              e.preventDefault();
+              st.enterEditMode(fileId);
+            }
           }
           return;
         }
@@ -198,22 +225,43 @@ export function App() {
       // SET actually changes (a file enters/leaves the selection) vs just an
       // edit to an already-selected file.
       const before = new Set(useGraphStore.getState().selectionSet);
+      // If every buffered delta is for the file the user is actively editing,
+      // this is the echo of their own save (or an external edit to that same
+      // file). Don't auto-select the file or re-frame — that would clobber the
+      // user's AST-node selection and jump the camera mid-edit. Just merge.
+      const st = useGraphStore.getState();
+      const editGuard =
+        st.editMode &&
+        st.editFileId != null &&
+        buffer.length > 0 &&
+        buffer.every((d) => d.fileId === st.editFileId);
+      // Echo of the user's own save: suppress auto-select/re-frame even after
+      // "Save & exit" has left edit mode. Consume the markers as we go.
+      const selfGuard =
+        buffer.length > 0 && buffer.every((d) => selfSavedFileIds.has(d.fileId));
+      for (const d of buffer) selfSavedFileIds.delete(d.fileId);
+      const viewGuard = editGuard || selfGuard;
       const touched: string[] = [];
       for (const d of buffer) {
         applyDelta(d);
         if (d.kind !== 'removed') touched.push(d.fileId);
       }
       buffer.length = 0;
-      // Auto-select files that are newly added/changed (not already selected).
-      const current = useGraphStore.getState().selectionSet;
-      const newlySelected = touched.filter((id) => !current.has(id));
-      if (newlySelected.length > 0) addSelection(newlySelected);
-      // Re-frame the camera ONLY when the set of selected files changed — a file
-      // entered (added/changed-and-not-yet-selected) or left (a selected file was
-      // removed and pruned). Editing an already-selected file leaves the set
-      // unchanged, so the camera stays exactly where the user left it.
-      const after = useGraphStore.getState().selectionSet;
-      if (!sameStringSet(before, after)) requestSelectionFrame();
+      if (!viewGuard) {
+        // Auto-select ONLY the most-recently changed file (last delta in arrival
+        // order), REPLACING any prior selection rather than accumulating. During a
+        // rapid update burst the selection set would otherwise grow unboundedly and
+        // the camera would lurch to re-frame an ever-wider spread of files. Tracking
+        // just the latest file keeps the view pinned to one small target.
+        const latest = touched.length > 0 ? touched[touched.length - 1] : null;
+        if (latest && useGraphStore.getState().selection !== latest) setSelection(latest);
+        // Re-frame the camera ONLY when the set of selected files changed — the
+        // latest changed file became the (new) selection, or a selected file was
+        // removed and pruned. Re-saving the file that's ALREADY the sole selection
+        // leaves the set unchanged, so the camera stays exactly where it is.
+        const after = useGraphStore.getState().selectionSet;
+        if (!sameStringSet(before, after)) requestSelectionFrame();
+      }
       setRefreshing(true);
       if (clearFlash) clearTimeout(clearFlash);
       clearFlash = setTimeout(() => setRefreshing(false), 400);
@@ -231,7 +279,17 @@ export function App() {
       if (flushTimer) clearTimeout(flushTimer);
       if (clearFlash) clearTimeout(clearFlash);
     };
-  }, [project?.projectId, applyDelta, addSelection]);
+  }, [project?.projectId, applyDelta, setSelection]);
+
+  // Entering edit mode (e.g. via the 'e' hotkey while the canvas is focused)
+  // auto-expands the editor panel so the user can actually see what they're
+  // editing.
+  const editMode = useGraphStore((s) => s.editMode);
+  useEffect(() => {
+    if (!editMode) return;
+    const p = editorPanelRef.current;
+    if (p && p.isCollapsed()) p.expand();
+  }, [editMode]);
 
   return (
     <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column' }}>
@@ -312,7 +370,7 @@ export function App() {
               panelRef={editorPanelRef}
               onResize={(size) => setEditorCollapsed(size.asPercentage === 0)}
             >
-              <EditorPane project={project} />
+              <EditorPane project={project} exitRef={editExitRef} />
             </Panel>
           </Group>
         ) : (

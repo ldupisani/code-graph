@@ -381,6 +381,11 @@ export function EditorPane({ project, exitRef }: EditorPaneProps) {
     if (!useGraphStore.getState().editMode) return;
     if (!dirtyRef.current || savingRef.current || hasErrorRef.current) return;
     setSaving(true);
+    // Also flip the ref SYNCHRONOUSLY — the mirror effect only updates it
+    // after the next render, so two same-tick invocations (Monaco's Cmd-S
+    // command and the window-level fallback below can both match one
+    // keydown) would otherwise both pass the guard and double-write.
+    savingRef.current = true;
     try {
       const res = await writeSource(project.projectId, fileId, {
         text: currentTextRef.current,
@@ -417,6 +422,27 @@ export function EditorPane({ project, exitRef }: EditorPaneProps) {
   useEffect(() => {
     saveRef.current = save;
   }, [save]);
+
+  // Window-level Cmd/Ctrl-S fallback. Monaco's own Cmd-S command only fires
+  // while the EDITOR has focus; mid-edit the user is often focused on the
+  // canvas (clicking nodes, panning), where the browser's save-page dialog
+  // would win. While edit mode is on, swallow the shortcut everywhere and
+  // route it to save — even when there's nothing to save (not dirty / has
+  // errors), the browser dialog should never appear over an edit session.
+  // When Monaco DID handle it, the event arrives here with defaultPrevented
+  // set (and save() is reentrancy-guarded via savingRef regardless).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+      if (e.key.toLowerCase() !== 's') return;
+      if (!useGraphStore.getState().editMode) return;
+      if (e.defaultPrevented) return; // Monaco's command already took it
+      e.preventDefault();
+      void saveRef.current();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   // --- Conflict resolution -------------------------------------------------
   const reloadFromDisk = useCallback(() => {

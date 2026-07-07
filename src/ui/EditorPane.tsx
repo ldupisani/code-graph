@@ -335,6 +335,40 @@ export function EditorPane({ project, exitRef }: EditorPaneProps) {
     };
   }, [targetFileId, activeFileId, project.projectId, clearMarkers]);
 
+  // Reload the buffer when the ACTIVE file changes ON DISK. The load effect
+  // above only fires on file SWAPS (targetFileId !== activeFileId), so an
+  // in-place change — another session's save, an external editor — left the
+  // pane showing stale text even while the graph (which gets a fresh AST via
+  // the delta) had already updated. The delta replaces the file's entry in
+  // `asts`, so that object's identity is our change signal. Never fires while
+  // the user is editing: unsaved local work must not be clobbered — the save
+  // path's conflict detection owns that case.
+  const activeAst = activeFileId ? asts.get(activeFileId) : undefined;
+  useEffect(() => {
+    if (!activeFileId || !activeAst) return;
+    if (useGraphStore.getState().editMode) return;
+    let cancelled = false;
+    getSourceForEdit(project.projectId, activeFileId)
+      .then((res) => {
+        if (cancelled) return;
+        if (activeFileIdRef.current !== activeFileId) return; // swapped meanwhile
+        if (res.text === baselineTextRef.current) return; // no content change
+        baselineTextRef.current = res.text;
+        currentTextRef.current = res.text;
+        baseHashRef.current = res.hash;
+        baseMtimeMsRef.current = res.mtimeMs;
+        setSource(res.text);
+        setDirty(false);
+      })
+      .catch(() => {
+        // Transient fetch failure: keep showing the last-loaded text; the
+        // next delta (or file swap) retries.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeAst, activeFileId, project.projectId]);
+
   // Focus the editor when entering edit mode so the user can just start typing.
   useEffect(() => {
     if (isEditing) editorRef.current?.focus();

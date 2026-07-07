@@ -1930,6 +1930,13 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 const ambient = state.selectionSet.size === 0;
                 const effectiveLiveFiles: ReadonlySet<string> | null = ambient ? AMBIENT_EMPTY_LIVE_SET : liveFiles;
 
+                // The file whose buffer is open in edit mode. It gets the
+                // same "user's point of attention" treatment as selection:
+                // never hidden (tests filter / isolate), never dimmed, and
+                // ringed below so the canvas shows WHERE the edit is
+                // happening even when the selection has moved elsewhere.
+                const editingFileId = state.editMode ? state.editFileId : null;
+
                 // Path-trace lookup: a set of "${a}|${b}" keys for every
                 // CONSECUTIVE pair in state.tracedPath (both directions, so
                 // edge-direction independence is automatic). drawEdges /
@@ -2002,6 +2009,10 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                             }
                         }
                     }
+                    // The file open in the editor is never hidden: the user
+                    // has a live buffer on it, so neither the tests filter
+                    // nor isolate mode may drop it off the canvas.
+                    if (editingFileId) out.delete(editingFileId);
                     return out;
                 })();
                 const hiddenFileIds = frameHiddenFileIds;
@@ -2083,7 +2094,8 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     const dimmed =
                         effectiveLiveFiles != null &&
                         !effectiveLiveFiles.has(sim.id) &&
-                        !pathFileSet.has(sim.id);
+                        !pathFileSet.has(sim.id) &&
+                        sim.id !== editingFileId;
                     drawFile(sim, selectionSet, dimmed ? 0.22 : 1);
                 }
                 // 2c. Path overlay: thin yellow outline around every file
@@ -2220,8 +2232,13 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             ): void {
                 const x = sim.x - sim.width / 2;
                 const y = sim.y - sim.height / 2;
-                const expanded = useGraphStore.getState().expandedFiles.has(sim.id);
+                const storeState = useGraphStore.getState();
+                const expanded = storeState.expandedFiles.has(sim.id);
                 const isSelected = selectionSet.has(sim.id);
+                // Being edited is the strongest form of attention — the
+                // file's name gets the same LOD/emphasis exemptions as
+                // selection and hover below.
+                const isEdited = storeState.editMode && storeState.editFileId === sim.id;
                 // Hover reveals the file name even when the LOD gate would
                 // otherwise hide it — `hoveredHit` is set by the camera's
                 // hit-test pipeline; we just consult it here.
@@ -2253,7 +2270,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // HOVERED file are exceptions — they're the user's anchor
                     // and current point of attention; both stay readable.
                     const fileNamesVisible = cameraScale >= cfg.lod.fileNamesAtMul * Math.max(fitScale, 1e-4);
-                    if (!fileNamesVisible && !isSelected && !isHovered) {
+                    if (!fileNamesVisible && !isSelected && !isHovered && !isEdited) {
                         return;
                     }
                     // Expanded files AND hovered files show the FULL
@@ -2272,7 +2289,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // (no cluster) keep the default white so the active
                     // attention target stands out against the dimmer rest.
                     const cluster = fileToActiveCluster.get(sim.id);
-                    const highlighted = showFullPath || isSelected;
+                    const highlighted = showFullPath || isSelected || isEdited;
                     const color = highlighted || !cluster ? liveTheme.colors.text : colourForDirectoryDim(cluster);
                     // Default: 75% of the directory-hull label's 12px so
                     // file names sit a tier below their containing folder
@@ -2436,6 +2453,28 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                             });
                         }
                     }
+                }
+
+                // 2b. Edit-mode ring: a slowly pulsing ring around the file
+                //     whose buffer is open in the editor. Same blue as
+                //     EditorPane's "you are editing" top bar (#4a9eff) so
+                //     the two affordances read as one state. Drawn here
+                //     (not as a separate pass) because animatedR is the
+                //     file's true VISUAL radius — icons scale with
+                //     popularity and zoom caps, so sim.width alone would
+                //     put the ring inside a large icon. Sits OUTSIDE the
+                //     selection rim with a screen-constant gap, and pulses,
+                //     so the two stay distinguishable even though both are
+                //     blue. draw() already runs every ticker frame, so the
+                //     pulse needs no extra invalidation.
+                if (isEdited) {
+                    const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 350);
+                    const ringR = animatedR + (8 + 3 * pulse) / cameraScale;
+                    worldGfx.circle(sim.x, sim.y, ringR).stroke({
+                        color: 0x4a9eff,
+                        width: 2.5 / cameraScale,
+                        alpha: 0.55 + 0.4 * pulse,
+                    });
                 }
 
                 // 3. Hit rect: pick the shape that's currently MORE

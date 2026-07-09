@@ -620,6 +620,41 @@ export function EditorPane({ project, exitRef }: EditorPaneProps) {
       //   2. activeFileIdRef (not the captured activeFileId variable):
       //      onMount is invoked once, so a captured variable would forever
       //      reference the file that was active at first mount.
+      // Typing in the read-only viewer auto-enters edit mode, so "click a
+      // file, start typing" just works without hunting for the Edit button.
+      // The keydown that TRIGGERS the transition is replayed through
+      // ed.trigger so the first keystroke isn't swallowed: we preventDefault
+      // it (the editor is still read-only when Monaco would process it),
+      // flip readOnly imperatively (the React prop catches up on the next
+      // render), enter edit mode FIRST (onChange ignores changes outside
+      // edit mode), then inject the equivalent edit.
+      ed.onKeyDown((e) => {
+        if (useGraphStore.getState().editMode) return;
+        const be = e.browserEvent;
+        if (be.metaKey || be.ctrlKey) return; // shortcuts aren't typing
+        const fileId = activeFileIdRef.current;
+        if (!fileId) return;
+        // Never hijack while the pane is mirroring a FOLLOWED session's live
+        // edit — that view is theirs, not a local buffer.
+        const ps = usePresenceStore.getState();
+        if (ps.followingId && ps.presence.get(ps.followingId)?.editFileId != null) return;
+        // Plain printable characters (no alt: on mac those are dead-key /
+        // compose sequences), Enter, and the two deletes count as "typing";
+        // navigation, function keys, and Escape don't.
+        const printable = be.key.length === 1 && !be.altKey;
+        const isEnter = be.key === 'Enter';
+        const isBackspace = be.key === 'Backspace';
+        const isDelete = be.key === 'Delete';
+        if (!printable && !isEnter && !isBackspace && !isDelete) return;
+        e.preventDefault();
+        ed.updateOptions({ readOnly: false });
+        useGraphStore.getState().enterEditMode(fileId);
+        if (printable) ed.trigger('keyboard', 'type', { text: be.key });
+        else if (isEnter) ed.trigger('keyboard', 'type', { text: '\n' });
+        else if (isBackspace) ed.trigger('keyboard', 'deleteLeft', null);
+        else ed.trigger('keyboard', 'deleteRight', null);
+      });
+
       ed.onDidChangeCursorPosition((e) => {
         if (useGraphStore.getState().editMode) return;
         if (applyingRemoteRef.current) return;

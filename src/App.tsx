@@ -18,7 +18,7 @@ import { FolderPicker } from './ui/FolderPicker';
 import { SessionsPill } from './ui/SessionsPill';
 import { addRecentPath } from './ui/recentPaths';
 import { SettingsPanel } from './ui/settings/SettingsPanel';
-import type { AstNode, FileNode, GraphDelta, PresenceState, ProjectResponse } from './api/types';
+import type { FileNode, GraphDelta, PresenceState, ProjectResponse } from './api/types';
 
 // Membership equality for two string sets — used to detect whether a delta
 // actually changed the selected-file set (and thus warrants a camera re-frame).
@@ -602,56 +602,16 @@ function Hints() {
 function SelectionPanel() {
   const project = useGraphStore((s) => s.project);
   const selection = useGraphStore((s) => s.selection);
-  const asts = useGraphStore((s) => s.asts);
   if (!project || !selection) return null;
 
+  // Files only. Selected AST nodes used to get a descriptive card here
+  // (syntaxKind / name / char range), but the canvas rect + the editor
+  // pane's highlight already say everything it did.
   const fileMatch = project.files.find((f) => f.id === selection);
   if (fileMatch) {
     return <FilePanel file={fileMatch} project={project} />;
   }
-  const astMatch = findAstNode(asts, selection);
-  if (astMatch) {
-    return <AstPanel node={astMatch.node} fileId={astMatch.fileId} />;
-  }
   return null;
-}
-
-function findAstNode(
-  asts: ReadonlyMap<string, { nodes: AstNode[] }>,
-  id: string,
-): { fileId: string; node: AstNode } | null {
-  // The id format is `${fileId}#${seq}` so we can short-circuit by fileId.
-  const hash = id.lastIndexOf('#');
-  if (hash > 0) {
-    const fileId = id.slice(0, hash);
-    const ast = asts.get(fileId);
-    if (ast) {
-      const node = ast.nodes.find((n) => n.id === id);
-      if (node) return { fileId, node };
-    }
-  }
-  for (const [fileId, ast] of asts) {
-    const node = ast.nodes.find((n) => n.id === id);
-    if (node) return { fileId, node };
-  }
-  return null;
-}
-
-function AstPanel({ node, fileId }: { node: AstNode; fileId: string }) {
-  return (
-    <aside style={PANEL_STYLE}>
-      <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>{node.syntaxKind}</div>
-      {node.name ? (
-        <div style={{ marginBottom: '0.25rem' }}>
-          <span style={{ opacity: 0.6 }}>name: </span>
-          <span>{node.name}</span>
-        </div>
-      ) : null}
-      <div style={{ opacity: 0.7 }}>
-        {fileId} · chars [{node.start}, {node.end})
-      </div>
-    </aside>
-  );
 }
 
 const PANEL_STYLE: React.CSSProperties = {

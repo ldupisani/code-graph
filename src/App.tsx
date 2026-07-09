@@ -326,6 +326,7 @@ export function App() {
         expandedAstNodes: [...st.expandedAstNodes],
         previewedAstNodes: [...st.previewedAstNodes],
         pins: cameraApiRef.current?.getPins() ?? [],
+        overlayOffsets: cameraApiRef.current?.getOverlayOffsets() ?? [],
         camera: cameraApiRef.current?.getCamera() ?? null,
         editFileId,
         bufferText: editFileId ? liveEditBuffer.text : null,
@@ -347,6 +348,7 @@ export function App() {
   useEffect(() => {
     let lastCameraKey = '';
     let lastPinsKey = '';
+    let lastOverlayKey = '';
     const unsub = usePresenceStore.subscribe((s, prev) => {
       const fid = s.followingId;
       if (!fid) return;
@@ -390,6 +392,15 @@ export function App() {
         if (key !== lastPinsKey) {
           lastPinsKey = key;
           cameraApiRef.current?.setPins(p.pins as { id: string; x: number; y: number }[]);
+        }
+      }
+      // Dragged-aside block overlays: relative offsets, safe to replace
+      // wholesale (the renderer reads the map per frame).
+      if (p.overlayOffsets) {
+        const key = JSON.stringify(p.overlayOffsets);
+        if (key !== lastOverlayKey) {
+          lastOverlayKey = key;
+          cameraApiRef.current?.setOverlayOffsets(p.overlayOffsets);
         }
       }
       if (p.camera) {
@@ -626,6 +637,23 @@ function findAstNode(
   return null;
 }
 
+function AstPanel({ node, fileId }: { node: AstNode; fileId: string }) {
+  return (
+    <aside style={PANEL_STYLE}>
+      <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>{node.syntaxKind}</div>
+      {node.name ? (
+        <div style={{ marginBottom: '0.25rem' }}>
+          <span style={{ opacity: 0.6 }}>name: </span>
+          <span>{node.name}</span>
+        </div>
+      ) : null}
+      <div style={{ opacity: 0.7 }}>
+        {fileId} · chars [{node.start}, {node.end})
+      </div>
+    </aside>
+  );
+}
+
 const PANEL_STYLE: React.CSSProperties = {
   position: 'absolute',
   // Sits below the settings gear (top-right) so the gear stays clickable.
@@ -671,19 +699,3 @@ function FilePanel({ file, project }: { file: FileNode; project: ProjectResponse
   );
 }
 
-function AstPanel({ node, fileId }: { node: AstNode; fileId: string }) {
-  return (
-    <aside style={PANEL_STYLE}>
-      <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>{node.syntaxKind}</div>
-      {node.name ? (
-        <div style={{ marginBottom: '0.25rem' }}>
-          <span style={{ opacity: 0.6 }}>name: </span>
-          <span>{node.name}</span>
-        </div>
-      ) : null}
-      <div style={{ opacity: 0.7 }}>
-        {fileId} · chars [{node.start}, {node.end})
-      </div>
-    </aside>
-  );
-}

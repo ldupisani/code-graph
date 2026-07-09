@@ -319,6 +319,11 @@ export interface PresenceState {
   // applying them reproduces the arranger's spatial layout on the follower
   // regardless of how each window's force sim had settled.
   pins: readonly { id: string; x: number; y: number }[];
+  // Expanded-block overlay drag offsets: world-unit displacement from each
+  // overlay's ORIGIN CELL (keyed by AST node id), so a block pulled aside
+  // renders at the same relative spot for followers — relative, not
+  // absolute, hence layout-independent.
+  overlayOffsets: readonly { id: string; x: number; y: number }[];
   camera: PresenceCamera | null;
   // Non-null while the session is in edit mode: the file being edited and the
   // LIVE (unsaved) buffer, so followers see keystrokes before any save.

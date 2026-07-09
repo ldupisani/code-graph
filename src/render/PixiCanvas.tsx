@@ -95,6 +95,12 @@ export interface CameraApi {
     // Replace the current pins with the given set: unpin everything, then pin
     // each listed file (that still exists) at its saved world position.
     setPins: (pins: {id: string; x: number; y: number}[]) => void;
+    // Read / replace the expanded-block overlay drag offsets (world-unit
+    // displacement from each overlay's origin cell, keyed by AST node id).
+    // Relative offsets — not absolute positions — so they transfer across
+    // windows whose layouts differ. Used by presence follow.
+    getOverlayOffsets: () => {id: string; x: number; y: number}[];
+    setOverlayOffsets: (offsets: readonly {id: string; x: number; y: number}[]) => void;
 }
 
 interface CanvasProps {
@@ -4898,6 +4904,15 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         layout.nodes
                             .filter((n) => n.userPinned)
                             .map((n) => ({id: n.id, x: n.connX, y: n.connY})),
+                    getOverlayOffsets: () =>
+                        [...overlayDragOffsets].map(([id, o]) => ({id, x: o.x, y: o.y})),
+                    setOverlayOffsets: (offsets) => {
+                        overlayDragOffsets.clear();
+                        for (const o of offsets) overlayDragOffsets.set(o.id, {x: o.x, y: o.y});
+                        // The overlay pass reads the map every frame, so the
+                        // new offsets take effect on the next draw — no
+                        // invalidation needed.
+                    },
                     setPins: (pins) => {
                         unpinAllFiles(); // clear current pins so the saved set fully replaces them
                         let any = false;

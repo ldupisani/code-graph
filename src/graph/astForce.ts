@@ -101,6 +101,18 @@ function isImportKind(kind: string): boolean {
     return IMPORT_KINDS.has(kind);
 }
 
+// "Middle" = everything that is neither an import (top arc) nor an export
+// (bottom arc): the file's main body, or a container's members. Shared by the
+// forces here and by PixiCanvas's execution-flow ribbon so all consumers
+// agree on what the flow sequence contains.
+export function isMiddleStatement(tn: TreemapNode): boolean {
+    if (isImportKind(tn.syntaxKind)) return false;
+    if (tn.syntaxKind === "ExportDeclaration" || tn.syntaxKind === "ExportAssignment") {
+        return false;
+    }
+    return tn.exported !== true;
+}
+
 // Visual rim added between a nested container's member cluster radius
 // and the drawn circle. The file's analogous constant FILE_RIM is owned
 // by PixiCanvas; this one stays here because it factors into rect.w/h
@@ -171,6 +183,18 @@ const IMPORT_EXPORT_ARC_OUTER_PAD = 10;
 // on the top arc, making the file's bounding circle balloon to
 // accommodate the off-centre middle's corners.
 const MIDDLE_CENTER_STRENGTH = 0.4;
+// Execution-flow ordering: each middle node is pulled toward a target Y from
+// its source-order rank (cumulative heights centered on origin), so reading
+// the middle top→bottom always matches source/execution order — continuing
+// the imports-run-first story the top arc already tells. NOT alpha-scaled:
+// collide and squareBias are alpha-independent shape constraints that rule
+// the late settle, so an alpha-scaled rank pull would be scrambled once
+// alpha ≈ 0. Same stability regime (and magnitude) as SQUARE_STRENGTH.
+const FLOW_Y_STRENGTH = 0.08;
+// Vertical gap between consecutive ranked rows. Slightly more than the
+// collide pads on both facing edges (2 × COLLIDE_PAD) so collide never
+// fights the flow targets.
+const FLOW_ROW_GAP = 10;
 const WEIGHT_CAP = 3;
 const SETTLE_TICKS = 300;
 
@@ -505,25 +529,50 @@ function planRectsMirrored(plan: ArcRingPlan, ringSpacing: number): PlanRect[] {
 // pulling each middle node toward origin directly (and skipping
 // arc nodes), the middle settles AT origin regardless of how the
 // arcs are distributed.
-function middleCenterForce(strength: number) {
+// Extended with execution-flow ranking: X keeps the alpha-scaled pull to the
+// centre axis, but Y pulls each middle node toward its source-order target
+// (see computeFlowTargets) with a constant, alpha-INDEPENDENT gain so the
+// ordering survives the late settle where only the shape constraints
+// (collide, squareBias) still act. With one middle node the target is y=0,
+// which degenerates to the old centre pull — preserving the anti-ballooning
+// behaviour described above.
+function middleFlowForce(
+    xStrength: number,
+    yStrength: number,
+    targetYById: ReadonlyMap<string, number>,
+) {
     let middleNodes: SimAstNode[] = [];
     function force(alpha: number): void {
         for (const n of middleNodes) {
-            n.vx = (n.vx ?? 0) + (-n.x) * alpha * strength;
-            n.vy = (n.vy ?? 0) + (-n.y) * alpha * strength;
+            const targetY = targetYById.get(n.id) ?? 0;
+            n.vx = (n.vx ?? 0) + (-n.x) * alpha * xStrength;
+            n.vy = (n.vy ?? 0) + (targetY - n.y) * yStrength;
         }
     }
     force.initialize = (nodes: SimAstNode[]): void => {
-        middleNodes = [];
-        for (const n of nodes) {
-            const k = n.tree.syntaxKind;
-            if (isImportKind(k)) continue;
-            if (k === "ExportDeclaration" || k === "ExportAssignment") continue;
-            if (n.tree.exported === true) continue;
-            middleNodes.push(n);
-        }
+        middleNodes = nodes.filter((n) => isMiddleStatement(n.tree));
     };
     return force;
+}
+
+// Source-order rank → target Y for each middle node: rows stacked by
+// cumulative heights (not even division, so a giant const object gets the
+// room it needs), centered so the column spans the origin. `middle` must be
+// in source order — childrenByParent arrays already are (treemap start-sort).
+function computeFlowTargets(
+    middle: readonly TreemapNode[],
+    gap: number,
+): Map<string, number> {
+    const targets = new Map<string, number>();
+    let totalH = 0;
+    for (const tn of middle) totalH += tn.rect.h;
+    if (middle.length > 1) totalH += gap * (middle.length - 1);
+    let acc = -totalH / 2;
+    for (const tn of middle) {
+        targets.set(tn.id, acc + tn.rect.h / 2);
+        acc += tn.rect.h + gap;
+    }
+    return targets;
 }
 
 function importExportArcForce(
@@ -610,11 +659,7 @@ function importExportArcForce(
                 importNodes.push(x);
                 continue;
             }
-            const isExported =
-                x.tree.syntaxKind === "ExportDeclaration" ||
-                x.tree.syntaxKind === "ExportAssignment" ||
-                x.tree.exported === true;
-            if (isExported) {
+            if (!isMiddleStatement(x.tree)) {
                 exportNodes.push(x);
                 continue;
             }
@@ -760,18 +805,18 @@ function buildContainerForceLayout(
     // target — otherwise the force has to drag wide items through
     // the middle cluster against collide, distending the layout
     // before it settles into its planned arrangement.
-    const isExportedTopLevel = (tn: TreemapNode): boolean =>
-        tn.syntaxKind === "ExportDeclaration" ||
-        tn.syntaxKind === "ExportAssignment" ||
-        tn.exported === true;
     const importMembers: TreemapNode[] = [];
     const exportMembers: TreemapNode[] = [];
     const middleMembers: TreemapNode[] = [];
     for (const tn of members) {
         if (isImportKind(tn.syntaxKind)) importMembers.push(tn);
-        else if (isExportedTopLevel(tn)) exportMembers.push(tn);
+        else if (!isMiddleStatement(tn)) exportMembers.push(tn);
         else middleMembers.push(tn);
     }
+
+    // Execution-flow targets: middleMembers inherits `members`' source order
+    // (treemap start-sort), so ranks are simply positional.
+    const flowTargets = computeFlowTargets(middleMembers, FLOW_ROW_GAP);
 
     // Estimate middle's natural extent from rect SIZES so the seed
     // plan can place arcs at the right radius from the start — same
@@ -783,15 +828,16 @@ function buildContainerForceLayout(
     for (const tn of middleMembers) seedMiddleArea += tn.rect.w * tn.rect.h;
     const seedMiddleR = seedMiddleArea > 0 ? Math.sqrt(seedMiddleArea / Math.PI) : 0;
 
-    // Middle seeds first — a small ring near origin so charge spreads
-    // them without an initial pile-up — because the arc plans need
-    // them as obstacle rects.
+    // Middle seeds first — each at its flow target Y with a small
+    // alternating X jitter (deterministic, breaks charge symmetry) —
+    // because the arc plans need them as obstacle rects, and seeding at
+    // the target column means those obstacle rects describe the REAL
+    // settled shape instead of a transient ring.
     const middleSeedById = new Map<string, {x: number; y: number}>();
     const middleSeedRects: PlanRect[] = [];
     middleMembers.forEach((tn, i) => {
-        const angle = i * 2.4;
-        const x = Math.cos(angle) * (spread * 0.4);
-        const y = Math.sin(angle) * (spread * 0.4);
+        const x = (i % 2 === 0 ? 1 : -1) * spread * 0.15;
+        const y = flowTargets.get(tn.id) ?? 0;
         middleSeedById.set(tn.id, {x, y});
         middleSeedRects.push({cx: x, cy: y, hw: tn.rect.w / 2, hh: tn.rect.h / 2});
     });
@@ -888,10 +934,13 @@ function buildContainerForceLayout(
         // (middle + arc) to origin, which means a file with a
         // top-heavy distribution (lots of imports, few middle
         // statements) pushes the middle UP to compensate. We use
-        // `middleCenter` below to pull the MIDDLE NODES specifically
-        // to origin so they stay centred regardless of the arc
-        // distribution.
-        .force("middleCenter", middleCenterForce(MIDDLE_CENTER_STRENGTH))
+        // `middleFlow` below to pull the MIDDLE NODES specifically
+        // to the centre axis (and each to its source-order row) so
+        // they stay centred regardless of the arc distribution.
+        .force(
+            "middleFlow",
+            middleFlowForce(MIDDLE_CENTER_STRENGTH, FLOW_Y_STRENGTH, flowTargets),
+        )
         .force("x", forceX<SimAstNode>(0).strength(COMPRESS_STRENGTH))
         .force("y", forceY<SimAstNode>(0).strength(COMPRESS_STRENGTH))
         .force("importExportArc", importExportArcForce(

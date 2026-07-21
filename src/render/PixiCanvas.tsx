@@ -9,7 +9,7 @@ import type {GraphConfig} from "../graph/config/types";
 import {activeTiers, createTierEngine} from "./tierLayout";
 import {getPattern} from "../graph/patterns/registry";
 import {layoutAst, type TreemapLayout, type TreemapNode} from "../graph/treemap";
-import {buildAstForceLayout, type AstForceLayout, type ContainerForceLayout} from "../graph/astForce";
+import {buildAstForceLayout, isMiddleStatement, type AstForceLayout, type ContainerForceLayout, type SimAstNode} from "../graph/astForce";
 import type {AstNode, FileAstResponse, ProjectResponse} from "../api/types";
 import type {SimFileNode} from "../graph/types";
 import {blendColor, DEFAULT_FILL_ALPHA, depthTint, EXPORT_FILL_ALPHA, EXPORT_FILL_BLEND, EXPORT_FILL_COLOR, hslToHex, liveTheme} from "./theme";
@@ -927,6 +927,17 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // Extra horizontal inset on each side of a code block's statements,
             // beyond the normal padding, so they don't hug the box edges.
             const BLOCK_SIDE_PAD = 12;
+            // Execution-flow ribbon: a translucent tapered strip through a
+            // file's top-level middle statements in source order (bottom-center
+            // of stmt N → top-center of stmt N+1). The taper — wide at the
+            // source, narrow at the target — is the direction cue; Pixi
+            // Graphics strokes can't gradient, so each segment is a filled
+            // strip instead.
+            const RIBBON_W_START = 10;
+            const RIBBON_W_END = 4;
+            const RIBBON_ALPHA = 0.15;
+            const RIBBON_COLOR = 0x8fa3c0;
+            const RIBBON_SAMPLES = 14;
 
             // Per-file AST layouts now live in `layoutsByFileId` (declared
             // below) — keyed by fileId and holding BOTH the `full` and
@@ -2580,6 +2591,68 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 }
             }
 
+            // Draw the execution-flow ribbon beneath a file's top-level
+            // statement blocks: one tapered cubic-bezier strip per consecutive
+            // middle-statement pair, entering each block at its top-center and
+            // leaving from its bottom-center. Vertical control-point tangents
+            // mean a (rare) upward segment renders as a legible S-loop rather
+            // than a kink. Recomputed from live sim positions every frame, so
+            // it follows file drags and force jitter with no invalidation.
+            function drawFlowRibbon(middle: readonly SimAstNode[], offsetX: number, offsetY: number): void {
+                const gfx = currentGfx;
+                for (let i = 0; i < middle.length - 1; i++) {
+                    const a = middle[i];
+                    const b = middle[i + 1];
+                    const p0x = offsetX + a.x;
+                    const p0y = offsetY + a.y + a.rect.h / 2;
+                    const p1x = offsetX + b.x;
+                    const p1y = offsetY + b.y - b.rect.h / 2;
+                    // Cull segments too small to read at this zoom.
+                    const screenLen = Math.hypot(p1x - p0x, p1y - p0y) * cameraScale;
+                    if (screenLen < cfg.lod.cullPx) continue;
+                    const k = Math.min(48, Math.max(8, Math.abs(p1y - p0y) * 0.4));
+                    // Sample the bezier and its tangent, then emit one filled
+                    // strip whose half-width tapers source → target.
+                    const left: number[] = [];
+                    const right: number[] = [];
+                    for (let s = 0; s <= RIBBON_SAMPLES; s++) {
+                        const t = s / RIBBON_SAMPLES;
+                        const u = 1 - t;
+                        // Cubic bezier: p0, (p0x, p0y + k), (p1x, p1y − k), p1.
+                        const x =
+                            u * u * u * p0x +
+                            3 * u * u * t * p0x +
+                            3 * u * t * t * p1x +
+                            t * t * t * p1x;
+                        const y =
+                            u * u * u * p0y +
+                            3 * u * u * t * (p0y + k) +
+                            3 * u * t * t * (p1y - k) +
+                            t * t * t * p1y;
+                        // Derivative of the same bezier for the tangent (the
+                        // u²/t² x-terms vanish: both control points share
+                        // their endpoint's x).
+                        const dx = 6 * u * t * (p1x - p0x);
+                        const dy =
+                            3 * u * u * k +
+                            6 * u * t * (p1y - p0y - 2 * k) +
+                            3 * t * t * k;
+                        const len = Math.hypot(dx, dy) || 1;
+                        const nx = -dy / len;
+                        const ny = dx / len;
+                        const hw = (RIBBON_W_START + (RIBBON_W_END - RIBBON_W_START) * t) / 2;
+                        left.push(x + nx * hw, y + ny * hw);
+                        right.push(x - nx * hw, y - ny * hw);
+                    }
+                    // left forward + right reversed = closed strip outline.
+                    const pts = left.slice();
+                    for (let j = right.length - 2; j >= 0; j -= 2) {
+                        pts.push(right[j], right[j + 1]);
+                    }
+                    gfx.poly(pts).fill({color: RIBBON_COLOR, alpha: RIBBON_ALPHA});
+                }
+            }
+
             function drawSubtree(tree: TreemapLayout, _baseX: number, _baseY: number, fileId: string, selectionSet: ReadonlySet<string>): void {
                 // Top-level statements are positioned by the per-file fractal force
                 // layout, not the treemap's wrapped-row defaults. Each top-level
@@ -2598,6 +2671,11 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // depend on the file having a rectangular content area at all.
                 const offsetX = sim.x - force.bounds.cx;
                 const offsetY = sim.y - force.bounds.cy;
+                // Execution-flow ribbon first, so it paints beneath every
+                // block. force.nodes preserves source order (treemap
+                // start-sort), so filtering keeps the execution sequence.
+                const flowMiddle = force.nodes.filter((sn) => isMiddleStatement(sn.tree));
+                if (flowMiddle.length >= 2) drawFlowRibbon(flowMiddle, offsetX, offsetY);
                 for (const sn of force.nodes) {
                     const tn = sn.tree;
                     // sn.{x,y} is the sim node's center; tn.rect.{x,y} is the

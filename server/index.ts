@@ -18,18 +18,24 @@ import {
   applyFileEvent,
   getCachedAst,
   getLoadedProject,
+  openProject,
   noteWatchClose,
   noteWatchOpen,
-  openProject,
   readSourceForEdit,
   validateSource,
   writeSource,
 } from './project';
+import { getOrCreateToken, registerAuth } from './auth';
+import { isPathAllowed, loadConfig, resolveFileIdWithinRoot } from './config';
+import { discoverProjects } from './discovery';
 
 const PORT = 5174;
 const HOST = '127.0.0.1';
 
 const app = Fastify({ logger: true });
+
+const token = getOrCreateToken();
+registerAuth(app, token);
 
 // --- Presence: connected sessions per project --------------------------------
 // One entry per open SSE /watch connection. The server is a pure relay:
@@ -75,6 +81,18 @@ function rosterOf(projectId: string): SessionInfo[] {
   }));
 }
 
+// Openable projects discovered under the configured workspace roots — what
+// the UI picker lists instead of accepting a free-text path.
+app.get('/api/projects', async () => {
+  const config = loadConfig();
+  const projects = await discoverProjects(config.workspaces);
+  return {
+    workspaces: config.workspaces,
+    projects,
+    configMissing: config.configMissing,
+  };
+});
+
 app.post<{ Body: ProjectRequest; Reply: ProjectResponse | ApiError }>(
   '/api/project',
   async (req, reply) => {
@@ -83,8 +101,18 @@ app.post<{ Body: ProjectRequest; Reply: ProjectResponse | ApiError }>(
       reply.code(400);
       return { error: 'Missing required body field: path (string).' };
     }
+    const allowed = isPathAllowed(path);
+    if (!allowed.ok) {
+      reply.code(403);
+      return {
+        error:
+          'Path is not inside a configured workspace root. Edit code-graph.config.json and restart the server.',
+      };
+    }
     try {
-      const result = await openProject(path);
+      // Open by realpath so a symlinked spelling and its target share one
+      // projectId / analyzer / watcher.
+      const result = await openProject(allowed.realPath);
       app.log.info(
         `Loaded ${result.files.length} source files, ${result.edges.length} imports from ${result.rootPath}`,
       );
@@ -113,6 +141,10 @@ app.get<{
   if (!loaded) {
     reply.code(404);
     return { error: `Unknown projectId: ${projectId}. Re-open the project.` };
+  }
+  if (!resolveFileIdWithinRoot(loaded.rootPath, fileId)) {
+    reply.code(400);
+    return { error: `Invalid fileId: ${fileId}` };
   }
   // Prefer the cached walk computed at openProject time. IDs across the
   // cached AST and the project's semanticEdges must match exactly, so we
@@ -145,6 +177,10 @@ app.get<{
     reply.code(404);
     return { error: `Unknown projectId: ${projectId}. Re-open the project.` };
   }
+  if (!resolveFileIdWithinRoot(loaded.rootPath, fileId)) {
+    reply.code(400);
+    return { error: `Invalid fileId: ${fileId}` };
+  }
   const source = await loaded.analyzer.readSource(fileId);
   if (source == null) {
     reply.code(404);
@@ -172,6 +208,10 @@ app.get<{
   if (!loaded) {
     reply.code(404);
     return { error: `Unknown projectId: ${projectId}. Re-open the project.` };
+  }
+  if (!resolveFileIdWithinRoot(loaded.rootPath, fileId)) {
+    reply.code(400);
+    return { error: `Invalid fileId: ${fileId}` };
   }
   const res = readSourceForEdit(loaded, fileId);
   if (!res) {
@@ -203,6 +243,10 @@ app.post<{
     reply.code(404);
     return { error: `Unknown projectId: ${projectId}. Re-open the project.` };
   }
+  if (!resolveFileIdWithinRoot(loaded.rootPath, fileId)) {
+    reply.code(400);
+    return { error: `Invalid fileId: ${fileId}` };
+  }
   return validateSource(loaded, fileId, req.body.text);
 });
 
@@ -228,6 +272,10 @@ app.post<{
   if (!loaded) {
     reply.code(404);
     return { error: `Unknown projectId: ${projectId}. Re-open the project.` };
+  }
+  if (!resolveFileIdWithinRoot(loaded.rootPath, fileId)) {
+    reply.code(400);
+    return { error: `Invalid fileId: ${fileId}` };
   }
   try {
     const result = await writeSource(loaded, fileId, {
@@ -392,6 +440,9 @@ app
   .listen({ port: PORT, host: HOST })
   .then(() => {
     app.log.info(`code-graph helper listening on http://${HOST}:${PORT}`);
+    // Plain console.log (not pino) so the URL is copy-pasteable from the
+    // concurrently-prefixed dev output.
+    console.log(`\n  Open: http://localhost:5173/?token=${token}\n`);
   })
   .catch((err) => {
     app.log.error(err);

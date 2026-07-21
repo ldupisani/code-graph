@@ -13,6 +13,12 @@ export interface ProjectWatcher {
   close: () => void;
 }
 
+// Directories no analyzer/watcher/discovery pass should ever descend into.
+// Shared with server/discovery.ts so the project picker skips the same trees
+// the watcher ignores.
+export const EXCLUDE_DIR_RE =
+  /(?:^|[\\/])(?:node_modules|dist|build|\.git|venv|\.venv|env|__pycache__|\.mypy_cache|\.pytest_cache|\.tox|\.eggs|site-packages)(?:[\\/]|$)/;
+
 // `watches(absPath)` is the analyzer's source-file predicate — it decides
 // which files this project cares about (extension + excluded dirs), so the
 // watcher stays language-agnostic.
@@ -27,8 +33,6 @@ export function createProjectWatcher(
   // a `stats` argument; when stats is absent (e.g. before chokidar has
   // stat'd the entry) we must NOT treat the path as a file, or we'd reject
   // entire directories whose names don't end in a source extension.
-  const EXCLUDE_DIR_RE =
-    /(?:^|[\\/])(?:node_modules|dist|build|\.git|venv|\.venv|env|__pycache__|\.mypy_cache|\.pytest_cache|\.tox|\.eggs|site-packages)(?:[\\/]|$)/;
   const watcher: FSWatcher = chokidar.watch(rootPath, {
     ignoreInitial: true,
     awaitWriteFinish: { stabilityThreshold: 150, pollInterval: 60 },

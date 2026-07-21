@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Group, Panel, Separator, usePanelRef } from 'react-resizable-panels';
-import { openProject, postPresence, subscribeToDeltas } from './api/client';
+import { AuthError, openProject, postPresence, subscribeToDeltas } from './api/client';
 import { getSessionIdentity, usePresenceStore } from './graph/presence';
 import { selfSavedFileIds, useGraphStore } from './graph/store';
 import { useSourceStore } from './graph/sourceStore';
@@ -14,7 +14,7 @@ import { EdgeFilterPills } from './ui/EdgeFilterPills';
 import { HoverTooltip } from './ui/HoverTooltip';
 import { SearchPalette } from './ui/SearchPalette';
 import { EditorPane, liveEditBuffer } from './ui/EditorPane';
-import { FolderPicker } from './ui/FolderPicker';
+import { ProjectPicker } from './ui/ProjectPicker';
 import { SessionsPill } from './ui/SessionsPill';
 import { addRecentPath } from './ui/recentPaths';
 import { SettingsPanel } from './ui/settings/SettingsPanel';
@@ -36,6 +36,9 @@ export function App() {
 
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // This window presented no/an invalid token — nothing will work until the
+  // user opens the tokened URL the server prints, so show a dedicated screen.
+  const [authFailed, setAuthFailed] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   // Imperative camera handle the PixiCanvas fills in; drives the zoom buttons.
   const cameraApiRef = useRef<CameraApi | null>(null);
@@ -81,6 +84,7 @@ export function App() {
       addRecentPath(path);
       console.log('[code-graph] project loaded', data);
     } catch (e) {
+      if (e instanceof AuthError) setAuthFailed(true);
       setError(e instanceof Error ? e.message : String(e));
       setProject(null);
     } finally {
@@ -442,6 +446,21 @@ export function App() {
     if (p && p.isCollapsed()) p.expand();
   }, [editMode]);
 
+  if (authFailed) {
+    return (
+      <div style={{ position: 'fixed', inset: 0, display: 'grid', placeItems: 'center' }}>
+        <div style={{ textAlign: 'center', maxWidth: '32rem', lineHeight: 1.6 }}>
+          <h2>Missing or invalid token</h2>
+          <p style={{ opacity: 0.7 }}>
+            This window isn&apos;t authorized to talk to the code-graph server. Open the URL
+            printed in the <code>npm run dev</code> terminal (it looks like{' '}
+            <code>http://localhost:5173/?token=…</code>).
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={{ position: 'fixed', inset: 0, display: 'flex', flexDirection: 'column' }}>
       <header
@@ -455,11 +474,12 @@ export function App() {
         }}
       >
         <strong style={{ letterSpacing: 0.5 }}>code-graph</strong>
-        <FolderPicker
+        <ProjectPicker
           onSubmit={handleOpen}
           loading={loading}
           error={error}
-          initialPath={initialPath}
+          currentPath={project?.rootPath ?? (initialPath || undefined)}
+          onAuthError={() => setAuthFailed(true)}
         />
         {project ? <ProjectStats project={project} refreshing={refreshing} /> : null}
         {project ? <SessionsPill /> : null}
@@ -565,7 +585,7 @@ function EmptyHint() {
         pointerEvents: 'none',
       }}
     >
-      <p>Paste an absolute path to a TypeScript project (with a tsconfig.json) above.</p>
+      <p>Pick a project from the list above.</p>
     </div>
   );
 }

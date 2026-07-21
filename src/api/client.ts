@@ -7,6 +7,7 @@ import type {
   PresenceState,
   ProjectRequest,
   ProjectResponse,
+  ProjectsResponse,
   SessionInfo,
   SourceForEditResponse,
   ValidateResponse,
@@ -14,10 +15,33 @@ import type {
   WriteResponse,
 } from './types';
 
+// Session token, read once from this window's URL (the server prints the
+// tokened URL at startup). Sent as a header on fetches and as a query param on
+// the EventSource (which cannot set headers). An empty token just means every
+// API call 401s → the AuthError screen.
+const token = (() => {
+  try {
+    return new URLSearchParams(window.location.search).get('token') ?? '';
+  } catch {
+    return '';
+  }
+})();
+
+const AUTH_HEADER = { 'x-code-graph-token': token };
+
+// Thrown on 401 so App can show the "open the URL from the terminal" screen
+// instead of a generic error string.
+export class AuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuthError';
+  }
+}
+
 async function request<TResp>(path: string, init: RequestInit): Promise<TResp> {
   const res = await fetch(path, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
+    headers: { 'Content-Type': 'application/json', ...AUTH_HEADER, ...(init.headers ?? {}) },
   });
   const text = await res.text();
   let body: unknown;
@@ -28,9 +52,16 @@ async function request<TResp>(path: string, init: RequestInit): Promise<TResp> {
   }
   if (!res.ok) {
     const msg = (body as ApiError | null)?.error ?? `${res.status} ${res.statusText}`;
+    if (res.status === 401) throw new AuthError(msg);
     throw new Error(msg);
   }
   return body as TResp;
+}
+
+// Projects discovered under the server's configured workspace roots — what
+// the ProjectPicker lists.
+export function listProjects(): Promise<ProjectsResponse> {
+  return request<ProjectsResponse>('/api/projects', { method: 'GET' });
 }
 
 export function openProject(req: ProjectRequest): Promise<ProjectResponse> {
@@ -64,15 +95,15 @@ export function subscribeToDeltas(
   onDelta: (delta: GraphDelta) => void,
   opts?: SubscribeOptions,
 ): () => void {
-  let url = `/api/project/${encodeURIComponent(projectId)}/watch`;
+  // Token always rides the query string here — EventSource cannot set
+  // headers, and reconnects reuse the same URL so auth survives them.
+  const q = new URLSearchParams({ token });
   if (opts?.identity) {
-    const q = new URLSearchParams({
-      sessionId: opts.identity.id,
-      name: opts.identity.name,
-      color: opts.identity.color,
-    });
-    url += `?${q}`;
+    q.set('sessionId', opts.identity.id);
+    q.set('name', opts.identity.name);
+    q.set('color', opts.identity.color);
   }
+  const url = `/api/project/${encodeURIComponent(projectId)}/watch?${q}`;
   const es = new EventSource(url);
   // Deltas stay on the default (unnamed) event; presence rides NAMED events
   // ('sessions' / 'presence') so the two streams can't be confused.
@@ -116,7 +147,7 @@ export function postPresence(
   const url = `/api/project/${encodeURIComponent(projectId)}/presence`;
   void fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...AUTH_HEADER },
     body: JSON.stringify({ sessionId, state }),
   }).catch(() => {
     // Server restarting / connection blip — the next report retries.
@@ -169,7 +200,7 @@ export async function writeSource(
   const url = `/api/project/${encodeURIComponent(projectId)}/source?fileId=${encodeURIComponent(fileId)}`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...AUTH_HEADER },
     body: JSON.stringify(req),
   });
   const text = await res.text();
@@ -182,6 +213,7 @@ export async function writeSource(
   if (res.status === 409) throw new ConflictError(body as ConflictResponse);
   if (!res.ok) {
     const msg = (body as ApiError | null)?.error ?? `${res.status} ${res.statusText}`;
+    if (res.status === 401) throw new AuthError(msg);
     throw new Error(msg);
   }
   return body as WriteResponse;
@@ -189,7 +221,7 @@ export async function writeSource(
 
 export async function getFileSource(projectId: string, fileId: string): Promise<string> {
   const url = `/api/project/${encodeURIComponent(projectId)}/source?fileId=${encodeURIComponent(fileId)}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: AUTH_HEADER });
   if (!res.ok) {
     const text = await res.text();
     let msg = `${res.status} ${res.statusText}`;
@@ -199,6 +231,7 @@ export async function getFileSource(projectId: string, fileId: string): Promise<
     } catch {
       if (text) msg = text;
     }
+    if (res.status === 401) throw new AuthError(msg);
     throw new Error(msg);
   }
   return res.text();

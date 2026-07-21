@@ -20,6 +20,7 @@ import {
   writeManifest,
 } from './cache';
 import { createProjectWatcher, type ProjectWatcher, type WatchEvent } from './watcher';
+import { resolveFileIdWithinRoot } from './config';
 
 export interface LoadedProject {
   // Deterministic id = hashPath(rootPath), so reopening a path (or opening it
@@ -337,7 +338,10 @@ export function readSourceForEdit(
   loaded: LoadedProject,
   fileId: string,
 ): SourceForEdit | undefined {
-  const abs = path.join(loaded.rootPath, fileId);
+  // Containment guard (defense-in-depth: the routes check too) — a fileId
+  // must never resolve outside the project root.
+  const abs = resolveFileIdWithinRoot(loaded.rootPath, fileId);
+  if (!abs) return undefined;
   try {
     const text = readFileSync(abs, 'utf8');
     return { text, mtimeMs: statSync(abs).mtimeMs, hash: hashText(text) };
@@ -379,7 +383,9 @@ export async function writeSource(
   fileId: string,
   req: { text: string; baseHash: string | null; force?: boolean },
 ): Promise<WriteResult | WriteConflict> {
-  const abs = path.join(loaded.rootPath, fileId);
+  // Containment guard (defense-in-depth: the routes check too).
+  const abs = resolveFileIdWithinRoot(loaded.rootPath, fileId);
+  if (!abs) throw new Error(`Invalid fileId: ${fileId}`);
   const exists = existsSync(abs);
 
   if (!req.force) {

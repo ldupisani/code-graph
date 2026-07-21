@@ -8,3 +8,7 @@ dist
 *storybook.log
 storybook-static
 test-results
+
+# Local security config: workspace allowlist + session token (never commit).
+code-graph.config.json
+.code-graph/

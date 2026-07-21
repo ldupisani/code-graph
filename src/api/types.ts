@@ -50,6 +50,14 @@ export interface ProjectRequest {
   path: string;
 }
 
+// GET /api/projects — projects discovered under the server's configured
+// workspace roots. The picker lists these; nothing else can be opened.
+export interface ProjectsResponse {
+  workspaces: string[];
+  projects: { name: string; path: string }[];
+  configMissing: boolean;
+}
+
 export type SemanticEdgeKind = 'calls' | 'extends' | 'implements';
 
 // Edge between AST node IDs (`${fileId}#${seq}`). Computed once at project

@@ -747,8 +747,18 @@ class Analyzer:
 
     # ---- ops ----
 
+    def _abs_in_root(self, file_id):
+        # Containment guard (defense-in-depth; the Node routes check too):
+        # resolve the client-supplied fileId and only return it if it stays
+        # inside the project root. None = reject.
+        abs_path = os.path.realpath(os.path.join(self.root, file_id.replace("/", os.sep)))
+        if abs_path == self.root or abs_path.startswith(self.root + os.sep):
+            return abs_path
+        return None
+
     def op_open(self, msg):
-        self.root = msg["root"]
+        # Realpath so the containment prefix check compares canonical paths.
+        self.root = os.path.realpath(msg["root"])
         self.files.clear()
         self.module_to_file.clear()
         if jedi is not None:
@@ -802,7 +812,19 @@ class Analyzer:
         # the buffer wouldn't parse / would break our walk.
         file_id = msg["fileId"]
         text = msg["text"]
-        abs_path = os.path.join(self.root, file_id.replace("/", os.sep))
+        abs_path = self._abs_in_root(file_id)
+        if abs_path is None:
+            return {
+                "valid": False,
+                "diagnostics": [{
+                    "severity": "error",
+                    "message": f"Invalid fileId: {file_id}",
+                    "startLineNumber": 1,
+                    "startColumn": 1,
+                    "endLineNumber": 1,
+                    "endColumn": 2,
+                }],
+            }
         diags = []
         try:
             FileData(file_id, abs_path, text)
@@ -838,8 +860,8 @@ class Analyzer:
             if fd:
                 self.module_to_file.pop(fd.module_name, None)
             return {"file": None, "ast": None}
-        abs_path = os.path.join(self.root, file_id.replace("/", os.sep))
-        if not os.path.exists(abs_path):
+        abs_path = self._abs_in_root(file_id)
+        if abs_path is None or not os.path.exists(abs_path):
             return {"file": None, "ast": None}
         fd = self.parse_file(abs_path)
         if not fd:

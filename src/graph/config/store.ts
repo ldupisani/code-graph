@@ -41,10 +41,15 @@ export interface ConfigStore {
     importTemplate: (json: string) => {ok: boolean; error?: string};
 }
 
-let seq = 0;
+// Ids outlive the page (templates/tiers persist to localStorage), so they
+// must be unique across sessions — a counter would restart at 1 on reload
+// and hand out the same ids again.
 function uid(prefix: string): string {
-    seq += 1;
-    return `${prefix}-${seq}-${(seq * 2654435761) % 1000000}`;
+    const rand =
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+            ? crypto.randomUUID().slice(0, 8)
+            : `${Date.now().toString(36)}-${Math.floor(Math.random() * 0xffffff).toString(36)}`;
+    return `${prefix}-${rand}`;
 }
 
 // structuredClone preserves Infinity (zoomToMul); JSON would turn it to null.
@@ -172,10 +177,21 @@ export const useConfigStore = create<ConfigStore>()(
                 const userTemplates = Array.isArray(p.templates)
                     ? p.templates.filter((t) => t && !t.builtin).map((t) => ({...t, config: sanitizeConfig(t.config)}))
                     : [];
+                // Heal duplicate ids left behind by the old session-counter
+                // uid (templates saved in different sessions could collide,
+                // making select/load/delete hit both). First occurrence keeps
+                // its id so activeTemplateId stays valid; later ones get a
+                // fresh id and re-persist.
+                const builtins = builtinTemplates();
+                const seen = new Set(builtins.map((t) => t.id));
+                for (let i = 0; i < userTemplates.length; i++) {
+                    if (seen.has(userTemplates[i].id)) userTemplates[i] = {...userTemplates[i], id: uid("tmpl")};
+                    seen.add(userTemplates[i].id);
+                }
                 return {
                     ...current,
                     config: p.config ? sanitizeConfig(p.config) : current.config,
-                    templates: [...builtinTemplates(), ...userTemplates],
+                    templates: [...builtins, ...userTemplates],
                     activeTemplateId: typeof p.activeTemplateId === "string" ? p.activeTemplateId : null,
                 };
             },

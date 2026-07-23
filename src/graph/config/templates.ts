@@ -30,6 +30,15 @@ export function sanitizeConfig(raw: unknown): GraphConfig {
     const r = raw as Record<string, unknown>;
 
     const tiers = Array.isArray(r.tiers) ? r.tiers.map(sanitizeTier).filter(Boolean) as LayoutTier[] : base.tiers;
+    // Tiers added in different sessions could share an id (the old uid was a
+    // per-session counter); every tier edit matches by id, so dedupe here.
+    const seenIds = new Set<string>();
+    for (let i = 0; i < tiers.length; i++) {
+        let id = tiers[i].id;
+        while (seenIds.has(id)) id = `${id}-${i}`;
+        if (id !== tiers[i].id) tiers[i] = {...tiers[i], id};
+        seenIds.add(id);
+    }
     return {
         version: CONFIG_VERSION,
         tiers: tiers.length > 0 ? tiers : base.tiers,

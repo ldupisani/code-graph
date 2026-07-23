@@ -772,6 +772,18 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     const sy = world.y + n.y * scale;
                     if (sx + hw >= 0 && sx - hw <= W && sy + hh >= 0 && sy - hh <= H) return true;
                 }
+                // Expanded-block overlays are content too. A tall block can run
+                // far past its file's circle, so reading its lower half puts
+                // every file NODE offscreen — treating that as blank would
+                // auto-refit the project, and the fit's low zoom then collapses
+                // the very expansion the user is reading. overlayHitRects holds
+                // this frame's overlay rects in world coords (top-left + w/h),
+                // rebuilt during draw, which runs before this check.
+                for (const r of overlayHitRects) {
+                    const sx = world.x + r.x * scale;
+                    const sy = world.y + r.y * scale;
+                    if (sx + r.w * scale >= 0 && sx <= W && sy + r.h * scale >= 0 && sy <= H) return true;
+                }
                 return false;
             }
 

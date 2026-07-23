@@ -182,6 +182,19 @@ export interface AstNode {
   // SYNTAX.type colour regardless of their syntaxKind's normal
   // category, matching how the editor highlights types.
   isType?: boolean;
+  // Variable-ish role of the node, driving editor-like differentiation:
+  //  * 'const' | 'let' | 'var' — a declaration (the VariableStatement AND
+  //    each VariableDeclaration under it). The client prefixes the keyword
+  //    in keyword colour before the name.
+  //  * 'field' — a class field (TS PropertyDeclaration; Python class-body
+  //    Assign / AnnAssign). The client prefixes a keyword-colour "◇ ".
+  //  * 'mutation' — an assignment to an EXISTING binding (TS
+  //    BinaryExpression with `=` or any compound `+=`…`??=`; Python
+  //    AugAssign). The client renders the operator glyph in the mutation
+  //    colour instead of default grey. Plain Python Assign outside a class
+  //    body stays unset: first-bind vs rebind isn't syntactically
+  //    decidable there.
+  decl?: 'const' | 'let' | 'var' | 'field' | 'mutation';
   // Source-text signature: `(p: T, q: U): R` for function-likes,
   // `: T` for typed declarations (property / variable / parameter
   // with an explicit type annotation). The hover tooltip in

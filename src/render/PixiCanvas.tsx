@@ -13,7 +13,7 @@ import {buildAstForceLayout, isMiddleStatement, type AstForceLayout, type Contai
 import type {AstNode, FileAstResponse, ProjectResponse} from "../api/types";
 import type {SimFileNode} from "../graph/types";
 import {blendColor, DEFAULT_FILL_ALPHA, depthTint, EXPORT_FILL_ALPHA, EXPORT_FILL_BLEND, EXPORT_FILL_COLOR, hslToHex, liveTheme} from "./theme";
-import {composeModifierPrefix, isBracketKind, isBraceLabelKind, isExpandableKind, isFunctionSignatureKind, isHighLevel, isJsxSignatureKind, isSignificant, KIND_FILL_TINT, KIND_OUTLINE, labelFor, NAME_LIKE_KINDS, splitCallMarker, splitDeclarationKeyword, splitDefaultExportPrefix, splitTypeAnnotation, SYNTAX, syntaxColor, syntaxTokens} from "./astStyle";
+import {composeModifierPrefix, declPrefixOf, isBracketKind, isBraceLabelKind, isExpandableKind, isFunctionSignatureKind, isHighLevel, isJsxSignatureKind, isSignificant, KIND_FILL_TINT, KIND_OUTLINE, labelFor, NAME_LIKE_KINDS, splitCallMarker, splitDefaultExportPrefix, splitTypeAnnotation, SYNTAX, syntaxColor, syntaxTokens} from "./astStyle";
 import {findVisibleAnchor, smallestContaining, type HitRect} from "./hitTest";
 import {drawEdges, drawSemanticEdges, emitDashed} from "./edges";
 import {wireCamera} from "./cameraInput";
@@ -3259,10 +3259,14 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                                     rest = de.rest;
                                 }
                             }
-                            const decl = node.syntaxKind === "VariableStatement" ? splitDeclarationKeyword(rest) : null;
-                            if (decl) {
-                                segs.push({t: decl.keyword + " ", c: SYNTAX.keyword});
-                                segs.push({t: decl.rest, c: SYNTAX.variable});
+                            // Structured decl prefix ("◇ " field marker or a
+                            // const/let/var keyword) — labelFor baked the same
+                            // prefix into collapsedLabel, so splitting on it
+                            // keeps segments summing to the measured text.
+                            const declPfx = declPrefixOf(node);
+                            if (declPfx && rest.startsWith(declPfx)) {
+                                segs.push({t: declPfx, c: SYNTAX.keyword});
+                                segs.push({t: rest.slice(declPfx.length), c: SYNTAX.variable});
                             } else {
                                 segs.push({t: rest, c: syntaxColor(node)});
                             }
@@ -3627,6 +3631,13 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 const modifierPrefix = composeModifierPrefix(node);
                 const drawHeaderSegments = (startX: number, midY: number, centered: boolean): void => {
                     const segs: {t: string; c: number}[] = [];
+                    // Decl prefix ("◇ " field marker / const-let-var keyword)
+                    // leads, before modifiers — mirroring the ƒ marker and
+                    // labelFor's composition, so segments sum to the measured
+                    // label text.
+                    if (headerDeclPfx) {
+                        segs.push({t: headerDeclPfx, c: SYNTAX.keyword});
+                    }
                     if (modifierPrefix) {
                         segs.push({t: modifierPrefix + " ", c: SYNTAX.keyword});
                     }
@@ -3668,14 +3679,17 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     }
                 };
                 const composite = node.extendsName != null && node.name != null;
-                // The " extends Base" suffix and the modifier keywords are
-                // non-name detail; both drop in the simplified tier along
-                // with operators/kind labels — just the name. The multi-colour
-                // header path runs whenever EITHER of them is present (and
-                // we're above simplified).
+                // The " extends Base" suffix, the modifier keywords, and the
+                // decl prefix (◇ / const / let / var) are non-name detail; all
+                // drop in the simplified tier along with operators/kind labels
+                // — just the name. The multi-colour header path runs whenever
+                // ANY of them is present (and we're above simplified). The
+                // prefix only applies to NAMED nodes — labelFor bakes it into
+                // named labels only, and segments must sum to the measured text.
                 const showExtends = composite && !simplified;
                 const showModifiers = modifierPrefix.length > 0 && !simplified;
-                const useSegments = showExtends || showModifiers;
+                const headerDeclPfx = !simplified && node.name != null ? declPrefixOf(node) : null;
+                const useSegments = showExtends || showModifiers || headerDeclPfx != null;
                 const labelText = labelFor(node);
                 const labelBox = labelText ? labelScreenBox(labelText) : null;
                 // (CallExpression labels arrive from the server as `▷ <callee>` —
@@ -3897,7 +3911,11 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                             text: g.text,
                             worldX: baseX + g.anchor.x,
                             worldY: baseY + g.anchor.y,
-                            color: g.color ?? SYNTAX.default,
+                            // Mutation nodes (assignment to an existing
+                            // binding — TS `=`/`+=` BinaryExpression, Python
+                            // AugAssign) colour their operator glyph orange;
+                            // a declaration's `=` keeps the neutral default.
+                            color: g.color ?? (node.decl === "mutation" ? SYNTAX.mutation : SYNTAX.default),
                             size: gSize,
                             anchorX: 0.5,
                             anchorY: 0.5,

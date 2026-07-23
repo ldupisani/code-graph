@@ -116,6 +116,7 @@ export function extractAst(
       accessibility: accessibilityOf(node),
       extendsName: extendsNameOf(node),
       isType: typeFlag,
+      decl: declOf(node),
       signature: signatureOf(node) ?? callSignatureOf(node) ?? propertyTypeOf(node),
       preview: previewOf(node) ?? importPreviewOf(node),
       returnType: returnTypeOf(node),
@@ -991,6 +992,31 @@ function operatorOf(node: Node): string | undefined {
   return undefined;
 }
 
+// Variable-ish role for the client's decl styling (see AstNode.decl):
+// the declaration keyword for VariableStatement / VariableDeclaration
+// ('using' / 'await using' get none — no visual language for them yet),
+// 'field' for class properties, 'mutation' for assignment operators on
+// existing bindings.
+function declOf(node: Node): AstNode['decl'] {
+  const classic = (k: string): AstNode['decl'] =>
+    k === 'const' || k === 'let' || k === 'var' ? (k as AstNode['decl']) : undefined;
+  if (Node.isVariableStatement(node)) {
+    return classic(node.getDeclarationList().getDeclarationKind());
+  }
+  if (Node.isVariableDeclaration(node)) {
+    const parent = node.getParent();
+    return Node.isVariableDeclarationList(parent) ? classic(parent.getDeclarationKind()) : undefined;
+  }
+  if (Node.isPropertyDeclaration(node)) return 'field';
+  if (Node.isBinaryExpression(node)) {
+    const k = node.getOperatorToken().getKind();
+    // FirstAssignment (`=`) .. LastAssignment covers every compound form
+    // (`+=` … `??=`) — all mutations of an existing binding.
+    if (k >= ts.SyntaxKind.FirstAssignment && k <= ts.SyntaxKind.LastAssignment) return 'mutation';
+  }
+  return undefined;
+}
+
 // Part of the module's public surface? Exportable declarations carry an
 // `isExported()` (covers `export class/fn/const/...`, and `class X {}; export
 // { X }`); `export ...` / `export default ...` statements count too. Returns
@@ -1530,11 +1556,11 @@ function rawFriendlyName(
         }
       }
       if (names.length > 0) {
-        // Lead with the declaration keyword (`const` / `let` / `var`) so the
-        // collapsed cell reads like the source — `const Icon` instead of a
-        // bare `Icon` that could be mistaken for a reference. getDeclarationKind
-        // returns the keyword string directly.
-        return `${declList.getDeclarationKind()} ${names.join(', ')}`;
+        // Bare names only — the declaration keyword travels as the
+        // structured `decl` field (declOf) and the client's labelFor
+        // re-attaches it in keyword colour, so it's no longer baked into
+        // the name string (which forced regex-parsing client-side).
+        return names.join(', ');
       }
     }
     return null;

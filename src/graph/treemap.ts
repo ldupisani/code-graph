@@ -49,6 +49,9 @@ export interface TreemapNode {
   // their syntaxKind's normal category — currently set by the server
   // for type-only import bindings (see AstNode.isType in api/types.ts).
   isType?: boolean;
+  // Variable-ish role (see AstNode.decl in api/types.ts): drives the ◇ /
+  // keyword label prefix and the mutation-coloured operator glyph.
+  decl?: AstNode['decl'];
   // Inline syntax glyphs drawn between/around this node's child boxes — see
   // SyntaxGlyph. Holds a BinaryExpression's single operator, a ternary's
   // `?`/`:` pair, or a templated construct's full keyword sequence.
@@ -921,6 +924,7 @@ export function layoutAst(
       accessibility: s.node.accessibility,
       extendsName: s.node.extendsName,
       isType: s.node.isType,
+      decl: s.node.decl,
       rect: { x, y, w: s.w, h: s.h },
       depth,
       collapsed: s.collapsed,

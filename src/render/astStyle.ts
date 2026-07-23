@@ -114,17 +114,26 @@ export const SYNTAX_KIND_LABELS: Record<string, string> = {
 // anything not curated) returns null, so it neither competes with a real
 // name nor reserves a label band. Such single-child wrappers are then
 // flattened away entirely by the layout (see layoutAst).
-export function labelFor(node: {name: string | null; syntaxKind: string; extendsName?: string; static?: boolean; readonly?: boolean; accessibility?: "private" | "protected"; defaultExport?: boolean}): string | null {
+export function labelFor(node: {name: string | null; syntaxKind: string; extendsName?: string; static?: boolean; readonly?: boolean; accessibility?: "private" | "protected"; defaultExport?: boolean; decl?: "const" | "let" | "var" | "field" | "mutation"}): string | null {
     if (node.name) {
-        // Compose the full header text: "[export default] [private] [static] [readonly] name [extends Base]".
+        // Compose the full header text: "[◇ ][export default] [const] [private]
+        // [static] [readonly] name [extends Base]".
         // labelScreenBox measures THIS composite (single source of truth);
         // drawHeaderSegments below colours each part. Modifiers are tokens
         // separated by single spaces, source order matching how you'd write
         // them in TypeScript. The `export default` prefix marks a default export
         // that was merged onto its local implementation (see AstNode.defaultExport).
+        // The decl prefix (declPrefixOf) is baked in HERE so measurement and
+        // drawing agree: the const/let/var keyword sits inside any `export
+        // default` wrap (source order), while the ◇ field marker leads
+        // everything — mirroring how the ƒ function marker precedes modifiers.
         const modifiers = composeModifierPrefix(node);
         const withMods = modifiers ? `${modifiers} ${node.name}` : node.name;
-        const head = node.defaultExport ? `export default ${withMods}` : withMods;
+        const pfx = declPrefixOf(node);
+        const isField = node.decl === "field";
+        const withKeyword = pfx && !isField ? `${pfx}${withMods}` : withMods;
+        const wrapped = node.defaultExport ? `export default ${withKeyword}` : withKeyword;
+        const head = pfx && isField ? `${pfx}${wrapped}` : wrapped;
         if (node.extendsName) return `${head} extends ${node.extendsName}`;
         // An object-literal property key carries its `:` so it reads like the
         // source (`velocity:` not `velocity`). The colon is part of the label
@@ -136,16 +145,16 @@ export function labelFor(node: {name: string | null; syntaxKind: string; extends
     return SYNTAX_KIND_LABELS[node.syntaxKind] ?? null;
 }
 
-// Split a leading declaration keyword (`const` / `let` / `var`) off a label so
-// the renderer can colour it like an editor — the keyword in keyword-blue, the
-// declared name(s) in the variable colour — instead of one flat colour. The
-// server prepends the keyword in rawFriendlyName's VariableStatement branch
-// (so it survives the simplified tier in the collapsed cell); this splits it
-// back out for two-tone rendering. Returns null when there's no such prefix.
-const DECLARATION_KEYWORD = /^(const|let|var) (.+)$/;
-export function splitDeclarationKeyword(label: string): {keyword: string; rest: string} | null {
-    const m = DECLARATION_KEYWORD.exec(label);
-    return m ? {keyword: m[1], rest: m[2]} : null;
+// The keyword-coloured prefix a decl-carrying node's label starts with —
+// "◇ " for a class field, "const " / "let " / "var " for a declaration
+// (statement AND each declaration under it). labelFor bakes it into the
+// measured label; the renderer splits it back off for two-tone colouring
+// (keyword-blue prefix, variable-blue name). Null for mutation/none —
+// mutations colour their operator GLYPH instead (see SYNTAX.mutation),
+// since a `x = y` cell has no label band to prefix.
+export function declPrefixOf(node: {decl?: "const" | "let" | "var" | "field" | "mutation"}): string | null {
+    if (!node.decl || node.decl === "mutation") return null;
+    return node.decl === "field" ? "◇ " : `${node.decl} `;
 }
 
 // Split the leading `export default ` off a label (see labelFor / AstNode.
@@ -491,6 +500,11 @@ export const SYNTAX = {
     keyword: 0x569cd6,
     string: 0xce9178,
     number: 0xb5cea8,
+    // Assignment-to-existing-binding operator (`=`, `+=`, …) — warm orange,
+    // deliberately apart from string-salmon and number-green so a mutating
+    // `=` reads differently from a declaration's neutral `=` at a glance.
+    // See AstNode.decl === 'mutation'.
+    mutation: 0xffa657,
     default: 0xd4d4d4,
 } as const;
 

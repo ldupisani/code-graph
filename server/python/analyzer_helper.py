@@ -244,7 +244,10 @@ class FileData:
                         _txt += f" as {_a.asname}"
                     alias_import_text[id(_a)] = _txt
 
-        def visit(node, parent_id, top_level):
+        # `in_class` is True only for DIRECT statements of a ClassDef body —
+        # those Assign/AnnAssign are class fields (the Python analogue of a TS
+        # PropertyDeclaration) and get decl="field". Function bodies reset it.
+        def visit(node, parent_id, top_level, in_class=False):
             kind = type(node).__name__
             if kind in _SKIP or isinstance(node, _OPERATOR_BASES):
                 return
@@ -258,7 +261,7 @@ class FileData:
                 for child in ast.iter_child_nodes(node):
                     if kind == "arguments" and not isinstance(child, ast.arg):
                         continue
-                    visit(child, parent_id, top_level)
+                    visit(child, parent_id, top_level, in_class)
                 return
 
             # Comprehension clause (`for <target> in <iter> [if <cond>]…`) inside
@@ -366,6 +369,9 @@ class FileData:
             elif kind == "AugAssign":
                 t = op_text(node.op)
                 extra["op"] = (t + "=") if t else "="
+                # `+=` always mutates an existing binding — the one Python
+                # assignment form that's unambiguously a mutation.
+                extra["decl"] = "mutation"
             elif kind == "BoolOp":
                 t = op_text(node.op)
                 if t:
@@ -381,6 +387,8 @@ class FileData:
                     extra["op"] = " ".join(ops)
             elif kind == "Assign":
                 extra["op"] = "="
+                if in_class:
+                    extra["decl"] = "field"
                 tname = assign_target_name(node)
                 if tname:
                     name = tname
@@ -389,6 +397,8 @@ class FileData:
                 if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                     mark_inlined(node.targets[0])
             elif kind == "AnnAssign":
+                if in_class:
+                    extra["decl"] = "field"
                 tname = dotted(node.target)
                 ann = annotation_text(node.annotation)
                 if tname:
@@ -460,7 +470,10 @@ class FileData:
             for child in ast.iter_child_nodes(node):
                 if child in decorators:
                     continue
-                visit(child, astid, child_top)
+                # ClassDef bodies recurse directly (no Block wrapper), so this
+                # is the one place class-field context is born. Bases and
+                # decorators never get here (inlined / handled above).
+                visit(child, astid, child_top, kind == "ClassDef")
 
         # Root module node.
         root_rec, root_id = add(self.tree, "Module", None)

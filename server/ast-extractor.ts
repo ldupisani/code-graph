@@ -117,7 +117,7 @@ export function extractAst(
       extendsName: extendsNameOf(node),
       isType: typeFlag,
       signature: signatureOf(node) ?? callSignatureOf(node) ?? propertyTypeOf(node),
-      preview: previewOf(node),
+      preview: previewOf(node) ?? importPreviewOf(node),
       returnType: returnTypeOf(node),
       // friendlyName (above) ran synthesizeCallLabel, which populates chainData
       // for a method-chain root — read it back here. Object props evaluate
@@ -1097,6 +1097,44 @@ function previewOf(node: Node): string | undefined {
   if (!firstLine) return undefined;
   const more = lines.slice(idx + 1).some((l) => clean(l) !== '');
   return more ? `${firstLine} …` : firstLine;
+}
+
+// Full import statement for an imported NAME box — a named specifier
+// (`Foo` / `Foo as F` / `type Foo`), a default binding (`Dog`), or a namespace
+// (`* as ns`) — so hovering it shows `import { Foo } from './x'`. The TS
+// analogue of the per-name import preview the Python analyzer builds: only the
+// name that box represents is reconstructed, not the whole (possibly multi-name)
+// statement, so each box's tooltip names its own origin. Quote style of the
+// module specifier is preserved from source.
+function importPreviewOf(node: Node): string | undefined {
+  const k = node.getKind();
+  const eligible =
+    k === ts.SyntaxKind.ImportSpecifier ||
+    k === ts.SyntaxKind.NamespaceImport ||
+    // A default-import binding is a plain Identifier under the ImportClause.
+    k === ts.SyntaxKind.Identifier;
+  if (!eligible) return undefined;
+  // Walk up to the ImportDeclaration through ONLY import-internal wrappers, so a
+  // plain identifier (or a specifier's inner identifier) elsewhere never
+  // qualifies — the first non-import parent disqualifies the node.
+  let decl: Node | undefined;
+  let cur: Node | undefined = node.getParent();
+  for (let hops = 0; cur && hops < 6; hops++) {
+    const ck = cur.getKind();
+    if (ck === ts.SyntaxKind.ImportDeclaration) {
+      decl = cur;
+      break;
+    }
+    if (ck !== ts.SyntaxKind.ImportClause && ck !== ts.SyntaxKind.NamedImports) return undefined;
+    cur = cur.getParent();
+  }
+  const impDecl = decl?.asKind(ts.SyntaxKind.ImportDeclaration);
+  if (!impDecl) return undefined;
+  const modText = impDecl.getModuleSpecifier().getText(); // includes original quotes
+  const typeKw = impDecl.getImportClause()?.isTypeOnly() ? 'type ' : '';
+  const nameText = node.getText().replace(/\s+/g, ' ').trim();
+  const inner = k === ts.SyntaxKind.ImportSpecifier ? `{ ${nameText} }` : nameText;
+  return `import ${typeKw}${inner} from ${modText}`;
 }
 
 function signatureOf(node: Node): string | undefined {

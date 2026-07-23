@@ -215,6 +215,14 @@ export interface AstLayoutOpts {
     n: { name: string | null; syntaxKind: string; id: string },
     parentKind: string,
   ) => boolean;
+  // Optional predicate on a CONTAINER node: when it returns false, the wrapped-
+  // row height-equalisation is skipped for that container's children — each
+  // child keeps its natural height rather than stretching to its row's tallest
+  // sibling. Defaults to always-equalise. Set false for top-level file
+  // statements (SourceFile / Module): those are a sequence of independent logic,
+  // not a table of members, so stretching a one-liner to match a giant sibling
+  // (e.g. a multi-line call) just leaves a mostly-empty cell.
+  equaliseRows?: (node: { syntaxKind: string; id: string }) => boolean;
 }
 
 interface Sized {
@@ -278,6 +286,7 @@ export function layoutAst(
   const pruneEmpty = opts.pruneEmpty ?? (() => false);
   const prune = opts.prune ?? (() => false);
   const reserveBand = opts.reserveBand ?? (() => false);
+  const equaliseRows = opts.equaliseRows ?? (() => true);
   const collapseChildren = opts.collapseChildren;
   const isPruned = (n: AstNode): boolean =>
     prune(n) || (pruneEmpty(n) && (kidsOf.get(n.id)?.length ?? 0) === 0);
@@ -624,13 +633,15 @@ export function layoutAst(
     // already-reserved space — blockH is unchanged. Stretched cells are flagged
     // so the renderer pins their label to the top band (aligned with the tall
     // sibling's header) rather than centring it in the now-taller box.
-    const rowMaxH = new Map<number, number>();
-    for (const p of placed) rowMaxH.set(p.y, Math.max(rowMaxH.get(p.y) ?? 0, p.sized.h));
-    for (const p of placed) {
-      const target = rowMaxH.get(p.y)!;
-      if (target > p.sized.h) {
-        p.sized.h = target;
-        p.sized.labelTop = true;
+    if (equaliseRows(node)) {
+      const rowMaxH = new Map<number, number>();
+      for (const p of placed) rowMaxH.set(p.y, Math.max(rowMaxH.get(p.y) ?? 0, p.sized.h));
+      for (const p of placed) {
+        const target = rowMaxH.get(p.y)!;
+        if (target > p.sized.h) {
+          p.sized.h = target;
+          p.sized.labelTop = true;
+        }
       }
     }
     // Inset the packed children by the side padding so the block has symmetric

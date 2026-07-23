@@ -73,6 +73,11 @@ export interface CameraState {
 
 export interface CameraApi {
     zoomBy: (factor: number) => void; // factor < 1 zooms out, > 1 zooms in
+    // Pan the camera by a screen-space delta (pixels): shifts the world
+    // container's translation and cancels any auto-follow / tween / zoom-fit so
+    // the manual pan owns the camera — the same ownership a drag-pan takes.
+    // Used by the arrow-key panning in App.
+    panBy: (dxScreen: number, dyScreen: number) => void;
     fitView: () => void; // re-frame the overview layout
     // Pan + zoom so every listed file (AST-node ids resolve to their file) fits
     // the viewport. Used to auto-frame the selection after a filesystem delta.
@@ -1230,18 +1235,10 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             }
             if (!Number.isFinite(minPopularity)) minPopularity = 0;
 
-            // Shift-key tracking for path tracing. wireCamera's onClick
-            // doesn't pass modifier state, so we mirror it via window key
-            // listeners. Captured on the click, consulted in handleClick.
-            let shiftHeld = false;
-            const onShiftDown = (e: KeyboardEvent): void => {
-                if (e.key === "Shift") shiftHeld = true;
-            };
-            const onShiftUp = (e: KeyboardEvent): void => {
-                if (e.key === "Shift") shiftHeld = false;
-            };
-            window.addEventListener("keydown", onShiftDown);
-            window.addEventListener("keyup", onShiftUp);
+            // Shift-click multi-select reads the modifier straight off the
+            // pointer-down event (wireCamera passes it to onClick → handleClick),
+            // so there's no window-tracked flag that can get stuck true after a
+            // missed Shift keyup.
 
             // Cached live set + the inputs that produced it; recomputed in
             // the ticker when any of them change. liveFiles === null means
@@ -1683,6 +1680,13 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     measureGlyph: (t, s) => measureMono(t, s ?? AST_LABEL_FONT),
                     rowGap: (kind) => (kind === "Block" ? BLOCK_ROW_GAP : undefined),
                     sidePad: (kind) => (kind === "Block" ? BLOCK_SIDE_PAD : undefined),
+                    // Don't height-equalise the file's TOP-LEVEL statement rows:
+                    // a file's statements are independent logic, not a table of
+                    // members, so a one-liner sharing a row with a multi-line call
+                    // shouldn't stretch to match it (that leaves a mostly-empty
+                    // cell). Nested containers (object/array/type members) still
+                    // band. SourceFile = TS root, Module = Python root.
+                    equaliseRows: (n) => n.syntaxKind !== "SourceFile" && n.syntaxKind !== "Module",
                     // Every Block is ALWAYS collapsed in the main layout — the
                     // file's footprint never grows when a user expands a Block.
                     // Expanded Blocks are rendered as OVERLAYS on top of the
@@ -2315,6 +2319,14 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // 12px so the active attention target reads at the
                     // same weight as its containing folder.
                     const size = highlighted ? 12 : 9;
+                    // Focus-dim the NAME to match the icon. Non-highlighted file
+                    // names used to render at full alpha regardless of the file's
+                    // focus dim, so a 0.22-dimmed icon still carried a full-weight
+                    // basename — and near an expanded overlay those bright names
+                    // shout over the block content the user is actually reading.
+                    // Highlighted names (selected / expanded / hovered / edited)
+                    // and any file at full dimAlpha are unaffected.
+                    const labelAlpha = highlighted ? 1 : dimAlpha;
                     labelPool.put({
                         text,
                         worldX: sim.x,
@@ -2324,6 +2336,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         anchorX: 0.5,
                         anchorY: 1, // text's bottom sits `aboveGap` above the node
                         scale: labelScale,
+                        alpha: labelAlpha,
                     });
                 };
 
@@ -3302,6 +3315,18 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // like a function `Parameter` (light-blue outline + rounded).
                 const argParent = node.parentId ? tree.byId.get(node.parentId) : undefined;
                 const isCallArg = argParent?.syntaxKind === "CallExpression" || argParent?.syntaxKind === "NewExpression";
+                // Subscript index: the LAST child of a `base[index]` node (Python
+                // Subscript / TS ElementAccessExpression, whose children are
+                // [base, index]). Its box is stroked as a white square bracket so
+                // the subscript reads `base[index]` with the brace ON the indexed
+                // value — replacing the loose `[ ]` glyphs the template used to
+                // emit (see SYNTAX_TEMPLATES.Subscript).
+                const parentIsSubscript = argParent?.syntaxKind === "Subscript" || argParent?.syntaxKind === "ElementAccessExpression";
+                let isSubscriptIndex = false;
+                if (parentIsSubscript && node.parentId) {
+                    const sibs = tree.childrenByParent.get(node.parentId);
+                    isSubscriptIndex = sibs != null && sibs.length >= 2 && sibs[sibs.length - 1].id === node.id;
+                }
                 const paramLike = node.syntaxKind === "Parameter" || isCallArg;
                 // A parameter inside a function definition draws NO box of its
                 // own — the function's parameter GROUP carries the (open-topped,
@@ -3341,7 +3366,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // than a full rect, so it reads as `[ … ]`. Same zoom gate as the
                 // other kind outlines; colour/width come from the KIND_OUTLINE
                 // branch below (ArrayBindingPattern is listed there).
-                const bracketOutline = isBracketKind(node.syntaxKind) && cameraScale >= cfg.lod.outlineBelow;
+                const bracketOutline = (isBracketKind(node.syntaxKind) || isSubscriptIndex) && cameraScale >= cfg.lod.outlineBelow;
                 // Function CALL / `new`: frame the box with the same rounded
                 // brace as a function definition's parameter group, but YELLOW —
                 // the interior (args, nested calls, expandable sections) renders
@@ -3358,6 +3383,14 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // Selection blue as a thick outline, not a background recolor.
                     borderColor = liveTheme.colors.astSelected;
                     borderWidth = FILE_RIM / 2;
+                    borderAlpha = 1;
+                } else if (isSubscriptIndex) {
+                    // White square bracket around the indexed value — the `[ ]` of
+                    // a subscript. Takes precedence over any kind outline the index
+                    // node would otherwise wear (the brace belongs to the subscript,
+                    // not the value's own kind).
+                    borderColor = liveTheme.colors.astSelectedBorder; // white
+                    borderWidth = 1 / cameraScale;
                     borderAlpha = 1;
                 } else if (kindOutline !== undefined) {
                     // Selection still overrides the kind color so the active node
@@ -4966,6 +4999,16 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             if (cameraApiRef) {
                 cameraApiRef.current = {
                     zoomBy: (factor) => applyZoom(world.scale.x * factor),
+                    panBy: (dxScreen, dyScreen) => {
+                        world.x += dxScreen;
+                        world.y += dyScreen;
+                        // Take camera ownership like a drag-pan / wheel-zoom, so
+                        // an in-flight follow / zoom-fit doesn't yank it back.
+                        followId = null;
+                        zoomFit = null;
+                        cameraTween = null;
+                        cameraAnchorHold = null;
+                    },
                     fitView: () => {
                         followId = null;
                         zoomFit = null;
@@ -5475,7 +5518,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             };
             window.addEventListener("keydown", onPinKey);
 
-            function handleClick(target: HitRect | null) {
+            function handleClick(target: HitRect | null, shiftKey = false) {
                 if (!target) {
                     const st = useGraphStore.getState();
                     st.setSelection(null);
@@ -5522,7 +5565,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // survive the click rather than collapse to a single
                     // block. File expansion is no longer a click action
                     // — it's zoom-driven (see syncExpansion).
-                    if (shiftHeld) {
+                    if (shiftKey) {
                         state.toggleSelection(target.id);
                     } else if (target.kind === "ast") {
                         state.selectAstNode(target.id);
@@ -5535,15 +5578,24 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // settle on a comfortable view depth and then explore.
                     state.setFocus(target.id);
                 }
-                // Expandable-container toggle: clicking the collapsed cell
-                // (Block or ObjectLiteralExpression, in the main scene or
-                // inside an overlay) or an overlay's handle (kind
-                // 'ast-toggle') flips this node in expandedAstNodes. The
-                // MAIN layout doesn't change — the file's footprint is stable
-                // across toggles — so we don't call applyExpansionToSim.
-                // drawOverlay reads the new expandedAstNodes set on the next
-                // frame and renders the overlay; startBlockAnim primes the
-                // rect-grow animation.
+                // Expandable-container toggle: clicking a COLLAPSED expandable
+                // cell (Block or ObjectLiteralExpression, in the main scene or
+                // inside an overlay) EXPANDS it; clicking an overlay's handle
+                // (kind 'ast-toggle') COLLAPSES it. The MAIN layout doesn't
+                // change — the file's footprint is stable across toggles — so
+                // we don't call applyExpansionToSim. drawOverlay reads the new
+                // expandedAstNodes set on the next frame and renders the
+                // overlay; startBlockAnim primes the rect-grow animation.
+                //
+                // Clicking the BODY of an ALREADY-expanded block (kind 'ast',
+                // id in expandedAstNodes) does NOT collapse it. Member cells in
+                // an overlay don't tile, so a click in a gap between them
+                // resolves — via smallestContaining — to the overlay's root
+                // block rect. Toggling there would collapse the whole overlay
+                // out from under the user (who was aiming at a member and even
+                // saw its hover tooltip). Instead the selection above stands
+                // and the overlay stays open; the dedicated top-left handle is
+                // the only body-adjacent way to collapse.
                 //
                 // Resolve syntaxKind via the file's flat AST (not via
                 // mainTree.byId): the main layout's `collapseChildren`
@@ -5556,7 +5608,10 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     const ast = state.asts.get(target.fileId);
                     return ast?.nodes.find((n) => n.id === target.id)?.syntaxKind;
                 })();
-                const isExpandable = (astKind != null && isExpandableKind(astKind)) || target.kind === "ast-toggle";
+                const alreadyExpanded = state.expandedAstNodes.has(target.id);
+                const isExpandable =
+                    target.kind === "ast-toggle" ||
+                    (target.kind === "ast" && astKind != null && isExpandableKind(astKind) && !alreadyExpanded);
                 if (isExpandable) {
                     // Two cases for the prev-rect snapshot:
                     //   * Expanding: target is the cell HitRect (kind 'ast'); its
@@ -5834,8 +5889,6 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 layout.simulation.stop();
                 resizeObserver.disconnect();
                 detachCamera();
-                window.removeEventListener("keydown", onShiftDown);
-                window.removeEventListener("keyup", onShiftUp);
                 window.removeEventListener("keydown", onPinKey);
                 labelPool.destroy();
                 directoryLabelPool.destroy();

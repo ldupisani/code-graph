@@ -18,7 +18,8 @@ export const SYNTAX_KIND_LABELS: Record<string, string> = {
     CallExpression: "call",
     NewExpression: "new",
     PropertyAccessExpression: "access",
-    ElementAccessExpression: "index",
+    // ElementAccessExpression renders via SYNTAX_TEMPLATES as `base[index]`
+    // (inline brackets), so it carries no static label — see the template.
     PrefixUnaryExpression: "unary",
     PostfixUnaryExpression: "unary",
     // ConditionalExpression intentionally has NO static label: the
@@ -96,7 +97,8 @@ export const SYNTAX_KIND_LABELS: Record<string, string> = {
     // synthesized name wins, these are fallbacks).
     Call: "call",
     Attribute: "access",
-    Subscript: "index",
+    // Subscript renders via SYNTAX_TEMPLATES as `base[index]` (inline brackets),
+    // so it carries no static label — see the template.
     // Container literals — `{…}` collapsed object/dict, `[]`/`()` for
     // list/tuple. Like their TS counterparts the label drops when expanded
     // inline (see BRACE_LABEL_KINDS / BRACKET_KINDS).
@@ -305,10 +307,19 @@ export const KIND_OUTLINE: Record<string, number> = {
     Try: COLORS.astOutlineControl,
     ExceptHandler: COLORS.astOutlineControl,
     Match: COLORS.astOutlineControl,
+    comprehension: COLORS.astOutlineControl,
+    AsyncComprehension: COLORS.astOutlineControl,
     Dict: COLORS.astOutlineObject,
     Set: COLORS.astOutlineObject,
     List: COLORS.astOutlineObject,
     Tuple: COLORS.astOutlineObject,
+    // Comprehensions produce a container, so they wear the same object-yellow
+    // outline as the matching literal: `[ … ]` brackets for a list comp (via
+    // BRACKET_KINDS), a plain yellow box for set / dict comps — signalling the
+    // `for … in …` clause inside builds a list / set / dict.
+    ListComp: COLORS.astOutlineObject,
+    SetComp: COLORS.astOutlineObject,
+    DictComp: COLORS.astOutlineObject,
 };
 
 // Kinds whose box is stroked as a literal pair of square brackets — solid
@@ -317,7 +328,7 @@ export const KIND_OUTLINE: Record<string, number> = {
 // destructuring (`const [a, b] = …`) AND array literals (`[x, y]`), where the
 // brackets ARE the syntax and a "[]" text label over the band just duplicates
 // them. The stroke colour comes from KIND_OUTLINE above.
-export const BRACKET_KINDS = new Set(["ArrayBindingPattern", "ArrayLiteralExpression", "List"]);
+export const BRACKET_KINDS = new Set(["ArrayBindingPattern", "ArrayLiteralExpression", "List", "ListComp"]);
 export function isBracketKind(kind: string): boolean {
     return BRACKET_KINDS.has(kind);
 }
@@ -341,6 +352,12 @@ export const BRACE_LABEL_KINDS = new Set([
     "Dict",
     "Set",
     "List",
+    // Comprehensions render always-expanded (the `for … in …` clause shows),
+    // so — like the literals above — they reserve no label band; the bracket /
+    // box outline carries the container signal.
+    "ListComp",
+    "SetComp",
+    "DictComp",
 ]);
 export function isBraceLabelKind(kind: string): boolean {
     return BRACE_LABEL_KINDS.has(kind);
@@ -589,6 +606,14 @@ export const SYNTAX_TEMPLATES: Record<string, SyntaxTemplate> = {
     TemplateSpan: () => [{kw: "$", color: P}, {child: 0}],
     // `[expr] as [Type]` — both operands present (expression 0, type 1).
     AsExpression: () => [{child: 0}, {kw: "as", color: K}, {child: 1}],
+    // Subscript / element access `base[index]` — the base box followed by the
+    // index box glued to it (child 0 = base, child 1 = index). The `[ ]` are NOT
+    // flow glyphs: the renderer strokes the INDEX box itself as a white square
+    // bracket (see `isSubscriptIndex` in drawAstNode), so `ctx.query["item"]`
+    // reads with the brace ON the indexed value rather than two loose bracket
+    // chips. Covers TS `arr[i]` and Python `d["k"]`.
+    ElementAccessExpression: () => [{child: 0}, {child: 1, glue: true}],
+    Subscript: () => [{child: 0}, {child: 1, glue: true}],
 
     // --- Python control flow / keyword-expressions ---
     // Bodies are bare statement lists (no Block wrapper for control flow), so
@@ -599,6 +624,21 @@ export const SYNTAX_TEMPLATES: Record<string, SyntaxTemplate> = {
     While: () => [{kw: "while", color: C}, {child: 0}],
     For: () => [{kw: "for", color: C}, {child: 0}, {kw: "in", color: C}, {child: 1}],
     AsyncFor: () => [{kw: "async for", color: C}, {child: 0}, {kw: "in", color: C}, {child: 1}],
+    // Comprehension clause `for [target] in [iter] if [cond]…` — the server
+    // emits one `comprehension` box per generator with children in
+    // target (0), iter (1), ifs (2+) order. Each trailing `if` renders its own
+    // keyword so a filtered comprehension reads in full; nested comprehensions
+    // (`[x for a in A for b in B]`) surface as sibling comprehension boxes.
+    comprehension: (kids) => {
+        const t: SyntaxToken[] = [{kw: "for", color: C}, {child: 0}, {kw: "in", color: C}, {child: 1}];
+        for (let i = 2; i < kids.length; i++) t.push({kw: "if", color: C}, {child: i});
+        return t;
+    },
+    AsyncComprehension: (kids) => {
+        const t: SyntaxToken[] = [{kw: "async for", color: C}, {child: 0}, {kw: "in", color: C}, {child: 1}];
+        for (let i = 2; i < kids.length; i++) t.push({kw: "if", color: C}, {child: i});
+        return t;
+    },
     With: () => [{kw: "with", color: C}, {child: 0}],
     AsyncWith: () => [{kw: "async with", color: C}, {child: 0}],
     Return: () => [{kw: "↩", color: C, size: 22}],

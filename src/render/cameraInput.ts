@@ -9,7 +9,12 @@ export interface CameraDeps {
     getCameraScale: () => number;
     setCameraScale: (s: number) => void;
     hitTest: (wx: number, wy: number) => HitRect | null;
-    onClick: (target: HitRect | null) => void;
+    // `shiftKey` is the modifier state read straight off the pointer-down event
+    // that began this click (see `shiftDown`), NOT a separately key-tracked
+    // flag — so it can't get stuck true when a Shift keyup is missed (window
+    // blur / focus steal), which would otherwise turn every plain click into an
+    // additive multi-select.
+    onClick: (target: HitRect | null, shiftKey: boolean) => void;
     // Called whenever the (non-dragging) cursor moves over a new target.
     // `null` means the cursor moved off any hit-tested rect. Used by the
     // renderer to highlight collapsed Block cells under the cursor and to
@@ -321,7 +326,7 @@ export function wireCamera(deps: CameraDeps): () => void {
             }
             draggingFolder = null;
         } else if (dragging && movedDistance < DRAG_DEADZONE) {
-            onClick(pendingTarget);
+            onClick(pendingTarget, shiftDown);
         }
         dragging = false;
         pendingTarget = null;

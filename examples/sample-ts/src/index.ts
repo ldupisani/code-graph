@@ -2,7 +2,7 @@ import { Dog } from './Dog';
 import { Cat } from './Cat';
 import { purr } from './util';
 
-const buddy = new Dog('Buddy');
+const buddy = new Dog('Buddy the dog');
 const whiskers = new Cat('Whiskers');
 
 console.log(buddy.greet());

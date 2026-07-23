@@ -3,7 +3,7 @@ import { wagTail } from './util';
 
 export class Dog extends Animal {
   makeSound(): string {
-    return 'Woof!';
+    return 'Woof..... Woof, Woof!';
   }
 
   greet(): string {

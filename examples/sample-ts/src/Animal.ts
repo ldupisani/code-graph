@@ -4,8 +4,8 @@ export abstract class Animal {
     abstract makeSound(): string;
 
     describe(): string {
-        let i = 20;
-        const j = 10;
+        let i = 40;
+        const j = 0;
 
         i = i + 1 + j;
         return `${this.name} says: ${this.makeSound()}`;

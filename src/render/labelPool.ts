@@ -18,6 +18,13 @@ export interface LabelRequest {
     // glyph. Width is in canvas pixels (not screen px); a value of
     // ~3 px gives a visible halo at typical font sizes.
     stroke?: {color: number; width: number};
+    // Optional per-instance opacity (default 1). Unlike `color`, this is
+    // NOT part of the pool key — it's a display-object property (like
+    // position / scale / visibility) that's safe to mutate per frame, so
+    // the same text/size/color can render at different alphas without
+    // fragmenting the pool. Used to sink focus-dimmed file names behind
+    // the live scene instead of keeping every label at full weight.
+    alpha?: number;
 }
 
 // Per-key POOL of Text instances. Each key owns an array; each put()
@@ -99,6 +106,7 @@ export class LabelPool {
         label.position.set(req.worldX, req.worldY);
         const s = req.scale ?? 1;
         label.scale.set(s);
+        label.alpha = req.alpha ?? 1;
         label.visible = true;
     }
 

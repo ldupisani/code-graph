@@ -202,6 +202,26 @@ export function App() {
         st.setFocus(st.focusId, Math.max(1, st.focusHops - 1));
         return;
       }
+      // Arrow keys pan the graph camera. The arrow points where you want to
+      // look: the content slides opposite the camera's motion (ArrowRight ->
+      // reveal content to the right -> world shifts left). Screen-space step so
+      // it feels the same at any zoom; Shift covers ground faster. Browser key
+      // repeat gives continuous panning while a key is held. Cmd/Ctrl/Alt combos
+      // are left to the browser/OS. `preventDefault` stops the page scrolling.
+      if (
+        st.project &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight')
+      ) {
+        e.preventDefault();
+        const step = e.shiftKey ? 240 : 80;
+        const dx = e.key === 'ArrowLeft' ? step : e.key === 'ArrowRight' ? -step : 0;
+        const dy = e.key === 'ArrowUp' ? step : e.key === 'ArrowDown' ? -step : 0;
+        cameraApiRef.current?.panBy(dx, dy);
+        return;
+      }
       // (Direction toggles for the reverse-call query — R / [ / ] —
       // were removed when import-direction was moved to per-edge
       // COLOUR: yellow = outgoing from selection, blue = incoming

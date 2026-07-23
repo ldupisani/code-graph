@@ -45,7 +45,7 @@ _OPERATOR_BASES = (ast.operator, ast.boolop, ast.unaryop, ast.cmpop)
 
 # Structural wrappers with no value of their own — emit their children in
 # place (the TS PASSTHROUGH_KINDS analogue).
-_PASSTHROUGH = {"arguments", "keyword", "comprehension", "withitem", "Expr"}
+_PASSTHROUGH = {"arguments", "keyword", "withitem", "Expr"}
 
 # Expression-context markers (Load/Store/Del) — skipped entirely.
 _SKIP = {"Load", "Store", "Del", "Starred"}
@@ -222,6 +222,28 @@ class FileData:
 
         all_names = collect_dunder_all(self.tree)
 
+        # Per-alias reconstructed import statement, keyed by the alias node's
+        # identity. Each imported name box (`Answer`, `Price`, …) carries the
+        # single statement that brought it in as a hover `preview`, so hovering
+        # it shows `from ..answer import Answer` rather than just the bare name.
+        # `ast.alias` has no parent back-reference, so we resolve module/level
+        # from the owning Import / ImportFrom here in one walk.
+        alias_import_text = {}
+        for _imp in ast.walk(self.tree):
+            if isinstance(_imp, ast.ImportFrom):
+                _prefix = "." * (_imp.level or 0) + (_imp.module or "")
+                for _a in _imp.names:
+                    _txt = f"from {_prefix} import {_a.name}"
+                    if _a.asname:
+                        _txt += f" as {_a.asname}"
+                    alias_import_text[id(_a)] = _txt
+            elif isinstance(_imp, ast.Import):
+                for _a in _imp.names:
+                    _txt = f"import {_a.name}"
+                    if _a.asname:
+                        _txt += f" as {_a.asname}"
+                    alias_import_text[id(_a)] = _txt
+
         def visit(node, parent_id, top_level):
             kind = type(node).__name__
             if kind in _SKIP or isinstance(node, _OPERATOR_BASES):
@@ -237,6 +259,36 @@ class FileData:
                     if kind == "arguments" and not isinstance(child, ast.arg):
                         continue
                     visit(child, parent_id, top_level)
+                return
+
+            # Comprehension clause (`for <target> in <iter> [if <cond>]…`) inside
+            # a list/set/dict/generator comprehension. `ast.comprehension` carries
+            # NO source position of its own, so `node_span` would hand it the
+            # whole-file span; derive the span from its target → iter / ifs
+            # instead. Emitted as its OWN box (not passed through) so the client's
+            # `comprehension` token template can draw the `for … in … if …`
+            # keywords — otherwise the loop variable and iterable render as bare,
+            # unexplained boxes. Children are visited in target, iter, ifs order
+            # so the template can reference them positionally (child 0 = target,
+            # 1 = iter, 2+ = each `if`).
+            if kind == "comprehension":
+                parts = [node.target, node.iter, *node.ifs]
+                positioned = [p for p in parts if getattr(p, "lineno", None) is not None]
+                if positioned:
+                    cstart = min(char_off(p.lineno, getattr(p, "col_offset", 0)) for p in positioned)
+                    cend = max(
+                        char_off(getattr(p, "end_lineno", p.lineno), getattr(p, "end_col_offset", 0))
+                        for p in positioned
+                    )
+                else:
+                    cstart, cend = 0, len(source)
+                ckind = "AsyncComprehension" if getattr(node, "is_async", 0) else "comprehension"
+                crec, cid = add_synthetic(ckind, None, cstart, cend)
+                crec["parentId"] = parent_id
+                visit(node.target, cid, False)
+                visit(node.iter, cid, False)
+                for cond in node.ifs:
+                    visit(cond, cid, False)
                 return
 
             # Python params emit as `Parameter` so they reuse the TS function
@@ -288,6 +340,10 @@ class FileData:
                 name = None  # tinted; the alias children carry names
             elif kind == "alias":
                 name = node.asname or node.name
+                # Full import statement as the hover preview (see alias_import_text).
+                imp_text = alias_import_text.get(id(node))
+                if imp_text:
+                    extra["preview"] = imp_text
             elif kind == "arg":
                 ann = annotation_text(getattr(node, "annotation", None))
                 name = f"{node.arg}: {ann}" if ann else node.arg

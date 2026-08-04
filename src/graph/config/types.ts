@@ -5,41 +5,45 @@ import type {SemanticEdgeKind} from "../../api/types";
 //
 // Historically every tunable lived as a scattered module- or closure-scoped
 // `const` inside PixiCanvas.tsx / layout.ts. This object collects them so
-// they can be edited live (via useConfigStore), persisted, and saved as
-// named templates. The renderer reads the *current* config each frame through
+// they can be edited live (via useConfigStore), persisted, and captured into
+// snapshots. The renderer reads the *current* config each frame through
 // a mutable ref (see PixiCanvas's configRef) — config edits never tear down
 // the canvas.
 //
-// NOTE on phasing: the full shape is defined up-front so later phases don't
-// churn the type. In Phase 1 only `lod` and the behavioral *thresholds* are
-// actually consumed by the renderer; `tiers`, `theme`, `openLayoutBias`, and
-// the isolate flags exist with faithful defaults but are wired in later
-// phases (tiers → Phase 2, theme → Phase 6, isolate move → Phase 6).
 // ---------------------------------------------------------------------------
 
 // A pattern's tuned parameter values (keyed by ParamSpec.key). The schema
 // that describes/validates these lives with each LayoutPattern (patterns/types).
 export type PatternParams = Record<string, number | boolean | string>;
 
-// One zoom tier: owns a zoom range (as a MULTIPLE of fitScale, preserving the
-// project-fit-relative semantics of the old rigidness() band) and the single
-// layout pattern active within it. Adjacent tiers overlap in zoom; the renderer
-// crossfades between them in the overlap band. `params` are this tier's values
-// for its chosen pattern.
-export interface LayoutTier {
-    id: string;
-    name: string;
-    // Tier is active for cameraScale / fitScale in [zoomFromMul, zoomToMul].
-    // Use 0 for "down to fully zoomed out" and Infinity for "up to fully in".
-    zoomFromMul: number;
-    zoomToMul: number;
-    patternId: string;
+// One pattern's tuning. Held per pattern id (see LayoutConfig.byPattern) rather
+// than per active layout, so switching away from a pattern and back preserves
+// what you tuned instead of resetting it to defaults().
+export interface LayoutSettings {
     params: PatternParams;
-    // Mirror this tier's (static) layout across the vertical / horizontal axis.
-    // Applied by the tier engine to any static pattern (folder-grid, hub-spoke,
-    // treemap, …); a no-op for the live force tier. Optional → false.
-    flipX?: boolean; // mirror left ↔ right (negate x)
-    flipY?: boolean; // mirror top ↔ bottom (negate y)
+    // Mirror this (static) layout across the vertical / horizontal axis.
+    // Applied by the layout engine to any static pattern (folder-grid,
+    // hub-spoke, treemap, …); a no-op for the live force pattern.
+    flipX: boolean; // mirror left ↔ right (negate x)
+    flipY: boolean; // mirror top ↔ bottom (negate y)
+}
+
+// Which layout is arranging the files, and every pattern's saved tuning.
+//
+// This REPLACED the old zoom-tier list. Tiers bound the choice of pattern to
+// the camera zoom — adjacent tiers overlapped in a zoom band and the renderer
+// crossfaded between them as you zoomed — so the arrangement reorganised itself
+// as a side-effect of zooming in, which you never asked for and couldn't hold
+// still. The pattern is now an explicit choice; the crossfade survives, but it
+// runs on a short time tween when you SWITCH layouts (see render/layoutEngine).
+//
+// Zoom still drives level of detail (behavioral.expandAtMul / isolateAtMul and
+// the whole lod block) — that part was never the problem.
+export interface LayoutConfig {
+    patternId: string;
+    // Keyed by pattern id. A missing entry means "never tuned" and falls back
+    // to the pattern's defaults() — see layoutSettingsFor() in ./layout.
+    byPattern: Record<string, LayoutSettings>;
 }
 
 // Behavioral settings: expansion/isolate regime thresholds (multiples of
@@ -143,10 +147,10 @@ export interface ThemeConfig {
 }
 
 export interface GraphConfig {
-    // Bumped on every edit. Doubles as the tierEngine's recompute stamp
-    // (Phase 2) and the persistence migration version (Phase 5).
+    // Bumped on every edit. Doubles as the layout engine's recompute stamp
+    // and the persistence migration version.
     version: number;
-    tiers: LayoutTier[];
+    layout: LayoutConfig;
     behavioral: BehavioralConfig;
     lod: LodConfig;
     theme: ThemeConfig;

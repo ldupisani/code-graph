@@ -1,4 +1,7 @@
 import type {CameraApi} from "../../render/PixiCanvas";
+import {useConfigStore} from "../config/store";
+import {sanitizeConfig} from "../config/sanitize";
+import type {GraphConfig} from "../config/types";
 import {type GraphStore, useGraphStore} from "../store";
 import {type Snapshot, type SnapshotView, useSnapshotStore} from "./store";
 
@@ -23,6 +26,16 @@ function buildView(st: GraphStore): SnapshotView {
     };
 }
 
+// The live GraphConfig, deep-copied so later edits to the config store can't
+// mutate an already-saved snapshot through a shared reference.
+//
+// structuredClone rather than JSON: config values may be Infinity, which JSON
+// silently turns into null. Mirrors clone() in config/store.ts.
+function captureConfig(): GraphConfig {
+    const cfg = useConfigStore.getState().config;
+    return typeof structuredClone === "function" ? structuredClone(cfg) : (JSON.parse(JSON.stringify(cfg)) as GraphConfig);
+}
+
 // Save the current view as a NEW snapshot and CLEAR the active marker —
 // the highlight means "the view you're on", which is only meaningful after
 // explicitly jumping to (or overwriting) a saved view; auto-marking a fresh
@@ -32,7 +45,7 @@ export function captureSnapshot(api: CameraApi | null): string | null {
     const st = useGraphStore.getState();
     if (!st.project || !api) return null;
     const ss = useSnapshotStore.getState();
-    const id = ss.add(st.project.rootPath, {view: buildView(st), camera: api.getCamera(), pins: api.getPins()});
+    const id = ss.add(st.project.rootPath, {view: buildView(st), camera: api.getCamera(), pins: api.getPins(), config: captureConfig()});
     ss.setActive(st.project.rootPath, null);
     return id;
 }
@@ -43,7 +56,7 @@ export function overwriteSnapshot(id: string, api: CameraApi | null): void {
     const st = useGraphStore.getState();
     if (!st.project || !api) return;
     const ss = useSnapshotStore.getState();
-    ss.update(st.project.rootPath, id, {view: buildView(st), camera: api.getCamera(), pins: api.getPins()});
+    ss.update(st.project.rootPath, id, {view: buildView(st), camera: api.getCamera(), pins: api.getPins(), config: captureConfig()});
     ss.setActive(st.project.rootPath, id);
 }
 
@@ -80,6 +93,20 @@ export function applySnapshot(snap: Snapshot, api: CameraApi | null): void {
         tracedPath: v.tracedPath ? [...v.tracedPath] : null,
         showSupportFiles: v.showSupportFiles,
     });
+    // Restore the saved config (layout + theme + LOD + behavioral) so the view
+    // looks the way it did when saved, not just points at the same things.
+    //
+    // Through sanitizeConfig, not straight to replaceConfig: a snapshot can be
+    // arbitrarily old, and a config field added since it was saved would
+    // otherwise land as undefined and reach the renderer. sanitizeConfig fills
+    // those from defaults and migrates the pre-v2 `tiers` shape — the same
+    // treatment persistence rehydrate gives a stale blob, for the same reason.
+    //
+    // The layout switch ANIMATES for free: replaceConfig bumps config.version,
+    // the renderer's layoutEngine.sync sees a different layout.patternId on the
+    // next frame and starts its crossfade — the same path a LayoutBar click
+    // takes. Nothing here needs to know about the transition.
+    if (snap.config) useConfigStore.getState().replaceConfig(sanitizeConfig(snap.config));
     // Restore pins only when the snapshot recorded them — an older snapshot
     // without the field leaves the current pins untouched rather than clearing.
     if (snap.pins) api?.setPins(snap.pins);

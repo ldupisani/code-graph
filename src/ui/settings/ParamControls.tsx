@@ -1,6 +1,6 @@
 import type React from "react";
+import {layoutSettingsFor} from "../../graph/config/layout";
 import {useConfigStore} from "../../graph/config/store";
-import type {PatternParams} from "../../graph/config/types";
 import {getPattern} from "../../graph/patterns/registry";
 import type {ParamSpec} from "../../graph/patterns/types";
 import {Pill} from "../Pill";
@@ -8,24 +8,46 @@ import {Pill} from "../Pill";
 const LABEL_COLOR = "#b0b0b8";
 const VALUE_COLOR = "#dcdcaa";
 
-// Schema-driven controls: renders one input per ParamSpec of the tier's chosen
-// pattern, wired to setTierParam. number → slider+value, boolean → pill,
-// enum → select. Reused for any pattern; the schema (with min/max/step/options)
-// fully describes the UI.
-export function ParamControls({tierId, patternId, params}: {tierId: string; patternId: string; params: PatternParams}) {
-    const setTierParam = useConfigStore((s) => s.setTierParam);
-    const specs = getPattern(patternId).params;
-    if (specs.length === 0) {
-        return <div style={{color: LABEL_COLOR, opacity: 0.6, fontSize: "0.7rem", padding: "0.2rem 0"}}>No parameters.</div>;
-    }
+// Everything tunable about the ACTIVE layout: the flip toggles, then one input
+// per ParamSpec (number → slider+value, boolean → pill, enum → select), wired to
+// setLayoutFlip / setLayoutParam. Works for any pattern; the schema (with
+// min/max/step/options) fully describes the params UI.
+//
+// Takes no props deliberately — it reads the active pattern straight from the
+// config store. Flip lives here rather than in the LayoutBar because it's a
+// per-pattern layout setting exactly like a param is; splitting them meant the
+// bar and the panel each showed half the story.
+export function ParamControls() {
+    const layout = useConfigStore((s) => s.config.layout);
+    const setLayoutParam = useConfigStore((s) => s.setLayoutParam);
+    const setLayoutFlip = useConfigStore((s) => s.setLayoutFlip);
+    const pattern = getPattern(layout.patternId);
+    const specs = pattern.params;
+    const settings = layoutSettingsFor(layout);
+    // Flip mirrors a computed position map; the live force layout has none to
+    // mirror, so the toggles would be dead controls there.
+    const flippable = pattern.kind === "static";
     return (
         <div style={{display: "flex", flexDirection: "column", gap: "0.45rem", paddingTop: "0.2rem"}}>
-            {specs.map((spec) => (
-                <Control key={spec.key} spec={spec} value={params[spec.key]} onChange={(v) => setTierParam(tierId, spec.key, v)} />
-            ))}
+            {flippable ? (
+                <div style={{...rowStyle, justifyContent: "flex-start", gap: "0.4rem"}}>
+                    <span style={{color: LABEL_COLOR}}>flip</span>
+                    <Pill label="↔ X" on={settings.flipX} color={FLIP_COLOR} onToggle={() => setLayoutFlip({flipX: !settings.flipX})} />
+                    <Pill label="↕ Y" on={settings.flipY} color={FLIP_COLOR} onToggle={() => setLayoutFlip({flipY: !settings.flipY})} />
+                </div>
+            ) : null}
+            {specs.length === 0 ? (
+                <div style={{color: LABEL_COLOR, opacity: 0.6, fontSize: "0.7rem", padding: "0.2rem 0"}}>No parameters.</div>
+            ) : (
+                specs.map((spec) => (
+                    <Control key={spec.key} spec={spec} value={settings.params[spec.key]} onChange={(v) => setLayoutParam(spec.key, v)} />
+                ))
+            )}
         </div>
     );
 }
+
+const FLIP_COLOR = {bg: "#9aa3ff", text: "#0e1230"};
 
 function Control({spec, value, onChange}: {spec: ParamSpec; value: number | boolean | string | undefined; onChange: (v: number | boolean | string) => void}) {
     const v = value ?? spec.default;

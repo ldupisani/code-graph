@@ -1,67 +1,76 @@
 import {getPattern, PATTERN_REGISTRY} from "../patterns/registry";
 import type {ParamSpec} from "../patterns/types";
 import {CONFIG_VERSION, makeDefaultConfig} from "./defaults";
-import type {GraphConfig, LayoutTier, PatternParams} from "./types";
-
-// A saved template is a named, full GraphConfig. `builtin` marks shipped presets
-// (not persisted, not deletable).
-export interface Template {
-    id: string;
-    name: string;
-    builtin?: boolean;
-    config: GraphConfig;
-}
-
-// The on-disk JSON envelope for export/import.
-interface TemplateFile {
-    version: number;
-    name: string;
-    config: unknown;
-}
+import type {GraphConfig, LayoutConfig, LayoutSettings, PatternParams} from "./types";
 
 // Validate + coerce an arbitrary object into a well-formed GraphConfig. Fills
 // any missing field from the defaults, drops unknown extras, repoints unknown
-// pattern ids to the fallback, and clamps each tier's params to their spec.
-// Used by both persistence migration and JSON import so neither can crash the
-// renderer with a malformed config.
+// pattern ids to the fallback, and clamps each pattern's params to their spec.
+//
+// The two callers are the two places an OLD config can re-enter the app:
+// persistence rehydrate, and snapshot restore. Both can hand us a blob written
+// by a build that predates fields this one requires, so neither may skip it.
 export function sanitizeConfig(raw: unknown): GraphConfig {
     const base = makeDefaultConfig();
     if (!raw || typeof raw !== "object") return base;
     const r = raw as Record<string, unknown>;
 
-    const tiers = Array.isArray(r.tiers) ? r.tiers.map(sanitizeTier).filter(Boolean) as LayoutTier[] : base.tiers;
-    // Tiers added in different sessions could share an id (the old uid was a
-    // per-session counter); every tier edit matches by id, so dedupe here.
-    const seenIds = new Set<string>();
-    for (let i = 0; i < tiers.length; i++) {
-        let id = tiers[i].id;
-        while (seenIds.has(id)) id = `${id}-${i}`;
-        if (id !== tiers[i].id) tiers[i] = {...tiers[i], id};
-        seenIds.add(id);
-    }
     return {
         version: CONFIG_VERSION,
-        tiers: tiers.length > 0 ? tiers : base.tiers,
+        layout: sanitizeLayout(r.layout, r.tiers, base.layout),
         behavioral: mergeNumbersBooleans(base.behavioral, r.behavioral),
         lod: mergeNumbersBooleans(base.lod, r.lod),
         theme: sanitizeTheme(base.theme, r.theme),
     };
 }
 
-function sanitizeTier(raw: unknown, i: number): LayoutTier | null {
-    if (!raw || typeof raw !== "object") return null;
-    const t = raw as Record<string, unknown>;
-    const patternId = typeof t.patternId === "string" && PATTERN_REGISTRY[t.patternId] ? t.patternId : getPattern("").id;
-    const pattern = getPattern(patternId);
+// Coerce a LayoutConfig, MIGRATING from the pre-v2 `tiers` array when needed.
+//
+// Old shape: an ordered list of zoom-banded tiers, coarse → fine, where the
+// coarsest was what you saw at rest (fully zoomed out) and the finest was
+// usually the live force layout you only reached by zooming in. So the honest
+// translation of "what layout was this user actually looking at" is the first
+// STATIC tier — picking tiers[0] blindly would strand anyone whose overview was
+// force-connectivity, and picking the last would hand almost everyone force.
+// Every tier's params carry over into byPattern, so tuning survives the move.
+function sanitizeLayout(raw: unknown, legacyTiers: unknown, base: LayoutConfig): LayoutConfig {
+    const byPattern: Record<string, LayoutSettings> = {};
+    let patternId: string | null = null;
+
+    if (raw && typeof raw === "object") {
+        const l = raw as Record<string, unknown>;
+        if (typeof l.patternId === "string" && PATTERN_REGISTRY[l.patternId]) patternId = l.patternId;
+        if (l.byPattern && typeof l.byPattern === "object") {
+            for (const [id, v] of Object.entries(l.byPattern as Record<string, unknown>)) {
+                if (PATTERN_REGISTRY[id]) byPattern[id] = sanitizeSettings(id, v);
+            }
+        }
+    } else if (Array.isArray(legacyTiers)) {
+        for (const t of legacyTiers) {
+            if (!t || typeof t !== "object") continue;
+            const tier = t as Record<string, unknown>;
+            const id = typeof tier.patternId === "string" && PATTERN_REGISTRY[tier.patternId] ? tier.patternId : null;
+            if (!id) continue;
+            // First tier wins per pattern — coarse tiers come first, and a
+            // duplicated pattern across tiers is the overview's tuning we want.
+            if (!byPattern[id]) byPattern[id] = sanitizeSettings(id, tier);
+            if (patternId == null && getPattern(id).kind === "static") patternId = id;
+        }
+        // All tiers were live (the old "All force (no overview)" preset).
+        if (patternId == null && Object.keys(byPattern).length > 0) patternId = Object.keys(byPattern)[0];
+    }
+
+    return {patternId: patternId ?? base.patternId, byPattern};
+}
+
+// `raw` is either a LayoutSettings or (during migration) a legacy tier — both
+// carry `params` / `flipX` / `flipY` at the same keys, so one reader serves both.
+function sanitizeSettings(patternId: string, raw: unknown): LayoutSettings {
+    const s = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
     return {
-        id: typeof t.id === "string" ? t.id : `tier-${i}`,
-        name: typeof t.name === "string" ? t.name : `Tier ${i + 1}`,
-        zoomFromMul: numOr(t.zoomFromMul, 0),
-        zoomToMul: t.zoomToMul === null ? Infinity : numOr(t.zoomToMul, Infinity),
-        patternId,
-        params: clampParams(pattern.params, t.params),
-        flipX: t.flipX === true,
-        flipY: t.flipY === true,
+        params: clampParams(getPattern(patternId).params, s.params),
+        flipX: s.flipX === true,
+        flipY: s.flipY === true,
     };
 }
 
@@ -115,30 +124,4 @@ function sanitizeSemanticEdge(base: GraphConfig["theme"]["semanticEdge"], raw: u
         out[kind] = mergeNumbersBooleans(base[kind], r[kind]);
     }
     return out;
-}
-
-function numOr(v: unknown, fallback: number): number {
-    return typeof v === "number" && Number.isFinite(v) ? v : fallback;
-}
-
-export function serializeTemplate(t: Template): string {
-    const file: TemplateFile = {version: CONFIG_VERSION, name: t.name, config: t.config};
-    return JSON.stringify(file, null, 2);
-}
-
-// Parse an exported template JSON into a sanitized config + name. Tolerant:
-// returns an error string instead of throwing on bad input.
-export function parseTemplateFile(json: string): {ok: true; name: string; config: GraphConfig} | {ok: false; error: string} {
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(json);
-    } catch {
-        return {ok: false, error: "Not valid JSON"};
-    }
-    if (!parsed || typeof parsed !== "object") return {ok: false, error: "Expected a JSON object"};
-    const f = parsed as Record<string, unknown>;
-    // Accept either the {version,name,config} envelope or a bare config.
-    const rawConfig = "config" in f ? f.config : f;
-    const name = typeof f.name === "string" && f.name.trim() ? f.name : "Imported";
-    return {ok: true, name, config: sanitizeConfig(rawConfig)};
 }

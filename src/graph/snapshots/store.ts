@@ -1,5 +1,6 @@
 import {create} from "zustand";
 import {persist} from "zustand/middleware";
+import type {GraphConfig} from "../config/types";
 
 // ---------------------------------------------------------------------------
 // useSnapshotStore — saved "views" the user can jump between. A snapshot
@@ -57,6 +58,17 @@ export interface Snapshot {
     // sat. Optional: snapshots saved before pin capture existed simply omit it,
     // and applying one leaves the current pins untouched.
     pins?: {id: string; x: number; y: number}[];
+    // The full GraphConfig in force when this view was saved — layout choice and
+    // its params, theme, LOD, behavioral. A snapshot is meant to reproduce
+    // EXACTLY what you were looking at, and half of "what it looked like" lives
+    // in the config store rather than the graph store, so capturing only `view`
+    // would restore the right selection into the wrong-looking graph.
+    //
+    // Sits beside `camera`/`pins` rather than inside `view` because `view` is
+    // specifically the snapshot-worthy fields of useGraphStore; this comes from
+    // useConfigStore. Optional for the same reason `pins` is: a snapshot saved
+    // before this existed omits it, and applying one leaves the config alone.
+    config?: GraphConfig;
 }
 
 export interface SnapshotStore {
@@ -70,10 +82,17 @@ export interface SnapshotStore {
     // survives a reload.
     activeByProject: Record<string, string | null>;
     // Save a NEW snapshot for a project (no name unless given). Returns the id.
-    add: (rootPath: string, snap: {view: SnapshotView; camera: Snapshot["camera"]; pins?: Snapshot["pins"]; name?: string}) => string;
-    // Overwrite an existing snapshot's captured state (view/camera/pins) in
-    // place, keeping its id and name.
-    update: (rootPath: string, id: string, snap: {view: SnapshotView; camera: Snapshot["camera"]; pins?: Snapshot["pins"]}) => void;
+    add: (
+        rootPath: string,
+        snap: {view: SnapshotView; camera: Snapshot["camera"]; pins?: Snapshot["pins"]; config?: Snapshot["config"]; name?: string},
+    ) => string;
+    // Overwrite an existing snapshot's captured state (view/camera/pins/config)
+    // in place, keeping its id and name.
+    update: (
+        rootPath: string,
+        id: string,
+        snap: {view: SnapshotView; camera: Snapshot["camera"]; pins?: Snapshot["pins"]; config?: Snapshot["config"]},
+    ) => void;
     // Mark which snapshot is "active" (last saved / applied). null clears it.
     setActive: (rootPath: string, id: string | null) => void;
     remove: (rootPath: string, id: string) => void;
@@ -107,7 +126,7 @@ export const useSnapshotStore = create<SnapshotStore>()(
                     return {
                         byProject: {
                             ...s.byProject,
-                            [rootPath]: [...list, {id, name, view: snap.view, camera: snap.camera, pins: snap.pins}],
+                            [rootPath]: [...list, {id, name, view: snap.view, camera: snap.camera, pins: snap.pins, config: snap.config}],
                         },
                     };
                 });
@@ -120,7 +139,7 @@ export const useSnapshotStore = create<SnapshotStore>()(
                     return {
                         byProject: {
                             ...s.byProject,
-                            [rootPath]: list.map((x) => (x.id === id ? {...x, view: snap.view, camera: snap.camera, pins: snap.pins} : x)),
+                            [rootPath]: list.map((x) => (x.id === id ? {...x, view: snap.view, camera: snap.camera, pins: snap.pins, config: snap.config} : x)),
                         },
                     };
                 }),

@@ -15,6 +15,7 @@ export function mockCameraApi(): CameraApi {
     const camera: CameraState = {x: 0, y: 0, scale: 1};
     return {
         zoomBy: fn().mockName("zoomBy"),
+        panBy: fn().mockName("panBy"),
         fitView: fn().mockName("fitView"),
         frameFiles: fn().mockName("frameFiles"),
         pinAll: fn().mockName("pinAll"),
@@ -24,6 +25,8 @@ export function mockCameraApi(): CameraApi {
         setCamera: fn().mockName("setCamera"),
         getPins: () => [],
         setPins: fn().mockName("setPins"),
+        getOverlayOffsets: () => [],
+        setOverlayOffsets: fn().mockName("setOverlayOffsets"),
     };
 }
 

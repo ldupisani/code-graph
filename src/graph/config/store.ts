@@ -1,15 +1,20 @@
 import {create} from "zustand";
 import {persist} from "zustand/middleware";
-import {getPattern} from "../patterns/registry";
+import {PATTERN_REGISTRY} from "../patterns/registry";
 import {CONFIG_VERSION, makeDefaultConfig} from "./defaults";
-import {BUILTIN_PRESETS} from "./presets";
-import {parseTemplateFile, sanitizeConfig, serializeTemplate, type Template} from "./templates";
-import type {DeepPartial, GraphConfig, LayoutTier} from "./types";
+import {defaultSettingsFor, layoutSettingsFor} from "./layout";
+import {sanitizeConfig} from "./sanitize";
+import type {DeepPartial, GraphConfig} from "./types";
 
 // ---------------------------------------------------------------------------
-// useConfigStore — holds the LIVE GraphConfig the renderer reads each frame,
-// plus saved templates. Persisted to localStorage (config + user templates);
-// built-in presets are injected at hydrate, never persisted.
+// useConfigStore — holds the LIVE GraphConfig the renderer reads each frame.
+// Persisted to localStorage.
+//
+// This store used to ALSO keep named "templates": whole saved GraphConfigs you
+// could load, delete, and export/import as JSON, plus a few built-in presets.
+// They're gone — snapshots carry a full GraphConfig now, so a saved view IS a
+// saved config, and keeping both meant two ways to store the same thing with
+// only one of them tied to what you were actually looking at.
 //
 // Kept SEPARATE from useGraphStore (the hot project/selection store) so config
 // edits don't churn the project store and persistence is isolated. The renderer
@@ -19,181 +24,72 @@ import type {DeepPartial, GraphConfig, LayoutTier} from "./types";
 
 export interface ConfigStore {
     config: GraphConfig;
-    templates: Template[];
-    activeTemplateId: string | null;
 
     setConfig: (patch: DeepPartial<GraphConfig>) => void;
     replaceConfig: (config: GraphConfig) => void;
 
-    // Tier operations (settings UI).
-    addTier: () => void;
-    removeTier: (id: string) => void;
-    moveTier: (id: string, dir: -1 | 1) => void;
-    updateTier: (id: string, patch: Partial<Pick<LayoutTier, "name" | "zoomFromMul" | "zoomToMul" | "flipX" | "flipY">>) => void;
-    setTierPattern: (id: string, patternId: string) => void;
-    setTierParam: (id: string, key: string, value: number | boolean | string) => void;
-
-    // Template operations.
-    saveTemplate: (name: string) => void;
-    loadTemplate: (id: string) => void;
-    deleteTemplate: (id: string) => void;
-    exportTemplate: (id: string) => string | null;
-    importTemplate: (json: string) => {ok: boolean; error?: string};
-}
-
-// Ids outlive the page (templates/tiers persist to localStorage), so they
-// must be unique across sessions — a counter would restart at 1 on reload
-// and hand out the same ids again.
-function uid(prefix: string): string {
-    const rand =
-        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-            ? crypto.randomUUID().slice(0, 8)
-            : `${Date.now().toString(36)}-${Math.floor(Math.random() * 0xffffff).toString(36)}`;
-    return `${prefix}-${rand}`;
-}
-
-// structuredClone preserves Infinity (zoomToMul); JSON would turn it to null.
-function clone<T>(v: T): T {
-    return typeof structuredClone === "function" ? structuredClone(v) : JSON.parse(JSON.stringify(v));
-}
-
-function builtinTemplates(): Template[] {
-    return BUILTIN_PRESETS.map((p) => ({id: p.id, name: p.name, builtin: true, config: p.build()}));
+    // Layout operations (LayoutBar + settings UI). Param/flip edits always
+    // target the ACTIVE pattern — switching pattern never discards tuning,
+    // it just changes which entry of byPattern is in play.
+    setLayoutPattern: (patternId: string) => void;
+    setLayoutParam: (key: string, value: number | boolean | string) => void;
+    setLayoutFlip: (patch: {flipX?: boolean; flipY?: boolean}) => void;
 }
 
 export const useConfigStore = create<ConfigStore>()(
     persist(
-        (set, get) => ({
+        (set) => ({
             config: makeDefaultConfig(),
-            templates: builtinTemplates(),
-            activeTemplateId: null,
 
-            setConfig: (patch) => set((s) => ({config: mergeConfig(s.config, patch), activeTemplateId: null})),
-            replaceConfig: (config) => set(() => ({config: {...config, version: config.version + 1}})),
+            setConfig: (patch) => set((s) => ({config: mergeConfig(s.config, patch)})),
+            // Swap the whole config (snapshot restore). `version` counts EDITS,
+            // so it continues from the store's current value — taking it from
+            // the incoming config instead would rewind the counter, and after
+            // sanitizeConfig (which stamps the SCHEMA version) it would pin to
+            // the same number on every restore.
+            replaceConfig: (config) => set((s) => ({config: {...config, version: s.config.version + 1}})),
 
-            addTier: () =>
+            setLayoutPattern: (patternId) =>
                 set((s) => {
-                    const tiers = s.config.tiers.slice();
-                    const finest = tiers[tiers.length - 1];
-                    tiers.push({
-                        id: uid("tier"),
-                        name: `Tier ${tiers.length + 1}`,
-                        zoomFromMul: finest ? finest.zoomFromMul : 1,
-                        zoomToMul: finest ? finest.zoomToMul : Infinity,
-                        patternId: "folder-grid",
-                        params: getPattern("folder-grid").defaults(),
-                    });
-                    return {config: bump(s.config, {tiers}), activeTemplateId: null};
+                    if (!PATTERN_REGISTRY[patternId] || patternId === s.config.layout.patternId) return s;
+                    // Materialise the incoming pattern's settings if it's never
+                    // been tuned, so byPattern is a complete record of what the
+                    // user has actually visited (and so a snapshot taken right
+                    // after a switch carries real values, not an absent key).
+                    const byPattern = {...s.config.layout.byPattern};
+                    if (!byPattern[patternId]) byPattern[patternId] = defaultSettingsFor(patternId);
+                    return {config: bump(s.config, {layout: {patternId, byPattern}})};
                 }),
-            removeTier: (id) =>
+            setLayoutParam: (key, value) =>
                 set((s) => {
-                    if (s.config.tiers.length <= 1) return s;
-                    return {config: bump(s.config, {tiers: s.config.tiers.filter((t) => t.id !== id)}), activeTemplateId: null};
+                    const {patternId} = s.config.layout;
+                    const cur = layoutSettingsFor(s.config.layout);
+                    const byPattern = {...s.config.layout.byPattern, [patternId]: {...cur, params: {...cur.params, [key]: value}}};
+                    return {config: bump(s.config, {layout: {patternId, byPattern}})};
                 }),
-            moveTier: (id, dir) =>
+            setLayoutFlip: (patch) =>
                 set((s) => {
-                    const tiers = s.config.tiers.slice();
-                    const i = tiers.findIndex((t) => t.id === id);
-                    const j = i + dir;
-                    if (i < 0 || j < 0 || j >= tiers.length) return s;
-                    [tiers[i], tiers[j]] = [tiers[j], tiers[i]];
-                    return {config: bump(s.config, {tiers}), activeTemplateId: null};
+                    const {patternId} = s.config.layout;
+                    const cur = layoutSettingsFor(s.config.layout);
+                    const byPattern = {...s.config.layout.byPattern, [patternId]: {...cur, ...patch}};
+                    return {config: bump(s.config, {layout: {patternId, byPattern}})};
                 }),
-            updateTier: (id, patch) =>
-                set((s) => ({config: bump(s.config, {tiers: s.config.tiers.map((t) => (t.id === id ? {...t, ...patch} : t))}), activeTemplateId: null})),
-            setTierPattern: (id, patternId) =>
-                set((s) => ({
-                    config: bump(s.config, {
-                        tiers: s.config.tiers.map((t) => (t.id === id ? {...t, patternId, params: getPattern(patternId).defaults()} : t)),
-                    }),
-                    activeTemplateId: null,
-                })),
-            setTierParam: (id, key, value) =>
-                set((s) => ({
-                    config: bump(s.config, {
-                        tiers: s.config.tiers.map((t) => (t.id === id ? {...t, params: {...t.params, [key]: value}} : t)),
-                    }),
-                    activeTemplateId: null,
-                })),
 
-            saveTemplate: (name) =>
-                set((s) => {
-                    const id = uid("tmpl");
-                    const template: Template = {id, name: name.trim() || "Untitled", config: clone(s.config)};
-                    return {templates: [...s.templates, template], activeTemplateId: id};
-                }),
-            loadTemplate: (id) =>
-                set((s) => {
-                    const t = s.templates.find((x) => x.id === id);
-                    if (!t) return s;
-                    // Normalize so a template saved before a config field existed
-                    // (e.g. theme.edgeStyle) gets that field filled from defaults
-                    // rather than dropping it from the live config.
-                    return {config: {...sanitizeConfig(t.config), version: s.config.version + 1}, activeTemplateId: id};
-                }),
-            deleteTemplate: (id) =>
-                set((s) => {
-                    const t = s.templates.find((x) => x.id === id);
-                    if (!t || t.builtin) return s;
-                    return {
-                        templates: s.templates.filter((x) => x.id !== id),
-                        activeTemplateId: s.activeTemplateId === id ? null : s.activeTemplateId,
-                    };
-                }),
-            exportTemplate: (id) => {
-                const t = get().templates.find((x) => x.id === id);
-                return t ? serializeTemplate(t) : null;
-            },
-            importTemplate: (json) => {
-                const parsed = parseTemplateFile(json);
-                if (!parsed.ok) return {ok: false, error: parsed.error};
-                const id = uid("tmpl");
-                set((s) => ({
-                    templates: [...s.templates, {id, name: parsed.name, config: parsed.config}],
-                    config: {...parsed.config, version: s.config.version + 1},
-                    activeTemplateId: id,
-                }));
-                return {ok: true};
-            },
         }),
         {
             name: "code-graph:config",
             version: CONFIG_VERSION,
-            // Persist only the live config + USER templates; built-ins are
-            // injected fresh on hydrate so preset updates ship in code.
-            partialize: (s) => ({
-                config: s.config,
-                templates: s.templates.filter((t) => !t.builtin),
-                activeTemplateId: s.activeTemplateId,
-            }),
+            // Only the live config persists. Any `templates` / `activeTemplateId`
+            // left in an older blob is simply not read, and drops out of storage
+            // the first time this writes.
+            partialize: (s) => ({config: s.config}),
             // Old/foreign persisted state passes through to merge, which
             // sanitizes the config (fills missing fields, repoints unknown
             // patterns) so a stale schema can't crash the renderer.
             migrate: (persisted) => persisted as never,
             merge: (persisted, current) => {
                 const p = (persisted ?? {}) as Partial<ConfigStore>;
-                // Normalize each saved template's config too, so fields added
-                // after a template was saved are filled in (and re-persisted).
-                const userTemplates = Array.isArray(p.templates)
-                    ? p.templates.filter((t) => t && !t.builtin).map((t) => ({...t, config: sanitizeConfig(t.config)}))
-                    : [];
-                // Heal duplicate ids left behind by the old session-counter
-                // uid (templates saved in different sessions could collide,
-                // making select/load/delete hit both). First occurrence keeps
-                // its id so activeTemplateId stays valid; later ones get a
-                // fresh id and re-persist.
-                const builtins = builtinTemplates();
-                const seen = new Set(builtins.map((t) => t.id));
-                for (let i = 0; i < userTemplates.length; i++) {
-                    if (seen.has(userTemplates[i].id)) userTemplates[i] = {...userTemplates[i], id: uid("tmpl")};
-                    seen.add(userTemplates[i].id);
-                }
-                return {
-                    ...current,
-                    config: p.config ? sanitizeConfig(p.config) : current.config,
-                    templates: [...builtins, ...userTemplates],
-                    activeTemplateId: typeof p.activeTemplateId === "string" ? p.activeTemplateId : null,
-                };
+                return {...current, config: p.config ? sanitizeConfig(p.config) : current.config};
             },
         },
     ),
@@ -217,7 +113,7 @@ function mergeConfig(cur: GraphConfig, patch: DeepPartial<GraphConfig>): GraphCo
         behavioral: patch.behavioral ? {...cur.behavioral, ...patch.behavioral} : cur.behavioral,
         lod: patch.lod ? {...cur.lod, ...patch.lod} : cur.lod,
         theme: theme as GraphConfig["theme"],
-        tiers: (patch.tiers as GraphConfig["tiers"]) ?? cur.tiers,
+        layout: (patch.layout as GraphConfig["layout"]) ?? cur.layout,
     };
 }
 

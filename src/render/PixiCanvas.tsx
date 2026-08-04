@@ -6,7 +6,7 @@ import {AST_LABEL_FONT, astLabelOnScreenFactor, astLabelScale, fileLabel, labelS
 import {isSupportFile, useGraphStore} from "../graph/store";
 import {useConfigStore} from "../graph/config/store";
 import type {GraphConfig} from "../graph/config/types";
-import {activeTiers, createTierEngine} from "./tierLayout";
+import {createLayoutEngine} from "./layoutEngine";
 import {getPattern} from "../graph/patterns/registry";
 import {layoutAst, type TreemapLayout, type TreemapNode} from "../graph/treemap";
 import {buildAstForceLayout, isMiddleStatement, type AstForceLayout, type ContainerForceLayout, type SimAstNode} from "../graph/astForce";
@@ -496,14 +496,20 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // on the first ticker frame, not here, so every closure const it
             // transitively needs is initialised (avoids TDZ on late consts).
             let inheritedExpansionRestored = false;
-            // Drives the configured tiers: keeps layout.rigidRaw in sync with
-            // the static (overview) tier's pattern, and derives the rigid-blend
-            // weight from the tier zoom ranges (replaces the old rigidness()).
-            const tierEngine = createTierEngine(project, layout);
+            // Drives the configured layout: keeps layout.rigidRaw in sync with
+            // the active pattern, and runs the crossfade when the user switches
+            // to a different one.
+            const layoutEngine = createLayoutEngine(project, layout);
             if (import.meta.env.DEV && typeof window !== "undefined") {
                 (window as unknown as {__codegraph: unknown}).__codegraph = {
                     layout,
                     world,
+                    // Layout crossfade debugging: which slots are blending this
+                    // frame and by how much, plus the ticker delta that drives
+                    // the transition clock.
+                    getLayoutSelection: () => layoutEngine.selection(),
+                    getLayoutDebug: () => layoutEngine.debug(),
+                    getTickerDeltaMs: () => app.ticker.deltaMS,
                     getFileSize: (id: string) => {
                         const n = layout.byId.get(id);
                         return n ? {w: n.width, h: n.height, x: n.x, y: n.y} : null;
@@ -572,11 +578,11 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 layout.simulation.tick(50);
             }
             snapshotConn();
-            // Apply the configured overview pattern to rigidRaw BEFORE the
-            // initial anchor + fit, so a persisted non-default pattern (e.g. a
-            // saved hub-and-spoke template) is framed correctly on open rather
-            // than only after the first frame.
-            tierEngine.sync(configRef.current);
+            // Apply the configured pattern to rigidRaw BEFORE the initial anchor
+            // + fit, so a persisted non-default pattern (e.g. a saved
+            // hub-and-spoke layout) is framed correctly on open rather than only
+            // after the first frame.
+            layoutEngine.sync(configRef.current);
             assignRigidPositions(layout, connCentre());
 
             // Always run the auto-fit: besides framing the project it
@@ -600,10 +606,18 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // cameraScale + world position directly — no animation, since
             // this is the initial framing.
             //
-            // Frames the UNION of the connectivity layout and the rigid
-            // folder layout: the user lands zoomed-out (rigid view) for a
-            // big project, but the zoom may sit anywhere in the transition
-            // band, so both layouts must be on screen whatever the blend.
+            // Measures the ACTIVE PATTERN'S OWN target positions — rigidX for a
+            // static pattern, connX for the live one.
+            //
+            // Deliberately NOT the rendered x/y. Those look more honest (they
+            // include the overlap-relaxation offsets, so they're the extent you
+            // actually see) but they are not robust: a node the pattern didn't
+            // place falls back to its connectivity position, and the force sim
+            // parks stragglers far outside the cluster. One such outlier blows
+            // the measured bbox up several-fold and fits the whole graph down to
+            // a speck — measured here at scale 0.086 where the pattern's own
+            // extent gives ~0.4. A fit that crops a little beats a fit that's
+            // 5× wrong.
             function fitProjectToViewport(): void {
                 const nodes = layout.nodes;
                 if (nodes.length === 0) {
@@ -614,21 +628,18 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 let minY = Infinity;
                 let maxX = -Infinity;
                 let maxY = -Infinity;
-                // Frame the OVERVIEW (coarsest, index-0) tier — what's shown when
-                // fully zoomed out. If it's a live tier, that's the connectivity
-                // (connX) layout; otherwise the static buffer (rigidX = the
-                // coarsest static tier's centred positions). Framing only the
-                // overview keeps the fit matched to what's actually on screen at
-                // open — earlier this framed the force sim's (often huge,
-                // undisplayed) extent too, which skewed fitScale and pushed the
-                // open zoom past the overview tier's range.
-                const tiers = configRef.current.tiers;
-                const overviewLive = tiers.length > 0 && getPattern(tiers[0].patternId).kind === "live";
+                // Frame the ACTIVE layout — what's actually on screen. For a live
+                // (force) pattern that's the connectivity layout (connX); for a
+                // static one it's rigidX, the active pattern's centred positions.
+                // Framing anything else skews fitScale: this used to include the
+                // force sim's often-huge, undisplayed extent, which pushed the
+                // open zoom out of the range the overview was meant to occupy.
+                const activeLive = getPattern(configRef.current.layout.patternId).kind === "live";
                 for (const n of nodes) {
                     const halfW = n.width / 2;
                     const halfH = n.height / 2;
-                    const px = overviewLive ? n.connX : n.rigidX;
-                    const py = overviewLive ? n.connY : n.rigidY;
+                    const px = activeLive ? n.connX : n.rigidX;
+                    const py = activeLive ? n.connY : n.rigidY;
                     if (px - halfW < minX) minX = px - halfW;
                     if (py - halfH < minY) minY = py - halfH;
                     if (px + halfW > maxX) maxX = px + halfW;
@@ -4147,18 +4158,20 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 return {x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2};
             }
 
-            // Camera zoom → rigid-layout blend amount. 1 = positions snap
-            // fully to the deterministic folder outline; 0 = pure
-            // force-directed connectivity layout.
+            // Static-layout blend amount. 1 = positions snap fully to the
+            // active deterministic pattern; 0 = pure force-directed
+            // connectivity layout.
             //
-            // The zoom→blend transition is now expressed by the configured
-            // tiers' zoom ranges (multiples of fitScale) and computed by the
-            // TierEngine (see tierLayout.ts / activeTiers). It is RELATIVE to
-            // fitScale — the zoom the auto-fit chose at project open — so a big
-            // project (tiny fitScale) and a small one (large fitScale) get the
-            // same transition reachable by a moderate zoom-in. The default
-            // config reproduces the old 1.5×–4.5× band; log-space + smoothstep
-            // for an ease-in-out feel live in activeTiers().
+            // This used to be driven by camera zoom, via the tier system: the
+            // layout crossfaded from folder-grid to force as you zoomed past
+            // ~1.5×–4.5× fitScale. That's gone — the arrangement is now an
+            // explicit choice and holds still under zoom (see
+            // render/layoutEngine). What remains zoom-independent here:
+            //   * staticWeight — 1 on a static pattern, 0 on force, ramped only
+            //     while a SWITCH is crossfading.
+            //   * rigidEnable / openLayoutBias — the lean toward the live layer
+            //     while a file is open, which reveals connectivity around what
+            //     you're reading. Still wanted, still not zoom-driven.
 
             // --- Overlap relaxation -------------------------------------------
             //
@@ -4442,10 +4455,16 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // expand/collapse still re-blend cleanly.
             function stepLayout(): void {
                 const sim = layout.simulation;
-                // Recompute the static (overview) tier's buffer into
-                // layout.rigidRaw if its pattern/params changed (cheap no-op
-                // otherwise). Must precede assignRigidPositions below.
-                tierEngine.sync(cfg);
+                // Advance the layout crossfade clock, THEN pick up any switch.
+                // In that order a switch detected this frame starts at w=0, so
+                // the transition begins from the outgoing positions rather than
+                // skipping the first slice of the blend. (Pixi caps deltaMS via
+                // ticker.minFPS, so a backgrounded tab can't jump the tween.)
+                layoutEngine.advance(app.ticker.deltaMS);
+                // Recompute the active pattern's buffer into layout.rigidRaw if
+                // its params changed (cheap no-op otherwise). Must precede
+                // assignRigidPositions below.
+                layoutEngine.sync(cfg);
 
                 // 1. Ease per-file width/height toward their targets.
                 //    Runs BEFORE the sim tick so the tick's forces
@@ -4575,10 +4594,10 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 rigidCentre.x += (targetCentre.x - rigidCentre.x) * 0.1;
                 rigidCentre.y += (targetCentre.y - rigidCentre.y) * 0.1;
                 assignRigidPositions(layout, rigidCentre);
-                // If the overview tier's pattern just changed, the static
-                // layout's extent is different — re-fit the camera so the new
-                // arrangement lands in view (rigidX/rigidY are fresh above).
-                if (tierEngine.takeRefit()) fitProjectToViewport();
+                // A layout switch just finished crossfading: the new pattern has
+                // a different extent, so re-frame it. rigidX/rigidY are fresh
+                // from assignRigidPositions above.
+                if (layoutEngine.takeRefit()) fitProjectToViewport();
                 // Ease rigidEnable toward openLayoutBias while any file is open,
                 // back to 1 when none are. 0.08/frame ≈ a ~0.4s fade. Governs
                 // the "open a file → neighbours lean toward the live/force layer
@@ -4586,45 +4605,45 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 const anyFileOpen = useGraphStore.getState().expandedFiles.size > 0;
                 rigidEnable += ((anyFileOpen ? cfg.behavioral.openLayoutBias : 1) - rigidEnable) * 0.08;
 
-                // Fill the per-tier render buffers: each static tier's pattern
-                // re-centred on the connectivity centroid into tierX[t]/tierY[t];
-                // live tiers mirror connX/connY.
-                tierEngine.fillBuffers(cfg, rigidCentre, layout.nodes);
+                // Fill the layout render buffers: the active pattern re-centred
+                // on the connectivity centroid into blendX[1]/blendY[1], and —
+                // only while a switch is animating — the outgoing pattern into
+                // slot 0. Live (force) patterns mirror connX/connY.
+                layoutEngine.fillBuffers(cfg, rigidCentre, layout.nodes);
 
-                // Which tier(s) are active at this zoom, and how much of the
-                // blend is STATIC vs the live/force layer. Two active static
-                // tiers → staticWeight 1 (the live layer drops out, a pure
-                // static→static crossfade, e.g. treemap → hub-and-spoke). One
-                // static + the live tier → staticWeight = the old folder ⇄ force
-                // lean.
-                const sel = activeTiers(cameraScale, fitScale, cfg.tiers);
-                const aStatic = getPattern(cfg.tiers[sel.a].patternId).kind === "static";
-                const bStatic = sel.b != null && getPattern(cfg.tiers[sel.b].patternId).kind === "static";
+                // Which slot(s) are live this frame, and how much of the blend is
+                // STATIC vs the live/force layer. Settled on a static pattern →
+                // staticWeight 1. Settled on force → 0 (fully live). Mid-switch
+                // between two static patterns → 1 throughout, so the crossfade
+                // runs cleanly without the live layer bleeding in; switching
+                // to/from force ramps staticWeight across the transition.
+                const sel = layoutEngine.selection();
+                const {aStatic, bStatic} = sel;
                 const wa = sel.b != null ? 1 - sel.w : 1;
                 const wb = sel.w;
                 const staticWeight = (aStatic ? wa : 0) + (bStatic ? wb : 0);
                 // Static blend weight `t`, eased by rigidEnable and floored by
                 // openLayoutBias. The floor only matters when leaning toward the
-                // live layer; with two static tiers staticWeight is 1 so it
-                // never binds and the crossfade completes fully.
+                // live layer; on a settled static layout staticWeight is 1 so it
+                // never binds.
                 const t = Math.max(staticWeight * rigidEnable, cfg.behavioral.openLayoutBias);
 
                 // Per-node STATIC position: the crossfade of the active STATIC
-                // tiers' buffers (weight-normalised). When no static tier is
-                // active it returns the connectivity position, so the
+                // slots' buffers (weight-normalised). When no static slot is
+                // live it returns the connectivity position, so the
                 // lerp(connX, S, nt) below collapses to connX (fully live).
                 function staticPos(n: SimFileNode): {x: number; y: number} {
                     let sw = 0;
                     let sx = 0;
                     let sy = 0;
                     if (aStatic) {
-                        sx += n.tierX![sel.a] * wa;
-                        sy += n.tierY![sel.a] * wa;
+                        sx += n.blendX![sel.a] * wa;
+                        sy += n.blendY![sel.a] * wa;
                         sw += wa;
                     }
                     if (bStatic && sel.b != null) {
-                        sx += n.tierX![sel.b] * wb;
-                        sy += n.tierY![sel.b] * wb;
+                        sx += n.blendX![sel.b] * wb;
+                        sy += n.blendY![sel.b] * wb;
                         sw += wb;
                     }
                     if (sw > 1e-6) return {x: sx / sw, y: sy / sw};
@@ -5112,6 +5131,19 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         followAt = null;
                         zoomFit = null;
                         cameraAnchorHold = null;
+                        // An in-flight frameFiles() fit, and any delta-queued one
+                        // waiting for the next rebuild. A filesystem delta
+                        // auto-selects the changed file and queues a frame; left
+                        // armed, it fires later and zooms hard onto that single
+                        // file, discarding the camera being set here. Whoever
+                        // called setCamera asked for a specific view more
+                        // recently than the delta did.
+                        frameSelectionTargets = null;
+                        cameraFramingSelection = false;
+                        pendingSelectionFrame = false;
+                        // And the re-fit the layout engine would run when the
+                        // switch this camera arrives with finishes crossfading.
+                        layoutEngine.suppressNextSwitchRefit();
                         const scale = Math.min(32, Math.max(0.05, cam.scale)); // same bounds as wheel/applyZoom
                         // Resolve the target pan from the anchor when it still
                         // exists (content-relative, survives layout drift);

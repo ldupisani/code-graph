@@ -1,4 +1,4 @@
-import type {BehavioralConfig, GraphConfig, LayoutTier, LodConfig, ThemeConfig} from "./types";
+import type {BehavioralConfig, GraphConfig, LayoutConfig, LodConfig, ThemeConfig} from "./types";
 
 // ---------------------------------------------------------------------------
 // DEFAULT_CONFIG — every value lifted VERBATIM from the constants that used to
@@ -96,38 +96,28 @@ const DEFAULT_THEME: ThemeConfig = {
     edgeStyle: "straight",
 };
 
-// Default 2-tier layout — reproduces today's folder-grid ↔ force-connectivity
-// crossfade. Tier ranges mirror the old rigidness() band: folder-grid is the
-// base layer (active from fully zoomed out), the force tier overlaps it across
-// [1.5×, 4.5×] fitScale (RIGID_FULL_MUL .. RIGID_NONE_MUL), where the renderer
-// crossfades. Pattern ids are registered in Phase 2; params default to {} and
-// are filled from each pattern's defaults() then.
-const DEFAULT_TIERS: LayoutTier[] = [
-    {
-        id: "tier-overview",
-        name: "Overview",
-        zoomFromMul: 0,
-        zoomToMul: 4.5,
-        patternId: "folder-grid",
-        params: {},
-    },
-    {
-        id: "tier-detail",
-        name: "Detail",
-        zoomFromMul: 1.5,
-        zoomToMul: Infinity,
-        patternId: "force-connectivity",
-        params: {},
-    },
-];
+// Default layout: the folder grid. It's the arrangement that maps most directly
+// onto how you already think about the project, so it's the right thing to land
+// on at open; the other three are one click away in the LayoutBar.
+//
+// `byPattern` starts EMPTY rather than pre-seeded — defaults.ts deliberately
+// doesn't import the pattern registry (see config/layout.ts), so per-pattern
+// params are filled from each pattern's defaults() on first read.
+const DEFAULT_LAYOUT: LayoutConfig = {
+    patternId: "folder-grid",
+    byPattern: {},
+};
 
-export const CONFIG_VERSION = 1;
+// 2: `tiers` (a zoom-banded list of patterns, crossfaded by camera zoom)
+// collapsed to `layout` (one explicitly-chosen pattern + per-pattern tuning).
+// sanitizeConfig migrates an old persisted blob forward.
+export const CONFIG_VERSION = 2;
 
 export function makeDefaultConfig(): GraphConfig {
     // Deep-cloned so callers can freely mutate without touching the template.
     return {
         version: CONFIG_VERSION,
-        tiers: DEFAULT_TIERS.map((t) => ({...t, params: {...t.params}})),
+        layout: {patternId: DEFAULT_LAYOUT.patternId, byPattern: {}},
         behavioral: {...DEFAULT_BEHAVIORAL},
         lod: {...DEFAULT_LOD},
         theme: {

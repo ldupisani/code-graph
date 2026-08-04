@@ -60,10 +60,7 @@ export const withStores: Decorator = (Story, context) => {
         localStorage.removeItem("code-graph:snapshots");
 
         useGraphStore.setState(graphBaseline());
-        useConfigStore.setState({
-            config: makeDefaultConfig(),
-            activeTemplateId: null,
-        });
+        useConfigStore.setState({config: makeDefaultConfig()});
         useSnapshotStore.setState({byProject: {}, activeByProject: {}});
         useSourceStore.setState({sources: new Map()});
 

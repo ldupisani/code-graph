@@ -42,14 +42,16 @@ export function EdgeFilterPills() {
   if (!project) return null;
 
   return (
+    // Positioned by App's top HUD row (TopHudRow), not by this component: it
+    // shares that row with the LayoutBar, and two independently-absolute rows
+    // overlapped each other as soon as the canvas panel got narrow.
     <div
       style={{
-        position: 'absolute',
-        top: '0.6rem',
-        left: '0.8rem',
         display: 'flex',
         alignItems: 'center',
         gap: '0.6rem',
+        flexWrap: 'wrap',
+        pointerEvents: 'auto',
         fontFamily: 'ui-monospace, monospace',
         fontSize: '0.75rem',
         userSelect: 'none',

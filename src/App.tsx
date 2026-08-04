@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { Group, Panel, Separator, usePanelRef } from 'react-resizable-panels';
 import { AuthError, openProject, postPresence, subscribeToDeltas } from './api/client';
+import { useConfigStore } from './graph/config/store';
+import { listPatterns } from './graph/patterns/registry';
 import { getSessionIdentity, usePresenceStore } from './graph/presence';
-import { selfSavedFileIds, useGraphStore } from './graph/store';
+import { selfSavedFileIds, useGraphStore, type GraphStore } from './graph/store';
 import { useSourceStore } from './graph/sourceStore';
 import { PixiCanvas, requestSelectionFrame, type CameraApi } from './render/PixiCanvas';
 import { ZoomControls } from './ui/ZoomControls';
@@ -11,13 +13,14 @@ import { SnapshotBar } from './ui/SnapshotBar';
 import { applySnapshot, captureSnapshot, overwriteSnapshot } from './graph/snapshots/capture';
 import { useSnapshotStore } from './graph/snapshots/store';
 import { EdgeFilterPills } from './ui/EdgeFilterPills';
+import { LayoutBar } from './ui/LayoutBar';
+import { TopHudRow } from './ui/TopHudRow';
 import { HoverTooltip } from './ui/HoverTooltip';
 import { SearchPalette } from './ui/SearchPalette';
 import { EditorPane, liveEditBuffer } from './ui/EditorPane';
 import { ProjectPicker } from './ui/ProjectPicker';
 import { SessionsPill } from './ui/SessionsPill';
 import { addRecentPath } from './ui/recentPaths';
-import { SettingsPanel } from './ui/settings/SettingsPanel';
 import type { FileNode, GraphDelta, PresenceState, ProjectResponse } from './api/types';
 
 // Membership equality for two string sets — used to detect whether a delta
@@ -113,6 +116,7 @@ export function App() {
   //                  '=' is included so it works without holding shift
   //                  on a US keyboard (where shift+= produces '+').
   //   [ / ]        — narrow / widen the focus neighbourhood (hops).
+  //   L / ⇧L       — cycle the layout pattern forward / back.
   // Ignored while the user is typing in an input / textarea (so we
   // don't hijack typing in the FolderPicker or the search palette).
   useEffect(() => {
@@ -202,6 +206,18 @@ export function App() {
         if (st.focusId == null) return;
         e.preventDefault();
         st.setFocus(st.focusId, Math.max(1, st.focusHops - 1));
+        return;
+      }
+      // L cycles the layout pattern (⇧L goes back). Cycling rather than four
+      // separate digit keys: 1-9 already belong to snapshots, and with only
+      // four patterns you're never more than two presses from any of them.
+      if ((e.key === 'l' || e.key === 'L') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        const ids = listPatterns().map((p) => p.id);
+        const cfg = useConfigStore.getState();
+        const i = ids.indexOf(cfg.config.layout.patternId);
+        const step = e.shiftKey ? -1 : 1;
+        cfg.setLayoutPattern(ids[(i + step + ids.length) % ids.length]);
         return;
       }
       // + / - zoom the camera, anchored at the screen centre (zoomBy →
@@ -407,7 +423,10 @@ export function App() {
       // otherwise churn the renderer's expansion effects for nothing. The
       // renderer fetches ASTs for newly-expanded files itself, so mirroring
       // the id sets is sufficient.
-      const patch: Partial<Parameters<typeof useGraphStore.setState>[0]> = {};
+      // Partial<GraphStore>, not Partial<Parameters<setState>[0]> — setState's
+      // first parameter is a union with the updater-function form, so indexing
+      // into it doesn't resolve the store's own fields.
+      const patch: Partial<GraphStore> = {};
       const selSet = new Set(p.selectionSet);
       if (p.selection !== gs.selection || !sameStringSet(selSet, gs.selectionSet)) {
         patch.selection = p.selection;
@@ -554,8 +573,10 @@ export function App() {
               >
                 <PixiCanvas project={project} cameraApiRef={cameraApiRef} />
                 <SelectionPanel />
-                <EdgeFilterPills />
-                <SettingsPanel />
+                <TopHudRow>
+                  <EdgeFilterPills />
+                  <LayoutBar />
+                </TopHudRow>
                 <ZoomControls api={cameraApiRef} />
                 <PinControls api={cameraApiRef}>
                   <SnapshotBar api={cameraApiRef} rootPath={project.rootPath} />
@@ -650,7 +671,7 @@ function Hints() {
         U = unpin hovered · R = reset all pins · P = pin visible · ⇧P = pin all
       </div>
       <div style={{ opacity: 0.7 }}>
-        S = save view · ⇧S = overwrite active view · 1–9 = jump to view · +/− = zoom · arrows = pan
+        S = save view · ⇧S = overwrite · 1–9 = jump to view · L = cycle layout · +/− = zoom · arrows = pan
       </div>
     </div>
   );

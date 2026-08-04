@@ -1,54 +1,40 @@
 import type {Meta, StoryObj} from "@storybook/react-vite";
-import {ParamControls} from "./ParamControls";
-import {listPatterns} from "../../graph/patterns/registry";
 import {PanelBox} from "../../stories/PanelBox";
+import {ParamControls} from "./ParamControls";
 
-// Schema-driven controls: one input per ParamSpec of a tier pattern.
-// Empty params = every control shows its spec default (the common
-// state for a freshly-assigned pattern). tierId references the
-// default config's overview tier so setTierParam writes land.
+// Schema-driven controls for the ACTIVE layout pattern's params.
+//
+// ParamControls takes no props — it reads the active pattern from
+// useConfigStore — so each story seeds `layout.patternId` through the
+// withStores decorator rather than passing an arg. That's also why there's a
+// story per pattern instead of one side-by-side render: only one pattern is
+// ever active at a time.
 const meta = {
     title: "Settings/ParamControls",
     component: ParamControls,
-    args: {tierId: "tier-overview", patternId: "folder-grid", params: {}},
     parameters: {frame: {width: 460, height: 640}},
+    render: () => (
+        <PanelBox>
+            <ParamControls />
+        </PanelBox>
+    ),
 } satisfies Meta<typeof ParamControls>;
 export default meta;
 
 type Story = StoryObj<typeof meta>;
 
-// Every registered pattern's parameter schema, side by side — also
-// covers the zero-params case ("No parameters." placeholder) if any
-// pattern has an empty schema.
-export const AllPatterns: Story = {
-    parameters: {frame: {width: 900, height: 640}},
-    render: (args) => (
-        <div style={{display: "flex", flexWrap: "wrap", alignItems: "flex-start"}}>
-            {listPatterns().map((p) => (
-                <PanelBox key={p.id}>
-                    <div style={{fontWeight: 700, marginBottom: "0.4rem", color: "#dcdcaa"}}>{p.name}</div>
-                    <ParamControls {...args} patternId={p.id} />
-                </PanelBox>
-            ))}
-        </div>
-    ),
-};
+function withPattern(patternId: string) {
+    return {stores: {config: {layout: {patternId, byPattern: {}}}}};
+}
 
-export const FolderGrid: Story = {
-    render: (args) => (
-        <PanelBox>
-            <ParamControls {...args} />
-        </PanelBox>
-    ),
-};
+// byPattern is left empty, so every control shows its spec default — the state
+// a pattern is in until you first tune it.
+export const FolderGrid: Story = {parameters: withPattern("folder-grid")};
+export const HubSpoke: Story = {parameters: withPattern("hub-spoke")};
+export const Treemap: Story = {parameters: withPattern("treemap")};
+export const ForceConnectivity: Story = {parameters: withPattern("force-connectivity")};
 
-// Unknown pattern ids degrade to the fallback pattern's schema
-// instead of crashing — old/hand-edited templates stay loadable.
-export const UnknownPatternFallsBack: Story = {
-    args: {patternId: "no-such-pattern"},
-    render: (args) => (
-        <PanelBox>
-            <ParamControls {...args} />
-        </PanelBox>
-    ),
-};
+// Unknown pattern ids degrade to the fallback pattern's schema instead of
+// crashing — a snapshot from a build that had a pattern this one doesn't, or a
+// hand-edited localStorage blob, stays loadable.
+export const UnknownPatternFallsBack: Story = {parameters: withPattern("no-such-pattern")};

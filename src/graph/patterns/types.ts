@@ -19,9 +19,9 @@ export type {PatternParams} from "../config/types";
 //               crossfade band, and freezes it otherwise.
 // ---------------------------------------------------------------------------
 
-// UI/validation metadata for one tunable parameter. A schema-driven settings
-// panel (Phase 4) renders a control per ParamSpec; importTemplate (Phase 5)
-// clamps values to [min, max].
+// UI/validation metadata for one tunable parameter. ParamControls renders one
+// control per ParamSpec; sanitizeConfig clamps values to [min, max] whenever a
+// config comes back from storage.
 export interface ParamSpec {
     key: string;
     label: string;

@@ -1,25 +1,27 @@
 import type {Meta, StoryObj} from "@storybook/react-vite";
-import {userEvent, within} from "storybook/test";
-import {SettingsPanel} from "./SettingsPanel";
+import {fn} from "storybook/test";
+import {SettingsPanelBody} from "./SettingsPanel";
 
-// Self-contained overlay: gear button (top-right) toggling the docked
-// settings panel. The Open story exercises the full panel including
-// the TemplateManager and TierListEditor sections, live against the
-// seeded default config.
+// The docked settings panel — layout parameters, behavior, LOD, theme — live
+// against the seeded default config.
+//
+// The body is storied on its own because it no longer owns a trigger: the
+// LayoutBar's ▾ is the single way in (see HUD/LayoutBar → SettingsOpen for the
+// button and panel together).
 const meta = {
     title: "Settings/SettingsPanel",
-    component: SettingsPanel,
+    component: SettingsPanelBody,
+    args: {onClose: fn().mockName("onClose")},
     parameters: {frame: {width: 900, height: 640}},
-} satisfies Meta<typeof SettingsPanel>;
+} satisfies Meta<typeof SettingsPanelBody>;
 export default meta;
 
 type Story = StoryObj<typeof meta>;
 
-export const Closed: Story = {};
+export const Default: Story = {};
 
-export const Open: Story = {
-    play: async ({canvasElement}) => {
-        const canvas = within(canvasElement);
-        await userEvent.click(canvas.getByTitle("Layout settings"));
-    },
+// Force connectivity is the one live pattern: it has no computed position map
+// to mirror, so ParamControls drops the flip toggles.
+export const ForceConnectivityActive: Story = {
+    parameters: {stores: {config: {layout: {patternId: "force-connectivity", byPattern: {}}}}},
 };

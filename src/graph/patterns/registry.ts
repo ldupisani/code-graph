@@ -5,7 +5,7 @@ import {treemapPattern} from "./treemap";
 import type {LayoutPattern} from "./types";
 
 // Registry of available layout patterns, keyed by stable id (the id persisted
-// in configs/templates).
+// in the config, and in every snapshot's copy of it).
 export const PATTERN_REGISTRY: Record<string, LayoutPattern> = {
     [folderGridPattern.id]: folderGridPattern,
     [hubSpokePattern.id]: hubSpokePattern,
@@ -13,8 +13,9 @@ export const PATTERN_REGISTRY: Record<string, LayoutPattern> = {
     [forceConnectivityPattern.id]: forceConnectivityPattern,
 };
 
-// The id used when a config/template references a pattern that isn't registered
-// (e.g. an old or hand-edited template). Degrades gracefully instead of crashing.
+// The id used when a config references a pattern that isn't registered (e.g. a
+// snapshot from a build that had one this doesn't, or a hand-edited localStorage
+// blob). Degrades gracefully instead of crashing.
 export const FALLBACK_PATTERN_ID = folderGridPattern.id;
 
 export function getPattern(id: string): LayoutPattern {

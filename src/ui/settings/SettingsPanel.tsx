@@ -2,56 +2,47 @@ import {useState} from "react";
 import type React from "react";
 import {BehavioralControls} from "./BehavioralControls";
 import {LodControls} from "./LodControls";
-import {TemplateManager} from "./TemplateManager";
+import {ParamControls} from "./ParamControls";
 import {ThemeControls} from "./ThemeControls";
-import {TierListEditor} from "./TierListEditor";
 
-// Settings overlay: a gear button (top-right of the canvas) that toggles a
-// docked, scrollable panel. Section-based so later phases slot in (templates,
-// behavioral, LOD, theme). All config edits flow through useConfigStore and
-// reach the renderer live via its config ref — no canvas rebuild.
-export function SettingsPanel() {
-    const [open, setOpen] = useState(false);
-
+// The settings panel body: a docked, scrollable list of config sections. All
+// edits flow through useConfigStore and reach the renderer live via its config
+// ref — no canvas rebuild.
+//
+// This used to own its own trigger, a gear pinned to the canvas's top-right
+// corner, and "Layout parameters" appeared BOTH here and in the LayoutBar's own
+// disclosure. Two buttons, two panels, one set of settings. Now the LayoutBar
+// owns the single trigger (see ui/LayoutBar) and renders this body — so the ▾
+// beside the layout pills is the only way in, and it lands you on the params
+// for the pill you just pressed.
+//
+// There's no template manager either: saving/loading whole configs is what
+// snapshots do now, since a snapshot carries the full GraphConfig alongside the
+// camera and view it belongs to.
+export function SettingsPanelBody({onClose}: {onClose: () => void}) {
     return (
-        <>
-            <button
-                type="button"
-                onClick={() => setOpen((v) => !v)}
-                aria-pressed={open}
-                title="Layout settings"
-                style={gearStyle(open)}
-            >
-                ⚙
-            </button>
-            {open ? (
-                <div style={panelStyle}>
-                    <div style={headerStyle}>
-                        <span style={{fontWeight: 700, letterSpacing: 0.4}}>Layout settings</span>
-                        <button type="button" onClick={() => setOpen(false)} style={closeStyle} title="Close">
-                            ✕
-                        </button>
-                    </div>
-                    <div style={bodyStyle}>
-                        <Section title="Templates" defaultOpen>
-                            <TemplateManager />
-                        </Section>
-                        <Section title="Zoom tiers" defaultOpen>
-                            <TierListEditor />
-                        </Section>
-                        <Section title="Behavior">
-                            <BehavioralControls />
-                        </Section>
-                        <Section title="Detail thresholds (LOD)">
-                            <LodControls />
-                        </Section>
-                        <Section title="Theme">
-                            <ThemeControls />
-                        </Section>
-                    </div>
-                </div>
-            ) : null}
-        </>
+        <div style={panelStyle}>
+            <div style={headerStyle}>
+                <span style={{fontWeight: 700, letterSpacing: 0.4}}>Layout settings</span>
+                <button type="button" onClick={onClose} style={closeStyle} title="Close">
+                    ✕
+                </button>
+            </div>
+            <div style={bodyStyle}>
+                <Section title="Layout parameters" defaultOpen>
+                    <ParamControls />
+                </Section>
+                <Section title="Behavior">
+                    <BehavioralControls />
+                </Section>
+                <Section title="Detail thresholds (LOD)">
+                    <LodControls />
+                </Section>
+                <Section title="Theme">
+                    <ThemeControls />
+                </Section>
+            </div>
+        </div>
     );
 }
 
@@ -68,40 +59,23 @@ export function Section({title, defaultOpen, children}: {title: string; defaultO
     );
 }
 
-function gearStyle(open: boolean): React.CSSProperties {
-    return {
-        position: "absolute",
-        top: "0.6rem",
-        right: "0.8rem",
-        zIndex: 6,
-        width: "2rem",
-        height: "2rem",
-        borderRadius: 999,
-        border: 0,
-        padding: 0,
-        // Flex-centre the glyph: a fixed-size button won't centre a single
-        // character on its own.
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        lineHeight: 1,
-        boxShadow: "inset 0 0 0 1px rgba(120,120,130,0.4)",
-        background: open ? "#3a6fb0" : "rgba(40,40,46,0.85)",
-        color: open ? "#fff" : "#cfcfd6",
-        fontSize: "1rem",
-        cursor: "pointer",
-        backdropFilter: "blur(6px)",
-    };
-}
-
+// Anchored to App's TopHudRow (the LayoutBar renders this, and that row is the
+// nearest positioned ancestor), so `right: 0` already sits 0.8rem in from the
+// canvas edge and `top` only needs to clear the row itself.
+//
+// maxHeight is viewport-relative, NOT `calc(100% - …)`: a percentage resolves
+// against TopHudRow, which is one pill tall, and collapsed this panel to a
+// sliver. pointerEvents must be restored because that row sets `none` so its
+// empty middle doesn't eat canvas drags.
 const panelStyle: React.CSSProperties = {
     position: "absolute",
-    top: "3rem",
-    right: "0.8rem",
+    top: "2.4rem",
+    right: 0,
     zIndex: 6,
     width: "20rem",
-    maxHeight: "calc(100% - 4rem)",
+    maxHeight: "calc(100vh - 8rem)",
     overflowY: "auto",
+    pointerEvents: "auto",
     display: "flex",
     flexDirection: "column",
     borderRadius: 8,

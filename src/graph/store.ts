@@ -97,7 +97,7 @@ export interface GraphStore {
   editFileId: string | null;
   // NOTE: the "isolate" direction toggles moved to useConfigStore
   // (config.behavioral.isolateImports / isolateExports) so they persist and
-  // travel with layout templates. The renderer reads them from there.
+  // are captured by snapshots. The renderer reads them from there.
   setProject: (p: ProjectResponse | null) => void;
   refreshProject: (p: ProjectResponse) => void;
   // Merge an incremental filesystem delta (see GraphDelta) WITHOUT replacing

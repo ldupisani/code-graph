@@ -31,14 +31,16 @@ export interface SimFileNode {
   // lerps x/y toward these as the user zooms out.
   rigidX: number;
   rigidY: number;
-  // Per-tier render buffers, indexed parallel to config.tiers. For a STATIC
-  // tier, tierX[t]/tierY[t] hold that pattern's position for this node,
-  // re-centred on the connectivity centroid each frame (the generalisation of
-  // rigidX/rigidY to N tiers). Live (force) tiers are not stored here — the
-  // renderer reads connX/connY for those. Filled by the TierEngine; lazily
-  // allocated, so may be undefined before the first fillBuffers().
-  tierX?: number[];
-  tierY?: number[];
+  // Two-slot render buffers for the layout crossfade: slot 0 = the OUTGOING
+  // layout (only filled while a switch is animating), slot 1 = the ACTIVE one.
+  // For a STATIC pattern these hold that pattern's position for this node,
+  // re-centred on the connectivity centroid each frame (rigidX/rigidY
+  // generalised to a blend). A LIVE (force) pattern has no buffer of its own —
+  // its slot mirrors connX/connY, so the blend can read every slot the same
+  // way. Filled by the LayoutEngine; lazily allocated, so may be undefined
+  // before the first fillBuffers().
+  blendX?: number[];
+  blendY?: number[];
   // Collision-relaxation offset. The render position is
   // lerp(connectivity, rigid) PLUS this offset; the offset is what
   // a per-frame overlap-relaxation pass produces to keep file

@@ -2567,14 +2567,35 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     });
                 }
 
-                // 4. Name label, positioned just above the currently-
-                //    visible shape. Top of the animated circle is at
-                //    sim.y - animatedR; at t=0 that equals iy, at t=1 it
-                //    equals y, so the label slides smoothly upward as
-                //    the file grows. Story files clear the embed's
-                //    floating header bar (screen-fixed ~28px above the
-                //    rect) so the two don't overlap.
-                putName(story ? sim.y - animH / 2 - (t * 34) / cameraScale : sim.y - animatedR);
+                // 4. Name label, positioned above whatever is actually DRAWN —
+                //    the box or its contents, whichever reaches higher.
+                //
+                //    animatedR alone isn't enough. It tracks `sim.width / 2`,
+                //    which the sim eases toward the target over the expand
+                //    animation, but the AST blocks inside are laid out once at
+                //    their FINAL size and don't shrink with it. So through the
+                //    tail of an expand (and all the way through a collapse) the
+                //    contents are larger than the box that nominally holds
+                //    them, and a label pinned to the box sits on top of the
+                //    first row of blocks.
+                //
+                //    The extent is bounds.visualTop, NOT radius or -minY. Both
+                //    of those measure arc nodes (imports / exports) by their
+                //    CENTRE on purpose: imports are laid out centred ON the
+                //    file's border, so half of each import box is meant to hang
+                //    outside the drawn circle. A label placed at either one
+                //    therefore lands in the vertical MIDDLE of the import band.
+                //    visualTop counts every node's full footprint, so it's the
+                //    top of what's actually on screen.
+                //
+                //    Collapsed files are unaffected: there's no expanded layout
+                //    to consult, so this is exactly animatedR.
+                //
+                //    Story files clear the embed's floating header bar
+                //    (screen-fixed ~28px above the rect) so the two don't
+                //    overlap.
+                const contentTopR = expanded ? Math.max(0, activeForce(sim.id)?.bounds.visualTop ?? 0) : 0;
+                putName(story ? sim.y - animH / 2 - (t * 34) / cameraScale : sim.y - Math.max(animatedR, contentTopR));
 
                 // 5. AST contents — only when fully expanded (t === 1
                 //    after the snap-to-target threshold). Drawing them

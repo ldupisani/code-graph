@@ -47,6 +47,16 @@ export interface ContainerBounds {
     // Smallest radius around the centroid that encloses every member rect
     // corner. The container is drawn as a circle of (radius + rim).
     radius: number;
+    // How far the topmost thing actually DRAWN reaches above the centroid,
+    // counting every node's full footprint — including the arc nodes that
+    // `minY` / `radius` deliberately measure by centre only.
+    //
+    // Imports sit centred ON the container's border by design, so half of each
+    // import box hangs outside the drawn circle. That's intentional for the
+    // border, but anything positioning itself against the container's visual
+    // top needs the real extent or it lands in the middle of the import band.
+    // The file-name label is the case that needs this (see PixiCanvas putName).
+    visualTop: number;
 }
 
 // A single force-laid-out container. The same shape powers both the file
@@ -1049,7 +1059,12 @@ function buildContainerForceLayout(
     let maxX = -Infinity;
     let minY = Infinity;
     let maxY = -Infinity;
+    // Tracked separately from minY: full footprint for EVERY node, arc nodes
+    // included, so it reflects what is actually drawn rather than where the
+    // border runs.
+    let visualMinY = Infinity;
     for (const n of nodes) {
+        if (n.y - n.rect.h / 2 < visualMinY) visualMinY = n.y - n.rect.h / 2;
         if (arcIdSet.has(n.id)) {
             // Centre-only for arc nodes.
             if (n.x < minX) minX = n.x;
@@ -1071,6 +1086,7 @@ function buildContainerForceLayout(
         minY = 0;
         maxY = 0;
     }
+    if (!Number.isFinite(visualMinY)) visualMinY = 0;
     const bboxW = maxX - minX;
     const bboxH = maxY - minY;
 
@@ -1092,7 +1108,7 @@ function buildContainerForceLayout(
         nodes,
         links,
         byId,
-        bounds: {minX, minY, bboxW, bboxH, cx, cy, radius},
+        bounds: {minX, minY, bboxW, bboxH, cx, cy, radius, visualTop: -visualMinY},
     };
 }
 

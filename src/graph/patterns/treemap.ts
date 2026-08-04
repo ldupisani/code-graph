@@ -1,6 +1,6 @@
 import type {ProjectResponse} from "../../api/types";
 import {dirnameOf} from "../layout";
-import {defaultsFromSpecs, type LayoutPattern, type ParamSpec, type PatternParams, type PositionMap} from "./types";
+import {defaultsFromSpecs, type LayoutPattern, type ParamSpec, type PatternBuildContext, type PatternParams, type PositionMap} from "./types";
 
 // Treemap / packed folders: the folder tree squarified into nested rectangles,
 // each file sized by its weight (lines / bytes / equal). A file's center is the
@@ -8,6 +8,8 @@ import {defaultsFromSpecs, type LayoutPattern, type ParamSpec, type PatternParam
 
 const PARAMS: readonly ParamSpec[] = [
     {key: "weightBy", label: "Size files by", type: "enum", default: "lines", options: ["lines", "bytes", "equal"], help: "What determines each file's rectangle area"},
+    {key: "gap", label: "File spacing", type: "number", default: 28, min: 0, max: 160, step: 4, help: "Clear space kept around every file box"},
+    {key: "sizeContrast", label: "Size contrast", type: "number", default: 8, min: 1, max: 40, step: 1, help: "How much bigger the largest file's cell may be than the smallest"},
     {key: "padding", label: "Folder padding", type: "number", default: 8, min: 0, max: 40, step: 1, help: "Inner padding around each nested folder"},
     {key: "aspectTarget", label: "Aspect ratio", type: "number", default: 1.6, min: 0.5, max: 4, step: 0.1, help: "Width : height of the whole treemap"},
 ];
@@ -19,8 +21,8 @@ export const treemapPattern: LayoutPattern = {
     kind: "static",
     params: PARAMS,
     defaults: () => defaultsFromSpecs(PARAMS),
-    compute(project, params) {
-        return {kind: "static", positions: build(project, params)};
+    compute(project, params, shared) {
+        return {kind: "static", positions: build(project, params, shared)};
     },
 };
 
@@ -30,13 +32,28 @@ interface Node {
     children: Map<string, Node>;
 }
 
-function build(project: ProjectResponse, params: PatternParams): PositionMap {
+function build(project: ProjectResponse, params: PatternParams, shared: PatternBuildContext): PositionMap {
     const weightBy = typeof params.weightBy === "string" ? params.weightBy : "lines";
     const padding = num(params.padding, 8);
     const aspect = num(params.aspectTarget, 1.6);
+    const gap = num(params.gap, 28);
+    const contrast = Math.max(1, num(params.sizeContrast, 8));
 
-    const weightOf = (lines: number, bytes: number): number =>
+    const rawWeightOf = (lines: number, bytes: number): number =>
         weightBy === "bytes" ? Math.max(1, bytes) : weightBy === "equal" ? 1 : Math.max(1, lines);
+
+    // Bound the heaviest:lightest area ratio.
+    //
+    // A treemap's whole idea is area ∝ weight, but a file's DRAWN box is
+    // roughly constant — it's a name plus padding — so raw line counts put a
+    // 3-line file in a cell several times smaller than its own label while a
+    // 3000-line neighbour gets acres. That's what made this layout read as a
+    // pile of overlapping boxes. Flooring the weights keeps the ordering and
+    // most of the proportionality while stopping the tail from collapsing.
+    const rawWeights = project.files.map((f) => rawWeightOf(f.lineCount, f.sizeBytes));
+    const heaviest = rawWeights.length > 0 ? Math.max(...rawWeights) : 1;
+    const weightFloor = heaviest / contrast;
+    const weightOf = (lines: number, bytes: number): number => Math.max(weightFloor, rawWeightOf(lines, bytes));
 
     // Build the folder tree. Each path segment becomes a folder node; the file
     // is a leaf carrying its weight.
@@ -57,11 +74,33 @@ function build(project: ProjectResponse, params: PatternParams): PositionMap {
     }
     sumWeights(root);
 
-    // Root rectangle sized so the average file cell is a reasonable area; the
-    // squarify pass then distributes by weight. assignRigidPositions translates
-    // (no scaling) onto the connectivity centroid afterwards.
+    // Root rectangle sized so EVERY file's cell can hold that file's drawn box
+    // plus `gap` of clear space. assignRigidPositions translates (no scaling)
+    // onto the connectivity centroid afterwards.
+    //
+    // This used to be a flat `fileCount * 26000`, a guess with no knowledge of
+    // how big a file actually renders. squarify hands each leaf an area of
+    // `area * weight/total`, so the requirement per file is a minimum cell
+    // area, and the root area is the largest of those solved for `area`.
+    //
+    // The minimum is `CELL_ASPECT_ALLOWANCE * longestSide²`, not `boxW * boxH`.
+    // Enough AREA is not enough ROOM: squarify aims for square-ish cells but
+    // still emits elongated ones, and a 300x20 cell has ample area for a 96x32
+    // box while having nowhere to put it. Budgeting for the box's longest side
+    // in either orientation is what actually stops neighbours touching —
+    // area-only sizing still left overlapping pairs on this project.
+    //
+    // Files the sim hasn't measured yet fall back to a typical collapsed box.
+    const CELL_ASPECT_ALLOWANCE = 2.5;
     const fileCount = Math.max(1, project.files.length);
-    const area = fileCount * 26000;
+    const totalWeight = project.files.reduce((s, f) => s + weightOf(f.lineCount, f.sizeBytes), 0) || 1;
+    let area = fileCount * 26000;
+    for (const f of project.files) {
+        const n = shared.byId.get(f.id);
+        const longest = Math.max((n?.collapsedW ?? 96) + gap, (n?.collapsedH ?? 32) + gap);
+        const share = weightOf(f.lineCount, f.sizeBytes) / totalWeight;
+        area = Math.max(area, (CELL_ASPECT_ALLOWANCE * longest * longest) / share);
+    }
     const W = Math.sqrt(area * aspect);
     const H = area / W;
 

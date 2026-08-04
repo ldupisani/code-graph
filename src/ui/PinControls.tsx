@@ -23,15 +23,16 @@ export function PinControls({api, children}: {api: {current: CameraApi | null}; 
     );
 }
 
+// Positioned by App's BottomHudStack, not by this component: it shares that
+// column with the shortcuts footer, whose height now changes when the user
+// opens it. The old hardcoded `bottom: 4.6rem` assumed a permanently
+// three-line footer.
 const wrapStyle: React.CSSProperties = {
-    position: "absolute",
-    // Sits above the bottom-left hints footer (now 3 lines tall) so the two
-    // don't overlap.
-    bottom: "4.6rem",
-    left: "0.8rem",
     display: "flex",
     alignItems: "center",
+    flexWrap: "wrap",
     gap: "0.4rem",
+    pointerEvents: "auto",
     fontFamily: "ui-monospace, monospace",
     fontSize: "0.72rem",
     color: "#cfcfd6",

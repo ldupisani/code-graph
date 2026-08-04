@@ -1,4 +1,3 @@
-import type React from 'react';
 import { useGraphStore, type EdgeFilter } from '../graph/store';
 import { useConfigStore } from '../graph/config/store';
 import { Pill } from './Pill';
@@ -116,11 +115,11 @@ export function EdgeFilterPills() {
             gap: '0.45rem',
           }}
         >
+          {/* Live state only. The keys that drive it ([ / ], ⇧+click, Esc)
+              moved to the shortcuts panel: shown here they appeared only once
+              a focus was already active — i.e. after you'd found them. */}
           <span>
             focus {focusHops} hop{focusHops === 1 ? '' : 's'}
-          </span>
-          <span>
-            <Kbd>[</Kbd>/<Kbd>]</Kbd> · <Kbd>⇧</Kbd>+click multi · <Kbd>Esc</Kbd>
           </span>
         </span>
       )}
@@ -139,21 +138,3 @@ export function EdgeFilterPills() {
     </div>
   );
 }
-
-function Kbd({ children }: { children: React.ReactNode }) {
-  return (
-    <span
-      style={{
-        padding: '0.05rem 0.3rem',
-        border: '1px solid rgba(120,120,130,0.45)',
-        borderRadius: 3,
-        fontSize: '0.7rem',
-        color: '#d4d4d4',
-        background: 'rgba(40,40,46,0.55)',
-      }}
-    >
-      {children}
-    </span>
-  );
-}
-

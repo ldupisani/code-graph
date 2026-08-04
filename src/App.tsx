@@ -15,6 +15,7 @@ import { useSnapshotStore } from './graph/snapshots/store';
 import { EdgeFilterPills } from './ui/EdgeFilterPills';
 import { LayoutBar } from './ui/LayoutBar';
 import { TopHudRow } from './ui/TopHudRow';
+import { BottomHudStack } from './ui/BottomHudStack';
 import { HoverTooltip } from './ui/HoverTooltip';
 import { SearchPalette } from './ui/SearchPalette';
 import { EditorPane, liveEditBuffer } from './ui/EditorPane';
@@ -578,15 +579,17 @@ export function App() {
                   <LayoutBar />
                 </TopHudRow>
                 <ZoomControls api={cameraApiRef} />
-                <PinControls api={cameraApiRef}>
-                  <SnapshotBar api={cameraApiRef} rootPath={project.rootPath} />
-                </PinControls>
+                <BottomHudStack>
+                  <PinControls api={cameraApiRef}>
+                    <SnapshotBar api={cameraApiRef} rootPath={project.rootPath} />
+                  </PinControls>
+                  <Hints />
+                </BottomHudStack>
                 <HoverTooltip />
                 <SearchPalette
                   open={searchOpen}
                   onClose={() => setSearchOpen(false)}
                 />
-                <Hints />
               </div>
             </Panel>
             <Separator
@@ -648,33 +651,94 @@ function EmptyHint() {
   );
 }
 
+// Every shortcut in one place, behind a `?` toggle and closed by default.
+//
+// This footer used to sit open permanently, three lines of text across the
+// bottom of the canvas — a reference you read once and then look past forever,
+// while it keeps covering the graph. The selection/focus keys additionally
+// lived somewhere else entirely, inline in EdgeFilterPills, appearing only once
+// a focus was active: exactly when you already knew about them, and never when
+// you were looking for them. They're folded in here with the rest.
+//
+// The toggle stays mounted so there's always an affordance saying shortcuts
+// exist; only the panel is conditional. Positioned by BottomHudStack, which
+// anchors this at the bottom so the panel opens UPWARD and the button doesn't
+// move out from under the cursor.
 function Hints() {
+  const [open, setOpen] = useState(false);
   return (
-    <div
-      style={{
-        position: 'absolute',
-        bottom: '0.6rem',
-        left: '0.8rem',
-        fontSize: '0.75rem',
-        opacity: 0.7,
-        pointerEvents: 'none',
-        fontFamily: 'ui-monospace, monospace',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '0.25rem',
-      }}
-    >
-      <div style={{ opacity: 0.7 }}>
-        drag bg = pan · drag file/folder = pin · wheel = zoom · click file = expand/collapse · click AST rect = select
-      </div>
-      <div style={{ opacity: 0.7 }}>
-        U = unpin hovered · R = reset all pins · P = pin visible · ⇧P = pin all
-      </div>
-      <div style={{ opacity: 0.7 }}>
-        S = save view · ⇧S = overwrite · 1–9 = jump to view · L = cycle layout · +/− = zoom · arrows = pan
-      </div>
+    <div style={hintsWrapStyle}>
+      {open && (
+        <div style={hintsPanelStyle}>
+          <div>drag bg = pan · drag file/folder = pin · wheel = zoom · click file = expand/collapse · click AST rect = select</div>
+          <div>⇧+click = multi-select · ⇧+drag = marquee select · [ / ] = narrow/widen focus · Esc = clear selection + focus</div>
+          <div>U = unpin hovered · R = reset all pins · P = pin visible · ⇧P = pin all</div>
+          <div>S = save view · ⇧S = overwrite · 1–9 = jump to view · L = cycle layout · +/− = zoom · arrows = pan</div>
+          <div>⌘K = search symbols · E = edit selected file</div>
+        </div>
+      )}
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        title={open ? 'Hide shortcuts' : 'Show shortcuts'}
+        aria-label="Shortcuts"
+        style={hintsToggleStyle(open)}
+      >
+        ?
+      </button>
     </div>
   );
+}
+
+const hintsWrapStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'flex-start',
+  gap: '0.4rem',
+  pointerEvents: 'auto',
+  fontFamily: 'ui-monospace, monospace',
+};
+
+const hintsPanelStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '0.25rem',
+  padding: '0.5rem 0.65rem',
+  borderRadius: 8,
+  background: 'rgba(22, 22, 26, 0.92)',
+  boxShadow: 'inset 0 0 0 1px rgba(120, 120, 130, 0.3)',
+  backdropFilter: 'blur(6px)',
+  color: '#cfcfd6',
+  fontSize: '0.75rem',
+  opacity: 0.85,
+  // Against the canvas width (BottomHudStack spans it), not the viewport, so
+  // the panel never runs under the editor pane.
+  maxWidth: '100%',
+};
+
+function hintsToggleStyle(open: boolean): React.CSSProperties {
+  return {
+    appearance: 'none',
+    border: 0,
+    borderRadius: 999,
+    // Flex-centre the glyph: a fixed-size button won't centre a single
+    // character on its own.
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    lineHeight: 1,
+    width: '1.5rem',
+    height: '1.5rem',
+    padding: 0,
+    background: open ? '#3a6fb0' : 'rgba(40, 40, 46, 0.85)',
+    color: open ? '#fff' : '#b0b0b8',
+    boxShadow: 'inset 0 0 0 1px rgba(120, 120, 130, 0.35)',
+    fontFamily: 'inherit',
+    fontSize: '0.72rem',
+    cursor: 'pointer',
+    backdropFilter: 'blur(6px)',
+  };
 }
 
 function SelectionPanel() {

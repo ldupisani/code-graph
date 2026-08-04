@@ -639,8 +639,16 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 for (const n of nodes) {
                     const halfW = n.width / 2;
                     const halfH = n.height / 2;
-                    const px = activeLive ? n.connX : n.rigidX;
-                    const py = activeLive ? n.connY : n.rigidY;
+                    // A user-pinned file ignores the pattern: ntFor returns 0
+                    // for it, so it renders at connX — the pin — at every zoom,
+                    // because the pin is an explicit "this file lives HERE" that
+                    // a layout shouldn't override. Measuring its rigidX would
+                    // fit to where the pattern WOULD have put it, leaving the
+                    // file itself off-screen. Switching to folders or treemap
+                    // with anything pinned did exactly that.
+                    const usePin = n.userPinned === true;
+                    const px = activeLive || usePin ? n.connX : n.rigidX;
+                    const py = activeLive || usePin ? n.connY : n.rigidY;
                     if (px - halfW < minX) minX = px - halfW;
                     if (py - halfH < minY) minY = py - halfH;
                     if (px + halfW > maxX) maxX = px + halfW;

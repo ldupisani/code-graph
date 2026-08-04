@@ -118,7 +118,7 @@ export function EdgeFilterPills() {
             focus {focusHops} hop{focusHops === 1 ? '' : 's'}
           </span>
           <span>
-            <Kbd>+</Kbd>/<Kbd>-</Kbd> · <Kbd>⇧</Kbd>+click multi · <Kbd>Esc</Kbd>
+            <Kbd>[</Kbd>/<Kbd>]</Kbd> · <Kbd>⇧</Kbd>+click multi · <Kbd>Esc</Kbd>
           </span>
         </span>
       )}

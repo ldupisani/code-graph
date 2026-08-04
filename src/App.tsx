@@ -109,10 +109,10 @@ export function App() {
   // search palette.
   //   Cmd/Ctrl-K   — open symbol search.
   //   Esc          — clear selection AND focus (return to overview).
-  //   +/= / -      — widen / narrow the focus neighbourhood (hops).
+  //   +/= / -/_    — zoom the camera in / out (anchored at screen centre).
   //                  '=' is included so it works without holding shift
   //                  on a US keyboard (where shift+= produces '+').
-  //   R / [ / ]    — focus-direction shortcuts (reverse-call query).
+  //   [ / ]        — narrow / widen the focus neighbourhood (hops).
   // Ignored while the user is typing in an input / textarea (so we
   // don't hijack typing in the FolderPicker or the search palette).
   useEffect(() => {
@@ -190,16 +190,33 @@ export function App() {
         st.setTracedPath(null);
         return;
       }
-      if (e.key === '+' || e.key === '=') {
+      // ] / [ widen / narrow the focus neighbourhood when a focus is active.
+      // (These used to live on +/- before those became camera zoom.)
+      if (e.key === ']') {
         if (st.focusId == null) return;
         e.preventDefault();
         st.setFocus(st.focusId, Math.min(8, st.focusHops + 1));
         return;
       }
-      if (e.key === '-' || e.key === '_') {
+      if (e.key === '[') {
         if (st.focusId == null) return;
         e.preventDefault();
         st.setFocus(st.focusId, Math.max(1, st.focusHops - 1));
+        return;
+      }
+      // + / - zoom the camera, anchored at the screen centre (zoomBy →
+      // applyZoom). Browser key repeat gives continuous zoom while held.
+      // Factors are exact inverses so +,- round-trips to the same scale.
+      if (
+        st.project &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        (e.key === '+' || e.key === '=' || e.key === '-' || e.key === '_')
+      ) {
+        e.preventDefault();
+        const zoomIn = e.key === '+' || e.key === '=';
+        cameraApiRef.current?.zoomBy(zoomIn ? 1.25 : 1 / 1.25);
         return;
       }
       // Arrow keys pan the graph camera. The arrow points where you want to
@@ -222,11 +239,11 @@ export function App() {
         cameraApiRef.current?.panBy(dx, dy);
         return;
       }
-      // (Direction toggles for the reverse-call query — R / [ / ] —
-      // were removed when import-direction was moved to per-edge
-      // COLOUR: yellow = outgoing from selection, blue = incoming
-      // to selection. The focusDirection store field is dormant; if
-      // a future feature needs direction back, those keys are free.)
+      // (Direction toggles for the reverse-call query were removed when
+      // import-direction was moved to per-edge COLOUR: yellow = outgoing
+      // from selection, blue = incoming to selection. The focusDirection
+      // store field is dormant. [ and ] now adjust focus hops; R belongs
+      // to the canvas's pin hotkeys.)
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -633,7 +650,7 @@ function Hints() {
         U = unpin hovered · R = reset all pins · P = pin visible · ⇧P = pin all
       </div>
       <div style={{ opacity: 0.7 }}>
-        S = save view · ⇧S = overwrite active view · 1–9 = jump to view
+        S = save view · ⇧S = overwrite active view · 1–9 = jump to view · +/− = zoom · arrows = pan
       </div>
     </div>
   );

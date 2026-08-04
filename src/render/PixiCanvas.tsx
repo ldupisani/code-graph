@@ -3042,14 +3042,24 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     // (W, H), the exit scale along direction d is
                     // t = 1 / max(|dx|/W, |dy|/H) — the dominant axis hits the
                     // edge exactly. The handle is a square (half-extent
-                    // handleSize/2). Only draw when the handle is OUTSIDE the
-                    // cell (otherwise the overlay still covers its origin and a
-                    // connector is meaningless / would point outward).
+                    // handleSize/2).
+                    //
+                    // Only draw once the OVERLAY is clear of its origin cell —
+                    // not merely once the handle is. The connector exists to say
+                    // "this panel came from over there", which you can already
+                    // see for free while the two are in contact. Testing the
+                    // handle alone meant an overlay sitting right on top of its
+                    // origin still drew a line, because the handle is inset at
+                    // the overlay's top-LEFT and slips outside the cell long
+                    // before the panel does.
+                    //
+                    // Separation on ANY axis means they're apart; strict
+                    // comparisons so exact edge-to-edge contact still counts as
+                    // touching, and draws nothing.
                     const hcx = hx + handleSize / 2;
                     const hcy = hy + handleSize / 2;
-                    const handleOutsideCell =
-                        hcx < cell.x || hcx > cell.x + cell.w || hcy < cell.y || hcy > cell.y + cell.h;
-                    if (dragOff && (dragOff.x !== 0 || dragOff.y !== 0) && handleOutsideCell) {
+                    const clearOfCell = x > cell.x + cell.w || x + w < cell.x || y > cell.y + cell.h || y + h < cell.y;
+                    if (dragOff && (dragOff.x !== 0 || dragOff.y !== 0) && clearOfCell) {
                         const ccx = cell.x + cell.w / 2;
                         const ccy = cell.y + cell.h / 2;
                         // Direction from cell centre to handle centre.

@@ -98,12 +98,25 @@ export const useConfigStore = create<ConfigStore>()(
 // --- merge helpers ---------------------------------------------------------
 
 function mergeConfig(cur: GraphConfig, patch: DeepPartial<GraphConfig>): GraphConfig {
-    const theme = patch.theme
+    // EVERY nested group under `theme` has to be merged, not replaced.
+    //
+    // Callers patch a single field — `setConfig({theme: {fill: {exportBlend: 0.3}}})`
+    // — so the `...patch.theme` spread above would put a one-key object where
+    // the whole group was, dropping its siblings to undefined. That doesn't
+    // fail loudly: `blendColor(base, undefined, t)` returns NaN and the wash
+    // simply stops being drawn, with no way to bring it back because the next
+    // edit is equally partial. Adding a group here without a line below is the
+    // easy mistake — syntax/folder/fill were added and missed exactly that.
+    const p = patch.theme;
+    const theme = p
         ? {
               ...cur.theme,
-              ...patch.theme,
-              colors: patch.theme.colors ? {...cur.theme.colors, ...patch.theme.colors} : cur.theme.colors,
-              semanticEdge: patch.theme.semanticEdge ? {...cur.theme.semanticEdge, ...patch.theme.semanticEdge} : cur.theme.semanticEdge,
+              ...p,
+              colors: p.colors ? {...cur.theme.colors, ...p.colors} : cur.theme.colors,
+              semanticEdge: p.semanticEdge ? {...cur.theme.semanticEdge, ...p.semanticEdge} : cur.theme.semanticEdge,
+              syntax: p.syntax ? {...cur.theme.syntax, ...p.syntax} : cur.theme.syntax,
+              folder: p.folder ? {...cur.theme.folder, ...p.folder} : cur.theme.folder,
+              fill: p.fill ? {...cur.theme.fill, ...p.fill} : cur.theme.fill,
           }
         : cur.theme;
     return {
@@ -123,6 +136,10 @@ function bump(cur: GraphConfig, patch: Partial<GraphConfig>): GraphConfig {
 
 // Dev-only console hook (mirrors useGraphStore): e.g.
 //   useConfigStore.getState().setConfig({lod: {cullPx: 20}})
-if (import.meta.env.DEV && typeof window !== "undefined") {
+//
+// `env?.DEV` rather than `env.DEV`: outside Vite (a node script exercising the
+// merge logic) import.meta.env is undefined and the bare read throws at import
+// time, making this module unloadable anywhere but the browser.
+if (import.meta.env?.DEV && typeof window !== "undefined") {
     (window as unknown as {useConfigStore: typeof useConfigStore}).useConfigStore = useConfigStore;
 }

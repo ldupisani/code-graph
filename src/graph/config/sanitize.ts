@@ -113,6 +113,12 @@ function sanitizeTheme(base: GraphConfig["theme"], raw: unknown): GraphConfig["t
         colors: mergeNumbersBooleans(base.colors, r.colors),
         semanticEdge: sanitizeSemanticEdge(base.semanticEdge, r.semanticEdge),
         edgeStyle: typeof r.edgeStyle === "string" && styles.includes(r.edgeStyle) ? (r.edgeStyle as GraphConfig["theme"]["edgeStyle"]) : base.edgeStyle,
+        // Groups added after theming was extended past bg/file/edge/text. Any
+        // config written before them simply has no such key, and
+        // mergeNumbersBooleans fills the whole group from defaults.
+        syntax: mergeNumbersBooleans(base.syntax, r.syntax),
+        folder: mergeNumbersBooleans(base.folder, r.folder),
+        fill: mergeNumbersBooleans(base.fill, r.fill),
     };
 }
 

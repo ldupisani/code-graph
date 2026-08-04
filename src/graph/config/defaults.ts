@@ -86,6 +86,11 @@ const DEFAULT_THEME: ThemeConfig = {
         edgeImporting: 0xe8c84a,
         edgeImported: 0x6cb6ff,
         edgeBidirectional: 0x6acf6a,
+        flowRibbon: 0x8fa3c0,
+        pinBadge: 0xe8c84a,
+        // Same blue as EditorPane's "you are editing" bar, so the two
+        // affordances read as one state.
+        editRing: 0x4a9eff,
     },
     semanticEdge: {
         calls: {color: 0xdcdcaa, width: 1.2, alpha: 0.85, arrowSize: 7},
@@ -94,6 +99,43 @@ const DEFAULT_THEME: ThemeConfig = {
     },
     // Import connection line routing (straight = original).
     edgeStyle: "straight",
+    // Monaco vs-dark / Dark+ family, matching EditorPane's theme: types teal,
+    // functions yellow, control-flow pink, other keywords blue, strings salmon,
+    // numbers green, identifiers light blue.
+    syntax: {
+        type: 0x4ec9b0,
+        func: 0xdcdcaa,
+        variable: 0x9cdcfe,
+        control: 0xc586c0,
+        keyword: 0x569cd6,
+        string: 0xce9178,
+        number: 0xb5cea8,
+        mutation: 0xffa657,
+        default: 0xd4d4d4,
+    },
+    // Hue comes from a hash of the directory path; these set the intensity.
+    // Strong = the file-icon body (unambiguously the folder's colour); dim =
+    // file-name labels, a tier below their containing folder's label.
+    folder: {
+        saturation: 38,
+        lightness: 52,
+        strongSaturation: 65,
+        strongLightness: 58,
+        dimSaturation: 38,
+        dimLightness: 42,
+    },
+    fill: {
+        depthStep: 5,
+        defaultAlpha: 0.92,
+        // Amber for exports, matching the directional language: imports come
+        // IN (blue), exports go OUT (amber). The lower alpha lets the file's
+        // boundary show through a cell that straddles it.
+        exportColor: 0xc59a4a,
+        exportBlend: 0.35,
+        exportAlpha: 0.6,
+        importTintColor: 0x4a6ac5,
+        importTintBlend: 0.35,
+    },
 };
 
 // Default layout: the folder grid. It's the arrangement that maps most directly
@@ -111,7 +153,10 @@ const DEFAULT_LAYOUT: LayoutConfig = {
 // 2: `tiers` (a zoom-banded list of patterns, crossfaded by camera zoom)
 // collapsed to `layout` (one explicitly-chosen pattern + per-pattern tuning).
 // sanitizeConfig migrates an old persisted blob forward.
-export const CONFIG_VERSION = 2;
+// 3: theme gained `syntax`, `folder` and `fill` — the palettes that decide how
+// the INSIDE of a file paints. sanitizeConfig fills them from defaults, so a v2
+// blob needs no migration beyond that.
+export const CONFIG_VERSION = 3;
 
 export function makeDefaultConfig(): GraphConfig {
     // Deep-cloned so callers can freely mutate without touching the template.

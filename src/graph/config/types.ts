@@ -97,9 +97,9 @@ export interface LodConfig {
     fileNamesAtMul: number;
 }
 
-// Packed 0xRRGGBB colors mirroring the renderer's COLORS palette. The Phase 6
-// theme UI surfaces only the file/edge/bg subset; the astOutline* entries are
-// kept for completeness but stay out of the v1 theming UI.
+// Packed 0xRRGGBB colors mirroring the renderer's COLORS palette. Every entry
+// is surfaced in the Theme panel and read live — the astOutline* entries used
+// to be neither, baked into astStyle's KIND_OUTLINE at module load.
 export interface ThemeColors {
     bg: number;
     file: number;
@@ -124,6 +124,12 @@ export interface ThemeColors {
     edgeImporting: number;
     edgeImported: number;
     edgeBidirectional: number;
+    // Chrome accents that were literals in the renderer: the execution-flow
+    // ribbon behind a file's statements, the pin badge, and the ring around the
+    // file whose buffer is open in the editor.
+    flowRibbon: number;
+    pinBadge: number;
+    editRing: number;
 }
 
 export interface SemanticEdgeStyle {
@@ -131,6 +137,52 @@ export interface SemanticEdgeStyle {
     width: number;
     alpha: number;
     arrowSize: number;
+}
+
+// Editor-style colours for AST label text. Defaults match Monaco's vs-dark /
+// Dark+ family so the graph and the editor pane read as one product.
+//
+// These were module constants in render/astStyle, which is why a light
+// background left every label in dark-theme pastels: the palette that decides
+// how the code READS wasn't part of the theme at all.
+export interface SyntaxColors {
+    type: number;
+    func: number;
+    variable: number;
+    control: number;
+    keyword: number;
+    string: number;
+    number: number;
+    // Assignment to an existing binding (`=`, `+=`) — deliberately apart from
+    // string and number so a mutating `=` reads differently from a
+    // declaration's neutral one.
+    mutation: number;
+    default: number;
+}
+
+// Each directory gets a signature hue hashed from its path; these fix the
+// saturation/lightness the hue is rendered at. Three intensities of one family:
+// the hull outline, the stronger file-icon body, and the dimmer file-name label.
+export interface FolderColors {
+    saturation: number;
+    lightness: number;
+    strongSaturation: number;
+    strongLightness: number;
+    dimSaturation: number;
+    dimLightness: number;
+}
+
+// How AST cells are filled: the base tint, how much each nesting level
+// lightens it, and the export / import washes blended on top.
+export interface FillConfig {
+    // Lightening applied per nesting depth, in 0-255 channel steps.
+    depthStep: number;
+    defaultAlpha: number;
+    exportColor: number;
+    exportBlend: number;
+    exportAlpha: number;
+    importTintColor: number;
+    importTintBlend: number;
 }
 
 // How import connection lines are routed:
@@ -144,6 +196,9 @@ export interface ThemeConfig {
     colors: ThemeColors;
     semanticEdge: Record<SemanticEdgeKind, SemanticEdgeStyle>;
     edgeStyle: EdgeLineStyle;
+    syntax: SyntaxColors;
+    folder: FolderColors;
+    fill: FillConfig;
 }
 
 export interface GraphConfig {

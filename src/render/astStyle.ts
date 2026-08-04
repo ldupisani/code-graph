@@ -1,4 +1,5 @@
-import {COLORS} from "./theme";
+import {liveTheme} from "./theme";
+import type {SyntaxColors, ThemeColors} from "../graph/config/types";
 
 // Friendly short labels for non-named AST kinds. Keeps the on-screen label
 // concise (e.g. `ReturnStatement` -> "return") so even narrow rects can host
@@ -246,89 +247,94 @@ export const NAME_LIKE_KINDS = new Set([
 
 // Kinds shown as a colored outline instead of a text label. They carry no
 // label (decluttered) but stay visually identifiable by border color.
-export const KIND_OUTLINE: Record<string, number> = {
-    Block: COLORS.astOutlineBlock,
-    ObjectLiteralExpression: COLORS.astOutlineObject,
+//
+// Maps to a ThemeColors KEY, not a colour. It used to hold values read from the
+// static COLORS palette at module load, so the seven astOutline* entries were
+// themeable on paper and inert in practice — editing them changed the config
+// and nothing on screen. Resolve through outlineColorFor() to read live.
+export const KIND_OUTLINE: Record<string, keyof ThemeColors> = {
+    Block: "astOutlineBlock",
+    ObjectLiteralExpression: "astOutlineObject",
     // Same outline as ObjectLiteralExpression — TypeLiteral reads as
     // an "object shape" too, just in type position.
-    TypeLiteral: COLORS.astOutlineObject,
+    TypeLiteral: "astOutlineObject",
     // Destructured parameter pattern (`({ id, size }: Props)`) — the
     // React component prop-definition shape. Same yellow as
     // ObjectLiteralExpression / TypeLiteral so the brace cells across
     // value, type, and binding positions all read as one visual idiom.
-    ObjectBindingPattern: COLORS.astOutlineObject,
+    ObjectBindingPattern: "astOutlineObject",
     // Destructured ARRAY pattern (`const [x, y] = …`). Same yellow as the
     // object-pattern braces — both are destructuring containers — but drawn
     // as square-bracket strokes rather than a full rect (see BRACKET_KINDS and
     // the bracket branch in PixiCanvas.drawAstNode). Listed here so the node
     // stays significant (never collapses as a pass-through) and the bracket
     // strokes inherit this colour.
-    ArrayBindingPattern: COLORS.astOutlineObject,
+    ArrayBindingPattern: "astOutlineObject",
     // Array literals (`[x, y]`) read as `[ … ]` square brackets too — same
     // yellow as the destructuring pattern and object braces, so every bracket/
     // brace container shares one visual idiom. See BRACKET_KINDS.
-    ArrayLiteralExpression: COLORS.astOutlineObject,
-    Parameter: COLORS.astOutlineParam,
+    ArrayLiteralExpression: "astOutlineObject",
+    Parameter: "astOutlineParam",
     // Type definitions (interfaces, type aliases). They used to render
     // as a dashed green circle with every member visible; now they're
     // collapsed cells (see EXPANDABLE_KINDS) with this same green for
     // continuity. Click to drill into members.
-    InterfaceDeclaration: COLORS.astOutlineAbstract,
-    TypeAliasDeclaration: COLORS.astOutlineAbstract,
+    InterfaceDeclaration: "astOutlineAbstract",
+    TypeAliasDeclaration: "astOutlineAbstract",
     // Classes share the green with interfaces / type aliases — same
     // colour the EXPANDED class circle uses (see `classOutline` below
     // in drawAstNode). Visual continuity across the collapsed-cell ↔
     // expanded-circle toggle.
-    ClassDeclaration: COLORS.astOutlineAbstract,
+    ClassDeclaration: "astOutlineAbstract",
     // Top-level `const/let/var x = ...` statements collapse to a
     // single labelled cell. Yellow matches the object/array brace
     // colour since most non-trivial top-level vars are object or
     // array initializers — the colour signals "value-bearing
     // container, click to drill in" the same way the brace cells do.
-    VariableStatement: COLORS.astOutlineObject,
+    VariableStatement: "astOutlineObject",
     // JSX wrappers — `<Foo>…</Foo>` and `<>…</>`. The expandable cell
     // shows the tag in its collapsed leaf; clicking spawns an overlay
     // with the opening tag (and its attributes), children, and closing
     // tag as separate rects.
-    JsxElement: COLORS.astOutlineJsx,
-    JsxFragment: COLORS.astOutlineJsx,
+    JsxElement: "astOutlineJsx",
+    JsxFragment: "astOutlineJsx",
     // Control-flow statements — pink border matches the `control`
     // syntax category used for their labels (if/for/while/etc.). The
     // border makes the statement's rect boundary unambiguous even at
     // zooms where the small `if` / `for` text label would be easy to
     // miss inside a larger surrounding Block.
-    IfStatement: COLORS.astOutlineControl,
-    ForStatement: COLORS.astOutlineControl,
-    ForInStatement: COLORS.astOutlineControl,
-    ForOfStatement: COLORS.astOutlineControl,
-    WhileStatement: COLORS.astOutlineControl,
-    DoStatement: COLORS.astOutlineControl,
-    SwitchStatement: COLORS.astOutlineControl,
-    TryStatement: COLORS.astOutlineControl,
+    IfStatement: "astOutlineControl",
+    ForStatement: "astOutlineControl",
+    ForInStatement: "astOutlineControl",
+    ForOfStatement: "astOutlineControl",
+    WhileStatement: "astOutlineControl",
+    DoStatement: "astOutlineControl",
+    SwitchStatement: "astOutlineControl",
+    TryStatement: "astOutlineControl",
     // --- Python ---
-    ClassDef: COLORS.astOutlineAbstract,
-    If: COLORS.astOutlineControl,
-    For: COLORS.astOutlineControl,
-    AsyncFor: COLORS.astOutlineControl,
-    While: COLORS.astOutlineControl,
-    With: COLORS.astOutlineControl,
-    AsyncWith: COLORS.astOutlineControl,
-    Try: COLORS.astOutlineControl,
-    ExceptHandler: COLORS.astOutlineControl,
-    Match: COLORS.astOutlineControl,
-    comprehension: COLORS.astOutlineControl,
-    AsyncComprehension: COLORS.astOutlineControl,
-    Dict: COLORS.astOutlineObject,
-    Set: COLORS.astOutlineObject,
-    List: COLORS.astOutlineObject,
-    Tuple: COLORS.astOutlineObject,
+    ClassDef: "astOutlineAbstract",
+    If: "astOutlineControl",
+    For: "astOutlineControl",
+    AsyncFor: "astOutlineControl",
+    While: "astOutlineControl",
+    With: "astOutlineControl",
+    AsyncWith: "astOutlineControl",
+    Try: "astOutlineControl",
+    ExceptHandler: "astOutlineControl",
+    Match: "astOutlineControl",
+    comprehension: "astOutlineControl",
+    AsyncComprehension: "astOutlineControl",
+    Dict: "astOutlineObject",
+    Set: "astOutlineObject",
+    List: "astOutlineObject",
+    Tuple: "astOutlineObject",
     // Comprehensions produce a container, so they wear the same object-yellow
     // outline as the matching literal: `[ … ]` brackets for a list comp (via
     // BRACKET_KINDS), a plain yellow box for set / dict comps — signalling the
     // `for … in …` clause inside builds a list / set / dict.
-    ListComp: COLORS.astOutlineObject,
-    SetComp: COLORS.astOutlineObject,
-    DictComp: COLORS.astOutlineObject,
+    ListComp: "astOutlineObject",
+    SetComp: "astOutlineObject",
+    DictComp: "astOutlineObject",
 };
 
 // Kinds whose box is stroked as a literal pair of square brackets — solid
@@ -377,17 +383,34 @@ export function isBraceLabelKind(kind: string): boolean {
 // a glance from the background hue alone — no extra label needed. The
 // number is a target colour; `blend` is the proportion (0–1) mixed
 // with the base fill.
-export const KIND_FILL_TINT: Record<string, {color: number; blend: number}> = {
+// Which kinds carry a background wash. The wash's colour and strength live in
+// the theme (fill.importTintColor / importTintBlend) — this only records that
+// the kind gets one, so the set stays a rendering decision while the palette
+// stays a themeable one. Resolve with fillTintFor().
+export const KIND_FILL_TINT: Record<string, "import"> = {
     // Imports get a slight blue wash — same hue family as the
     // edgeImported blue used for incoming-import lines, so a block
     // labelled with imported names + a blue background reads as
     // "this brings stuff in" at a glance, replacing the previous
     // explicit "import" header label.
-    ImportDeclaration: {color: 0x4a6ac5, blend: 0.35},
+    ImportDeclaration: "import",
     // Python imports get the same blue wash.
-    Import: {color: 0x4a6ac5, blend: 0.35},
-    ImportFrom: {color: 0x4a6ac5, blend: 0.35},
+    Import: "import",
+    ImportFrom: "import",
 };
+
+// The live colour for a kind's outline, or undefined when the kind has none.
+// Always prefer this over indexing KIND_OUTLINE directly — the map holds theme
+// KEYS, and resolving them here is what keeps the outlines themeable.
+export function outlineColorFor(kind: string): number | undefined {
+    const key = KIND_OUTLINE[kind];
+    return key === undefined ? undefined : liveTheme.colors[key];
+}
+
+// The live background wash for a kind, or undefined when it has none.
+export function fillTintFor(kind: string): {color: number; blend: number} | undefined {
+    return KIND_FILL_TINT[kind] === undefined ? undefined : {color: liveTheme.fill.importTintColor, blend: liveTheme.fill.importTintBlend};
+}
 
 // A node is "significant" — worth its own box, never collapsed as a
 // pass-through — if it shows a label OR carries a kind outline. (A magenta
@@ -492,7 +515,7 @@ export function isExpandableKind(kind: string): boolean {
 // matching EditorPane's theme): types teal, functions yellow, control-flow
 // pink, other keywords blue, strings salmon, numbers green, everything
 // identifier-ish light blue, fallback default foreground.
-export const SYNTAX = {
+export const SYNTAX: SyntaxColors = {
     type: 0x4ec9b0,
     func: 0xdcdcaa,
     variable: 0x9cdcfe,
@@ -506,7 +529,7 @@ export const SYNTAX = {
     // See AstNode.decl === 'mutation'.
     mutation: 0xffa657,
     default: 0xd4d4d4,
-} as const;
+};
 
 // --- Construct templates: make a node read like its source ----------------
 // Each entry maps a syntaxKind to a function that, given the node's
@@ -533,34 +556,36 @@ export type SyntaxTemplate = (
     node: { syntaxKind: string; name: string | null; returnType?: string },
 ) => SyntaxToken[];
 
-const C = SYNTAX.control; // control-flow keywords — pink
-const K = SYNTAX.keyword; // other keywords (typeof / as / void / delete) — blue
-const P = SYNTAX.default; // punctuation (`; : ...`) — default foreground
+// Template bodies reference SYNTAX.* directly rather than capturing the values
+// in module-level consts (`C`/`K`/`P` previously): the templates are functions
+// invoked per node at layout time, so a property read inside them picks up the
+// live palette, while a captured number would pin every keyword glyph to the
+// colours that happened to be loaded at import.
 
 export const SYNTAX_TEMPLATES: Record<string, SyntaxTemplate> = {
     // --- Loops ---
     // `for [item] of [iterable]` — item and iterable are always children 0 and
     // 1; the body (child 2) isn't referenced, so it auto-appends below.
-    ForOfStatement: () => [{kw: "for", color: C}, {child: 0}, {kw: "of", color: C}, {child: 1}],
-    ForInStatement: () => [{kw: "for", color: C}, {child: 0}, {kw: "in", color: C}, {child: 1}],
-    WhileStatement: () => [{kw: "while", color: C}, {child: 0}],
+    ForOfStatement: () => [{kw: "for", color: SYNTAX.control}, {child: 0}, {kw: "of", color: SYNTAX.control}, {child: 1}],
+    ForInStatement: () => [{kw: "for", color: SYNTAX.control}, {child: 0}, {kw: "in", color: SYNTAX.control}, {child: 1}],
+    WhileStatement: () => [{kw: "while", color: SYNTAX.control}, {child: 0}],
     // `do { body } while [cond]` — body is child 0, condition child 1.
     DoStatement: (kids) =>
         kids.length >= 2
-            ? [{kw: "do", color: C}, {child: 0}, {kw: "while", color: C}, {child: 1}]
-            : [{kw: "do", color: C}],
+            ? [{kw: "do", color: SYNTAX.control}, {child: 0}, {kw: "while", color: SYNTAX.control}, {child: 1}]
+            : [{kw: "do", color: SYNTAX.control}],
     // `for [init] ; [cond] ; [update]` — clauses are role-tagged by the server
     // because any can be omitted (`for (;;)`). Reference every role-bearing
     // child (there can be several `init`s, as in `for (let i=0, j=1; …)`); the
     // single roleless child (the body) auto-appends below.
     ForStatement: (kids) => {
-        const t: SyntaxToken[] = [{kw: "for", color: C}];
+        const t: SyntaxToken[] = [{kw: "for", color: SYNTAX.control}];
         const pushRole = (r: string) =>
             kids.forEach((k, i) => { if (k.role === r) t.push({child: i}); });
         pushRole("init");
-        t.push({kw: ";", color: P});
+        t.push({kw: ";", color: SYNTAX.default});
         pushRole("cond");
-        t.push({kw: ";", color: P});
+        t.push({kw: ";", color: SYNTAX.default});
         pushRole("update");
         return t;
     },
@@ -572,54 +597,54 @@ export const SYNTAX_TEMPLATES: Record<string, SyntaxTemplate> = {
     // rather than the `else` trailing the then-branch on the same row.
     IfStatement: (kids) =>
         kids.length >= 3
-            ? [{kw: "if", color: C}, {child: 0}, {child: 1}, {kw: "else", color: C, breakBefore: true}, {child: 2}]
-            : [{kw: "if", color: C}, {child: 0}],
-    SwitchStatement: () => [{kw: "switch", color: C}, {child: 0}],
-    CaseClause: () => [{kw: "case", color: C}, {child: 0}, {kw: ":", color: P}],
-    DefaultClause: () => [{kw: "default", color: C}, {kw: ":", color: P}],
+            ? [{kw: "if", color: SYNTAX.control}, {child: 0}, {child: 1}, {kw: "else", color: SYNTAX.control, breakBefore: true}, {child: 2}]
+            : [{kw: "if", color: SYNTAX.control}, {child: 0}],
+    SwitchStatement: () => [{kw: "switch", color: SYNTAX.control}, {child: 0}],
+    CaseClause: () => [{kw: "case", color: SYNTAX.control}, {child: 0}, {kw: ":", color: SYNTAX.default}],
+    DefaultClause: () => [{kw: "default", color: SYNTAX.control}, {kw: ":", color: SYNTAX.default}],
     // --- Jumps & error handling ---
     // `return` shows as a prominent pink return glyph (↩) rather than the word,
     // then the returned expression: `↩ [expr]`. Drawn at 2× the normal 11px
     // label size (it still scales with zoom like all labels, via labelScale).
-    ReturnStatement: () => [{kw: "↩", color: C, size: 22}],
-    ThrowStatement: () => [{kw: "throw", color: C}],
+    ReturnStatement: () => [{kw: "↩", color: SYNTAX.control, size: 22}],
+    ThrowStatement: () => [{kw: "throw", color: SYNTAX.control}],
     // `try { } catch (e) { } finally { }`. Children: try-block (0), an optional
     // CatchClause, an optional finally Block. Reference them in order so the
     // `finally` keyword lands before its block; the CatchClause draws its own
     // `catch [param]` via its own template.
     TryStatement: (kids) => {
-        const t: SyntaxToken[] = [{kw: "try", color: C}, {child: 0}];
+        const t: SyntaxToken[] = [{kw: "try", color: SYNTAX.control}, {child: 0}];
         let i = 1;
         if (kids[i]?.syntaxKind === "CatchClause") { t.push({child: i}); i++; }
-        if (kids[i]?.syntaxKind === "Block") { t.push({kw: "finally", color: C}, {child: i}); }
+        if (kids[i]?.syntaxKind === "Block") { t.push({kw: "finally", color: SYNTAX.control}, {child: i}); }
         return t;
     },
     // `catch [param] { body }` — a param is present unless it's a bare `catch {}`.
     CatchClause: (kids) =>
-        kids.length >= 2 ? [{kw: "catch", color: C}, {child: 0}] : [{kw: "catch", color: C}],
+        kids.length >= 2 ? [{kw: "catch", color: SYNTAX.control}, {child: 0}] : [{kw: "catch", color: SYNTAX.control}],
     // --- Inline keyword-expressions ---
-    AwaitExpression: () => [{kw: "await", color: C}],
-    YieldExpression: () => [{kw: "yield", color: C}],
-    TypeOfExpression: () => [{kw: "typeof", color: K}],
-    VoidExpression: () => [{kw: "void", color: K}],
-    DeleteExpression: () => [{kw: "delete", color: K}],
+    AwaitExpression: () => [{kw: "await", color: SYNTAX.control}],
+    YieldExpression: () => [{kw: "yield", color: SYNTAX.control}],
+    TypeOfExpression: () => [{kw: "typeof", color: SYNTAX.keyword}],
+    VoidExpression: () => [{kw: "void", color: SYNTAX.keyword}],
+    DeleteExpression: () => [{kw: "delete", color: SYNTAX.keyword}],
     // Spread `...expr` in every position: arrays / calls (SpreadElement),
     // object literals (SpreadAssignment), and JSX (`<C {...props} />`). All
     // render the `...` as an inline prefix glyph in front of the spread
     // expression instead of a `...`-labelled box, so `{ ...entity.velocity }`
     // reads as `... entity.velocity` rather than dropping the `...` entirely
     // (these collapse to a bare pass-through without a template).
-    SpreadElement: () => [{kw: "...", color: P}],
-    SpreadAssignment: () => [{kw: "...", color: P}],
-    JsxSpreadAttribute: () => [{kw: "...", color: P}],
+    SpreadElement: () => [{kw: "...", color: SYNTAX.default}],
+    SpreadAssignment: () => [{kw: "...", color: SYNTAX.default}],
+    JsxSpreadAttribute: () => [{kw: "...", color: SYNTAX.default}],
     // A template-literal interpolation `${expr}`: render a `$` prefix glyph in
     // front of the expression (child 0), so `` `button-${variant}` `` reads as
     // `` `button-` `` then `$ [variant]`. The trailing literal chunk (child 1, a
     // TemplateMiddle/Tail) auto-appends after when non-empty; empty chunks are
     // dropped server-side so there's no stray empty box.
-    TemplateSpan: () => [{kw: "$", color: P}, {child: 0}],
+    TemplateSpan: () => [{kw: "$", color: SYNTAX.default}, {child: 0}],
     // `[expr] as [Type]` — both operands present (expression 0, type 1).
-    AsExpression: () => [{child: 0}, {kw: "as", color: K}, {child: 1}],
+    AsExpression: () => [{child: 0}, {kw: "as", color: SYNTAX.keyword}, {child: 1}],
     // Subscript / element access `base[index]` — the base box followed by the
     // index box glued to it (child 0 = base, child 1 = index). The `[ ]` are NOT
     // flow glyphs: the renderer strokes the INDEX box itself as a white square
@@ -634,33 +659,33 @@ export const SYNTAX_TEMPLATES: Record<string, SyntaxTemplate> = {
     // each template references only its header operand(s); the body statements
     // auto-append below the keyword header. `elif` arrives as a nested `If` in
     // the parent's orelse, which simply renders as another `if [test]` row.
-    If: () => [{kw: "if", color: C}, {child: 0}],
-    While: () => [{kw: "while", color: C}, {child: 0}],
-    For: () => [{kw: "for", color: C}, {child: 0}, {kw: "in", color: C}, {child: 1}],
-    AsyncFor: () => [{kw: "async for", color: C}, {child: 0}, {kw: "in", color: C}, {child: 1}],
+    If: () => [{kw: "if", color: SYNTAX.control}, {child: 0}],
+    While: () => [{kw: "while", color: SYNTAX.control}, {child: 0}],
+    For: () => [{kw: "for", color: SYNTAX.control}, {child: 0}, {kw: "in", color: SYNTAX.control}, {child: 1}],
+    AsyncFor: () => [{kw: "async for", color: SYNTAX.control}, {child: 0}, {kw: "in", color: SYNTAX.control}, {child: 1}],
     // Comprehension clause `for [target] in [iter] if [cond]…` — the server
     // emits one `comprehension` box per generator with children in
     // target (0), iter (1), ifs (2+) order. Each trailing `if` renders its own
     // keyword so a filtered comprehension reads in full; nested comprehensions
     // (`[x for a in A for b in B]`) surface as sibling comprehension boxes.
     comprehension: (kids) => {
-        const t: SyntaxToken[] = [{kw: "for", color: C}, {child: 0}, {kw: "in", color: C}, {child: 1}];
-        for (let i = 2; i < kids.length; i++) t.push({kw: "if", color: C}, {child: i});
+        const t: SyntaxToken[] = [{kw: "for", color: SYNTAX.control}, {child: 0}, {kw: "in", color: SYNTAX.control}, {child: 1}];
+        for (let i = 2; i < kids.length; i++) t.push({kw: "if", color: SYNTAX.control}, {child: i});
         return t;
     },
     AsyncComprehension: (kids) => {
-        const t: SyntaxToken[] = [{kw: "async for", color: C}, {child: 0}, {kw: "in", color: C}, {child: 1}];
-        for (let i = 2; i < kids.length; i++) t.push({kw: "if", color: C}, {child: i});
+        const t: SyntaxToken[] = [{kw: "async for", color: SYNTAX.control}, {child: 0}, {kw: "in", color: SYNTAX.control}, {child: 1}];
+        for (let i = 2; i < kids.length; i++) t.push({kw: "if", color: SYNTAX.control}, {child: i});
         return t;
     },
-    With: () => [{kw: "with", color: C}, {child: 0}],
-    AsyncWith: () => [{kw: "async with", color: C}, {child: 0}],
-    Return: () => [{kw: "↩", color: C, size: 22}],
-    Raise: () => [{kw: "raise", color: C}],
-    Assert: () => [{kw: "assert", color: C}, {child: 0}],
-    Await: () => [{kw: "await", color: C}],
-    Yield: () => [{kw: "yield", color: C}],
-    YieldFrom: () => [{kw: "yield from", color: C}],
+    With: () => [{kw: "with", color: SYNTAX.control}, {child: 0}],
+    AsyncWith: () => [{kw: "async with", color: SYNTAX.control}, {child: 0}],
+    Return: () => [{kw: "↩", color: SYNTAX.control, size: 22}],
+    Raise: () => [{kw: "raise", color: SYNTAX.control}],
+    Assert: () => [{kw: "assert", color: SYNTAX.control}, {child: 0}],
+    Await: () => [{kw: "await", color: SYNTAX.control}],
+    Yield: () => [{kw: "yield", color: SYNTAX.control}],
+    YieldFrom: () => [{kw: "yield from", color: SYNTAX.control}],
     // NOTE: function definitions are NOT templated here — they use the
     // two-column functionLayout in treemap.ts (params bracketed on the left,
     // return type + body on the right). See isFunctionSignatureKind below,

@@ -13,8 +13,8 @@ import {layoutAst, type TreemapLayout, type TreemapNode} from "../graph/treemap"
 import {buildAstForceLayout, isMiddleStatement, type AstForceLayout, type ContainerForceLayout, type SimAstNode} from "../graph/astForce";
 import type {AstNode, FileAstResponse, ProjectResponse} from "../api/types";
 import type {SimFileNode} from "../graph/types";
-import {blendColor, DEFAULT_FILL_ALPHA, depthTint, EXPORT_FILL_ALPHA, EXPORT_FILL_BLEND, EXPORT_FILL_COLOR, hslToHex, liveTheme} from "./theme";
-import {composeModifierPrefix, declPrefixOf, isBracketKind, isBraceLabelKind, isExpandableKind, isFunctionSignatureKind, isHighLevel, isJsxSignatureKind, isSignificant, KIND_FILL_TINT, KIND_OUTLINE, labelFor, NAME_LIKE_KINDS, splitCallMarker, splitDefaultExportPrefix, splitTypeAnnotation, SYNTAX, syntaxColor, syntaxTokens} from "./astStyle";
+import {blendColor, depthTint, hslToHex, liveTheme} from "./theme";
+import {composeModifierPrefix, declPrefixOf, isBracketKind, isBraceLabelKind, isExpandableKind, isFunctionSignatureKind, isHighLevel, isJsxSignatureKind, isSignificant, fillTintFor, outlineColorFor, labelFor, NAME_LIKE_KINDS, splitCallMarker, splitDefaultExportPrefix, splitTypeAnnotation, SYNTAX, syntaxColor, syntaxTokens} from "./astStyle";
 import {findVisibleAnchor, smallestContaining, type HitRect} from "./hitTest";
 import {drawEdges, drawSemanticEdges, emitDashed} from "./edges";
 import {wireCamera} from "./cameraInput";
@@ -973,7 +973,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             const RIBBON_W_START = 10;
             const RIBBON_W_END = 4;
             const RIBBON_ALPHA = 0.15;
-            const RIBBON_COLOR = 0x8fa3c0;
+            const RIBBON_COLOR = liveTheme.colors.flowRibbon;
             const RIBBON_SAMPLES = 14;
 
             // Per-file AST layouts now live in `layoutsByFileId` (declared
@@ -1317,13 +1317,17 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 }
                 return ((h % 360) + 360) % 360;
             };
-            const colourForDirectory = (dir: string): number => hslToHex(hueForDirectory(dir), 38, 52);
+            // Hue is hashed from the path; the saturation/lightness of each of
+            // the three intensities is themed (theme.folder), so a light
+            // background can dial the whole family down rather than being stuck
+            // with values picked against a dark one.
+            const colourForDirectory = (dir: string): number => hslToHex(hueForDirectory(dir), liveTheme.folder.saturation, liveTheme.folder.lightness);
             const colourForDirectoryStrong = (dir: string): number =>
                 // Higher saturation + slightly higher lightness so the
                 // icon body is unambiguously the directory's signature
                 // colour, not a muted variant readable only against the
                 // hull behind it.
-                hslToHex(hueForDirectory(dir), 65, 58);
+                hslToHex(hueForDirectory(dir), liveTheme.folder.strongSaturation, liveTheme.folder.strongLightness);
             const colourForDirectoryDim = (dir: string): number =>
                 // A few stops darker than `colourForDirectory` — used for
                 // FILE NAME labels so they read as members of their
@@ -1332,7 +1336,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // Same hue and saturation so the family tie is obvious;
                 // lower lightness so the file name sits a tier "below"
                 // its containing folder name.
-                hslToHex(hueForDirectory(dir), 38, 42);
+                hslToHex(hueForDirectory(dir), liveTheme.folder.dimSaturation, liveTheme.folder.dimLightness);
             // Take the first `depth` components of a relative path. Used to
             // group deeply-nested files into a smaller number of meaningful
             // architectural clusters. `src/components/data-display/list/item.tsx`
@@ -2533,7 +2537,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 350);
                     const ringR = animatedR + (8 + 3 * pulse) / cameraScale;
                     worldGfx.circle(sim.x, sim.y, ringR).stroke({
-                        color: 0x4a9eff,
+                        color: liveTheme.colors.editRing,
                         width: 2.5 / cameraScale,
                         alpha: 0.55 + 0.4 * pulse,
                     });
@@ -2652,7 +2656,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     const badgeStroke = 1 / cameraScale;
                     worldGfx
                         .circle(bx, by, badgeR)
-                        .fill({color: 0xe8c84a, alpha: pinAlpha})
+                        .fill({color: liveTheme.colors.pinBadge, alpha: pinAlpha})
                         .stroke({color: 0x1c1c08, width: badgeStroke, alpha: pinAlpha});
                 }
             }
@@ -2788,7 +2792,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // Circle fill: same translucent dark as the file circle, so a
                 // class reads as a "smaller file" of related members. EXPORTED
                 // classes / interfaces get the amber export tint blended in
-                // (matching the EXPORT_FILL_COLOR used for rect-shaped exports
+                // (matching the liveTheme.fill.exportColor used for rect-shaped exports
                 // in drawAstNode below), so the "this is part of the module's
                 // public surface" signal carries over to the circle-shaped
                 // member-container variants too. Already semi-transparent at
@@ -2799,7 +2803,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                     node.syntaxKind === "ExportDeclaration" ||
                     node.syntaxKind === "ExportAssignment";
                 const containerFillColor = isExportContainer
-                    ? blendColor(liveTheme.colors.fileExpanded, EXPORT_FILL_COLOR, EXPORT_FILL_BLEND)
+                    ? blendColor(liveTheme.colors.fileExpanded, liveTheme.fill.exportColor, liveTheme.fill.exportBlend)
                     : liveTheme.colors.fileExpanded;
                 worldGfx.circle(cx, cy, radius).fill({color: containerFillColor, alpha: 0.55});
 
@@ -2941,7 +2945,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // (magenta for Block, yellow for ObjectLiteralExpression)
                 // so the overlay reads as a magnified version of the cell
                 // it was spawned from.
-                const stroke = KIND_OUTLINE[blockNode.syntaxKind] ?? liveTheme.colors.astBorder;
+                const stroke = outlineColorFor(blockNode.syntaxKind) ?? liveTheme.colors.astBorder;
                 worldGfx
                     .rect(x, y, w, h)
                     .fill({color: liveTheme.colors.fileExpanded, alpha: 1})
@@ -3223,7 +3227,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // (alpha 1 + thicker stroke) so the user sees it's interactive;
                 // clicking toggles it via handleClick.
                 if (node.collapsed) {
-                    const stroke = KIND_OUTLINE[node.syntaxKind] ?? liveTheme.colors.astBorder;
+                    const stroke = outlineColorFor(node.syntaxKind) ?? liveTheme.colors.astBorder;
                     const isSelectedLeaf = selectionSet.has(node.id);
                     const isHovered = hoveredHit?.id === node.id;
                     // Collapsed exported cells (e.g. `export class Cat` when
@@ -3238,10 +3242,10 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                         node.syntaxKind === "ExportDeclaration" ||
                         node.syntaxKind === "ExportAssignment";
                     const collapsedFillColor = isCollapsedExport
-                        ? blendColor(depthTint(node.depth), EXPORT_FILL_COLOR, EXPORT_FILL_BLEND)
+                        ? blendColor(depthTint(node.depth), liveTheme.fill.exportColor, liveTheme.fill.exportBlend)
                         : stroke;
                     const collapsedFillAlpha = isCollapsedExport
-                        ? EXPORT_FILL_ALPHA
+                        ? liveTheme.fill.exportAlpha
                         : isHovered ? 0.18 : 0;
                     worldGfx
                         .rect(x, y, node.rect.w, node.rect.h)
@@ -3363,7 +3367,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // alpha is the "semi-transparent overlay" so the
                 // file's circle boundary stays visible THROUGH the
                 // part of the rect sitting on the border.
-                const kindTint = KIND_FILL_TINT[node.syntaxKind];
+                const kindTint = fillTintFor(node.syntaxKind);
                 const isExportNode =
                     !kindTint &&
                     (node.exported === true ||
@@ -3373,11 +3377,11 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 if (kindTint) {
                     fillColor = blendColor(tint, kindTint.color, kindTint.blend);
                 } else if (isExportNode) {
-                    fillColor = blendColor(tint, EXPORT_FILL_COLOR, EXPORT_FILL_BLEND);
+                    fillColor = blendColor(tint, liveTheme.fill.exportColor, liveTheme.fill.exportBlend);
                 } else {
                     fillColor = tint;
                 }
-                const fillAlpha = isExportNode ? EXPORT_FILL_ALPHA : DEFAULT_FILL_ALPHA;
+                const fillAlpha = isExportNode ? liveTheme.fill.exportAlpha : liveTheme.fill.defaultAlpha;
                 // A call/new argument is a "parameter block for a call" — style it
                 // like a function `Parameter` (light-blue outline + rounded).
                 const argParent = node.parentId ? tree.byId.get(node.parentId) : undefined;
@@ -3404,7 +3408,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // Kind outlines have their own (much lower) zoom threshold so they
                 // reappear well before the rest of the detail does. A call argument
                 // with no outline of its own gets the parameter light-blue.
-                const kindOutline = cameraScale < cfg.lod.outlineBelow ? undefined : (KIND_OUTLINE[node.syntaxKind] ?? (isCallArg ? liveTheme.colors.astOutlineParam : undefined));
+                const kindOutline = cameraScale < cfg.lod.outlineBelow ? undefined : (outlineColorFor(node.syntaxKind) ?? (isCallArg ? liveTheme.colors.astOutlineParam : undefined));
                 // Abstract definitions AND interfaces get a green dashed outline
                 // (TS interfaces aren't flagged `abstract` but are abstract by
                 // nature). Same zoom gate as the kind outlines.
@@ -4953,6 +4957,15 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // config and keep the Pixi clear color in sync.
                 liveTheme.colors = cfg.theme.colors;
                 liveTheme.semanticEdge = cfg.theme.semanticEdge;
+                liveTheme.syntax = cfg.theme.syntax;
+                liveTheme.folder = cfg.theme.folder;
+                liveTheme.fill = cfg.theme.fill;
+                // SYNTAX is astStyle's own palette object, which the syntax
+                // templates and label colouring read by property. Mutated in
+                // place rather than reassigned: theme.ts can't import astStyle
+                // (astStyle imports theme), so the two can't share one object,
+                // and every `SYNTAX.control` read must see the new values.
+                Object.assign(SYNTAX, cfg.theme.syntax);
                 if (app.renderer) app.renderer.background.color = liveTheme.colors.bg;
                 // updateZoomFit BEFORE syncExpansion so the latter sees the
                 // zoom we're heading to (a zoom-fit in progress shouldn't be

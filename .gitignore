@@ -9,6 +9,9 @@ dist
 storybook-static
 test-results
 
+# Bytecode cache for the Python analyzer helper (server/python/).
+__pycache__/
+
 # Local security config: workspace allowlist + session token (never commit).
 code-graph.config.json
 .code-graph/

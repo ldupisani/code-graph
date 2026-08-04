@@ -1,7 +1,8 @@
 import {useEffect, useRef} from "react";
 import {Application, Container, Graphics} from "pixi.js";
 import {getFileAst} from "../api/client";
-import {applyExpansion, assignRigidPositions, buildFileLayout, EXPANDED_MAX, EXPANDED_MIN, isCircular, refreshSizeForces, seedFromSaved, type SavedNodePos} from "../graph/layout";
+import {layoutSettingsFor} from "../graph/config/layout";
+import {applyExpansion, applyForceParams, assignRigidPositions, buildFileLayout, EXPANDED_MAX, EXPANDED_MIN, forceParamsFrom, isCircular, refreshSizeForces, seedFromSaved, type SavedNodePos} from "../graph/layout";
 import {AST_LABEL_FONT, astLabelOnScreenFactor, astLabelScale, fileLabel, labelScreenBox, measureMono} from "../graph/labels";
 import {isSupportFile, useGraphStore} from "../graph/store";
 import {useConfigStore} from "../graph/config/store";
@@ -4452,6 +4453,34 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
             // Once alpha decays below alphaMin the sim stops ticking — it
             // does not run indefinitely — but the interpolation and
             // overlap relaxation keep running so zoom changes and file
+            // Push the force-connectivity pattern's params into the running
+            // simulation when they change. Signature-compared so an unchanged
+            // config costs one string build per frame and nothing else.
+            //
+            // Applied whatever the ACTIVE layout is, not just under `force`: the
+            // connectivity sim always runs — its positions are what a static
+            // pattern's files lean toward while a file is open (openLayoutBias),
+            // and what every file falls back to when a pattern doesn't place it.
+            // Gating this on the active pattern would make the sliders look
+            // inert from any other layout, which is the bug being fixed.
+            //
+            // Reheat on change, or nothing visibly moves: d3 only integrates
+            // forces while alpha is above alphaMin, and by the time the user
+            // reaches for a slider the sim has almost always settled. 0.35 is
+            // enough to re-settle into the new equilibrium without the
+            // full-restart lurch of alpha(1).
+            let lastForceSig = "";
+            function syncForceParams(): void {
+                const raw = layoutSettingsFor(cfg.layout, "force-connectivity").params;
+                const sig = JSON.stringify(raw);
+                if (sig === lastForceSig) return;
+                const first = lastForceSig === "";
+                lastForceSig = sig;
+                applyForceParams(layout, forceParamsFrom(raw));
+                const s = layout.simulation;
+                if (!first) s.alpha(Math.max(s.alpha(), 0.35)).restart();
+            }
+
             // expand/collapse still re-blend cleanly.
             function stepLayout(): void {
                 const sim = layout.simulation;
@@ -4465,6 +4494,7 @@ export function PixiCanvas({project, cameraApiRef}: CanvasProps) {
                 // its params changed (cheap no-op otherwise). Must precede
                 // assignRigidPositions below.
                 layoutEngine.sync(cfg);
+                syncForceParams();
 
                 // 1. Ease per-file width/height toward their targets.
                 //    Runs BEFORE the sim tick so the tick's forces

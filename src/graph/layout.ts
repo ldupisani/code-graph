@@ -624,6 +624,85 @@ export interface FileLayoutResult {
     // is recomputed. 0 until assignRigidPositions has run at least
     // once — the containment force early-exits in that case.
     rigidHalfDiag: number;
+    // The directional edge sets the callsX / callsY / inheritY forces are built
+    // from. Kept so applyForceParams can REBUILD those forces at a new strength:
+    // d3-force has no setter for a custom force's strength, so retuning one means
+    // constructing it again, which needs the edges.
+    callEdges: readonly DirectionalEdge[];
+    inheritEdges: readonly DirectionalEdge[];
+    // The force strengths currently applied to `simulation`. refreshSizeForces
+    // reads these so that rebuilding collide/link for a size change doesn't
+    // silently revert them to the defaults.
+    forceParams: ForceParams;
+}
+
+// Tunable strengths for the connectivity simulation, surfaced in the UI as the
+// force-connectivity pattern's parameters (graph/patterns/forceConnectivity).
+//
+// These were literals inline in buildFileLayout, and the pattern's ParamSpec
+// list was written to mirror them "so the settings UI can surface them", with
+// the wiring left as a later step — so every control in that panel was inert.
+// This is that wiring: one shape, one place they're applied.
+export interface ForceParams {
+    charge: number;
+    linkStrength: number;
+    collide: number;
+    callsX: number;
+    callsY: number;
+    inheritY: number;
+    cluster: number;
+}
+
+export const DEFAULT_FORCE_PARAMS: ForceParams = {
+    charge: -650,
+    linkStrength: 0.3,
+    collide: 0.95,
+    callsX: CALLS_X_STRENGTH,
+    callsY: CALLS_Y_STRENGTH,
+    inheritY: INHERIT_Y_STRENGTH,
+    cluster: 0.09,
+};
+
+// Coerce a pattern's loosely-typed params bag into ForceParams, falling back to
+// the default for anything missing or non-finite. sanitizeConfig already clamps
+// to each spec's min/max, so this only has to survive absence.
+export function forceParamsFrom(raw: Record<string, unknown> | undefined): ForceParams {
+    const num = (k: keyof ForceParams): number => {
+        const v = raw?.[k];
+        return typeof v === "number" && Number.isFinite(v) ? v : DEFAULT_FORCE_PARAMS[k];
+    };
+    return {
+        charge: num("charge"),
+        linkStrength: num("linkStrength"),
+        collide: num("collide"),
+        callsX: num("callsX"),
+        callsY: num("callsY"),
+        inheritY: num("inheritY"),
+        cluster: num("cluster"),
+    };
+}
+
+// Push a new set of strengths into the RUNNING simulation.
+//
+// Mutating in place rather than rebuilding the layout: a rebuild would reseed
+// every node and throw away the settled arrangement the user is looking at, so
+// dragging a slider would teleport the graph. The forces that expose a
+// `.strength()` setter are retuned directly; the custom ones (callsX/callsY/
+// inheritY/directoryCluster) have no setter and are reconstructed — cheap, since
+// they close over edge lists that already exist.
+//
+// The caller is responsible for reheating the sim; nothing moves otherwise,
+// because d3 only applies forces while alpha is above alphaMin.
+export function applyForceParams(layout: FileLayoutResult, p: ForceParams): void {
+    const sim = layout.simulation;
+    layout.forceParams = p;
+    sim.force<ReturnType<typeof forceLink<SimFileNode, SimImportLink>>>("link")?.strength(p.linkStrength);
+    sim.force<ReturnType<typeof forceManyBody<SimFileNode>>>("charge")?.strength(p.charge);
+    sim.force<ReturnType<typeof forceCollide<SimFileNode>>>("collide")?.strength(p.collide);
+    sim.force("callsX", directionalForce(layout.callEdges, "x", p.callsX));
+    sim.force("callsY", directionalForce(layout.callEdges, "y", p.callsY));
+    sim.force("inheritY", directionalForce(layout.inheritEdges, "y", p.inheritY));
+    sim.force("directoryCluster", directoryClusterForce(p.cluster));
 }
 
 // --- Rigid folder-outline layout -----------------------------------------
@@ -883,6 +962,11 @@ export function buildFileLayout(project: ProjectResponse): FileLayoutResult {
         byId,
         rigidRaw,
         rigidHalfDiag: 0,
+        callEdges,
+        inheritEdges,
+        // Built at the defaults; the renderer applies the user's configured
+        // values on its first frame (and on every later edit).
+        forceParams: DEFAULT_FORCE_PARAMS,
         // Filled in immediately below — the cast lets us defer
         // simulation construction one statement so the containment
         // force can take a closure over `result` itself.
@@ -1041,16 +1125,19 @@ export function applyExpansion(layout: FileLayoutResult, expandedFiles: Readonly
  * any node's size moved this frame.
  */
 export function refreshSizeForces(layout: FileLayoutResult): void {
+    // Strengths come from layout.forceParams, NOT literals: this replaces the
+    // two forces the user can tune, and hardcoding here would quietly undo their
+    // settings the moment any file resized (i.e. on every expand/collapse).
     layout.simulation.force(
         "collide",
-        forceCollide<SimFileNode>().radius(collisionRadius).strength(0.95).iterations(2),
+        forceCollide<SimFileNode>().radius(collisionRadius).strength(layout.forceParams.collide).iterations(2),
     );
     layout.simulation.force(
         "link",
         forceLink<SimFileNode, SimImportLink>(layout.links)
             .id((d) => d.id)
             .distance(linkDistance)
-            .strength(0.3),
+            .strength(layout.forceParams.linkStrength),
     );
 }
 

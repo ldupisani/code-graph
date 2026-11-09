@@ -87,5 +87,27 @@ export function isPathAllowed(candidate: string): { ok: true; realPath: string }
 export function resolveFileIdWithinRoot(rootPath: string, fileId: string): string | null {
   if (!fileId || path.isAbsolute(fileId) || fileId.includes('\\')) return null;
   const abs = path.resolve(rootPath, fileId);
-  return abs.startsWith(rootPath + path.sep) ? abs : null;
+  if (!abs.startsWith(rootPath + path.sep)) return null;
+  // Lexical containment alone isn't enough: `root/link/x.ts` passes the check
+  // above even when `link` is a symlink to /etc, and the read/write would
+  // follow it out. Canonicalize and re-check. A file that doesn't exist yet
+  // (or was just deleted) has no realpath, so canonicalize its parent dir —
+  // that's where a symlink escape would live. Missing parent → reject.
+  let real: string;
+  try {
+    real = realpathSync(abs);
+  } catch {
+    try {
+      real = path.join(realpathSync(path.dirname(abs)), path.basename(abs));
+    } catch {
+      return null;
+    }
+  }
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(rootPath);
+  } catch {
+    return null;
+  }
+  return real.startsWith(realRoot + path.sep) ? real : null;
 }
